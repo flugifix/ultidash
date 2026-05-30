@@ -1,0 +1,7 @@
+# EdgeTX compiled Lua bytecode (generated on the radio)
+*.luac
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
