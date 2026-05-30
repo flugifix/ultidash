@@ -17,6 +17,18 @@ run it full-screen.
 
 ---
 
+## A personal note
+
+UltiDash was originally built **just for my own personal use** — a way to combine
+everything I need into a single widget. I decided to make it available anyway, in case
+it's useful to someone else.
+
+It builds on and reuses the work of several authors (see [Credits](#credits) and
+[`NOTICE.md`](NOTICE.md)). Should any of them have concerns about their work being reused
+here, I will of course respect that.
+
+---
+
 ## Features
 
 - **Top bar** — date/time and a compact radio (TX) battery icon with voltage + %
