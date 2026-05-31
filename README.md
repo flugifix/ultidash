@@ -12,8 +12,8 @@ run it full-screen.
 
 > ⚠️ **Work in progress / under testing.** Version **0.1** is an early experimental
 > release and is still being tested in the field. Expect rough edges and changes;
-> use at your own risk. Developed on EdgeTX 2.12 with Rotorflight 2.x and **tested on
-> RadioMaster TX15 and TX16S MK3**. Feedback and bug reports are very welcome.
+> use at your own risk. Developed on EdgeTX 2.12 with **Rotorflight 2.3 (required)** and
+> **tested on RadioMaster TX15 and TX16S MK3**. Feedback and bug reports are very welcome.
 
 ---
 
@@ -50,8 +50,9 @@ here, I will of course respect that.
 ## Requirements
 
 - EdgeTX **color radio** with LVGL widget support (developed on 2.12).
-- **Rotorflight** with the **RFTool** widget installed (provides connection/arm state
-  and MSP data). MSP is only read on connect/disarm — never during armed flight.
+- **Rotorflight 2.3** (required) with the **RFTool** widget installed (provides
+  connection/arm state and MSP data). MSP is only read on connect/disarm — never during
+  armed flight.
 - Telemetry sensors (fixed names): `Vbat`, `Vcel`, `Cel#`, `Curr`, `Capa`, `Bat%`,
   `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `RQly`,
   `TPWR`, and (for ESC status) `Esc#` + `EscF`, plus `Skp` (skipped-packet counter).
