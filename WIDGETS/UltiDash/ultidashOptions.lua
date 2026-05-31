@@ -16,6 +16,7 @@ local M = {
         { "LinkWarn",       BOOL,   1 },
         { "RQlyWarn",       VALUE,  50, 0, 100 },
         { "RQlyCrit",       VALUE,  30, 0, 100 },
+        { "TopLeft",        CHOICE, 1,  { "Model image", "Timer" } },
     },
 
     translate = function(name)
@@ -35,6 +36,7 @@ local M = {
             LinkWarn = "Link/telemetry warnings",
             RQlyWarn = "Link quality warn (%)",
             RQlyCrit = "Link quality critical (%)",
+            TopLeft = "Top-left area shows",
         }
         return translations[name]
     end

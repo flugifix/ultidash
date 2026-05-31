@@ -2,6 +2,7 @@
 #########################################################################
 #                                                                       #
 #  UltiDash v0.1 - Rotorflight LVGL dashboard widget for EdgeTX         #
+#  Tested on RadioMaster TX15 and TX16S MK3 (EdgeTX 2.12).              #
 #                                                                       #
 #  Intended license: GPLv3 (http://www.gnu.org/licenses/gpl-3.0.html)   #
 #  NOT yet cleanly licensable as a whole - see the license notes below: #

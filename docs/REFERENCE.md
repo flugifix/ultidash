@@ -34,7 +34,7 @@ Alle Optionen erscheinen in der EdgeTX-Widget-Konfiguration.
 
 | Option | Typ | Default | Bereich | Bedeutung |
 |--------|-----|---------|---------|-----------|
-| **Timer** | TIMER | 0 | – | Welcher Modell-Timer für die Flugzeit-Reset-Erkennung genutzt wird (nicht mehr angezeigt) |
+| **Timer** | TIMER | 0 | – | Welcher Modell-Timer im Top-Left-Bereich angezeigt wird, wenn `TopLeft = Timer` |
 | **BGFilled** | BOOL | 0 (aus) | – | Hintergrundfarbe füllen |
 | **Reserve** | VALUE | 20 | 0–40 | Reserve-Kapazität in %. 0 % Anzeige = Reserve erreicht (ePowerbar-Modell) |
 | **CalloutInt** | VALUE | 6 | 1–60 | Mindestabstand zwischen Voice-Callouts (Sekunden) |
@@ -49,6 +49,7 @@ Alle Optionen erscheinen in der EdgeTX-Widget-Konfiguration.
 | **LinkWarn** | BOOL | 1 (an) | – | Link-/Telemetrie-Warnungen ein/aus (Verlust + niedrige RQly) |
 | **RQlyWarn** | VALUE | 50 | 0–100 | RQly-Warnschwelle in % (ELRS Link Quality) |
 | **RQlyCrit** | VALUE | 30 | 0–100 | RQly-Kritisch-Schwelle in % (mit Vibration) |
+| **TopLeft** | CHOICE | Model image | Model image / Timer | Was oben links angezeigt wird: Modellbild oder der `Timer` |
 
 > **Hinweis:** Zellspannungen werden in **Centivolt** angegeben (412 = 4,12 V).
 
@@ -89,7 +90,8 @@ UltiDash hat zwei automatisch umgeschaltete Ansichten.
 1. **Modell-Bild** (eBitmap) – fester reservierter Bereich (~32 % der Panel-Höhe),
    Bild oben verankert im echten Seitenverhältnis (kein Schweben). Der feste Bereich
    sorgt dafür, dass die Zeilen darunter bei unterschiedlichen Bildformaten **nicht
-   verrutschen**.
+   verrutschen**. Alternativ (Option `TopLeft = Timer`) zeigt dieser Bereich den
+   gewählten **Modell-`Timer`** groß an statt des Bildes.
 2. **Flüge** + **Gesamtflugzeit** (aus RF-MSP-Flugstatistik) – direkt unter dem Bildbereich
 3. **Headline-Zeile: Governor State** (links) + **Throttle %** (rechts)
 4. **ESC-/Arming-Statuszeile** (volle Breite, farbig). Zeigt ESC-Fehler bzw.
@@ -218,7 +220,7 @@ Fest verdrahtete Rotorflight-Sensornamen (keine konfigurierbaren Quellen):
 | `Esc#` / `EscF` | **ESC-Signatur + Statusflags (eStatus)** |
 | `RQly` / `RQly-` | **Link Quality aktuell (Link-Warnung)** / Min |
 | `TPWR+` | TX-Power (Max) |
-| `Skp` | Zähler nicht ausgewerteter/verworfener Telemetriepakete (Statusleisten unten) |
+| `*Skp` | Zähler nicht ausgewerteter/verworfener Telemetriepakete (Statusleisten unten); Sensorlabel beginnt wirklich mit `*` |
 
 EdgeTX-Telemetrie-Setup (Basis, ESC-Sensoren `Esc#`/`EscF` zusätzlich aktivieren):
 ```

@@ -507,8 +507,29 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
     local grid_value_h = math.max(profile_font_h, rate_font_h, battp_font_h)
     local grid_pad = math.max(0, math.floor((h_grid - header_h - grid_value_h) / 2))
 
-    local status_children = {
-        {
+    local status_children = {}
+
+    -- top-left slot: model image (default) or the configured model timer (TopLeft option)
+    if wgt.options.TopLeft == 2 then
+        local timer_val_h = math.max(1, image_slot_h - header_h - 2)
+        local timer_font = select_font(timer_val_h, inner_w, "-00:00")
+        local timer_font_h = measure_font(timer_font)
+        status_children[#status_children + 1] = {
+            type = "label", x = pad, y = pad, w = inner_w, h = header_h,
+            text = wgt.values.label_timer, font = header_font, color = COLOR_THEME_SECONDARY1, align = CENTER
+        }
+        status_children[#status_children + 1] = {
+            type = "label",
+            x = pad,
+            y = pad + header_h + math.floor((image_slot_h - header_h - timer_font_h) / 2),
+            w = inner_w, h = timer_font_h,
+            text = wgt.values.timer_str_formatted,
+            font = timer_font,
+            color = function() return wgt.values.timer_color() end,
+            align = CENTER
+        }
+    else
+        status_children[#status_children + 1] = {
             type = "image",
             x = pad,
             y = pad,
@@ -517,7 +538,7 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
             file = function() return wgt.values.model_image_path end,
             fill = false
         }
-    }
+    end
 
     -- flight totals directly under the image
     add_stacked_field(status_children, pad, y_meta, half_w, meta_pad,

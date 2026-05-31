@@ -104,7 +104,16 @@ local function is_rf_connected(wgt)
     return wgt.values.rf_connection_state ~= "disconnected"
 end
 
+-- Armed detection. Prefer the ARM telemetry sensor (Rotorflight arming flags,
+-- bit 0 = armed) because it's always available and authoritative; the RFTool
+-- connection state ("armed") is only a fallback (it doesn't reliably report the
+-- armed sub-state on every setup, which left flight-time tracking at 00:00).
 local function is_craft_armed(wgt)
+    local arm = getSourceValue("ARM")
+    if arm ~= nil then
+        arm = math.floor(arm)
+        return (arm % 2) == 1 or arm == 1024
+    end
     return wgt.values.rf_connection_state == "armed"
 end
 
@@ -115,23 +124,21 @@ end
 -- headspeed (rpm) above which the rotor counts as "spinning" for flight time
 local FLIGHT_TIME_MIN_HEADSPEED = 100
 
--- Flight-time tracking, made independent of the RFTool connection/arm state.
--- The old logic required is_rf_connected AND governor state > 2, i.e. it depended
--- BOTH on the RFTool state machine (rf2.rfToolState) AND the RF internal governor.
--- If either wasn't feeding through, flight time stayed at 00:00.
---
--- New: headspeed is the ground truth ("rotor spinning" = flying), read straight
--- from the Hspd sensor with no RFTool dependency. Falls back to governor state,
--- then to RFTool armed state, only when no headspeed sensor is present.
+-- Flight-time tracking: count only while ARMED *and* the rotor is spinning (both in
+-- combination). Sensors are read DIRECTLY here (getSourceValue), independent of the
+-- refresh path / rf_connection_state / any wgt.values caching — that indirection was
+-- unreliable (rfToolState is nil on this RFTool, so cached values could be stale).
 local function should_track_flight_time(wgt)
-    local hs = wgt.values.headspeed
-    if hs ~= nil then
-        return hs > FLIGHT_TIME_MIN_HEADSPEED
+    local arm = getSourceValue("ARM")
+    if arm ~= nil then
+        arm = math.floor(arm)
+        if (arm % 2) ~= 1 and arm ~= 1024 then return false end   -- ARM bit0 clear = disarmed
+    elseif not is_craft_armed(wgt) then
+        return false                                              -- no ARM sensor -> cached state
     end
-    if wgt.values.gov_state ~= nil then
-        return is_rf_connected(wgt) and should_track_governor_run_extrema(wgt)
-    end
-    return is_craft_armed(wgt)
+    local hs = getSourceValue("Hspd")
+    if hs == nil then return true end            -- no Hspd sensor -> armed-only
+    return hs > FLIGHT_TIME_MIN_HEADSPEED
 end
 
 local function reset_flight_time(wgt)
@@ -278,18 +285,14 @@ function ultidash_functions.update_model_image(wgt)
 end
 
 function ultidash_functions.update_timer_count(wgt)
+    -- model timer (only for optional display in the top-left area via the TopLeft option).
+    -- NOTE: deliberately NOT coupled to reset_flight_time anymore — the old coupling wiped
+    -- flight time when the timer rolled back to its start value (e.g. on disarm/throttle-cut,
+    -- exactly when you look at the stats page). Flight time resets only on telemetry reconnect.
     local t1 = model.getTimer(wgt.options.Timer or 0)
-    local timer_value = t1 and t1.value
-    local timer_start = t1 and t1.start
     local timer_text, is_negative = format_time(t1)
-
     wgt.values.timer_str = timer_text
     wgt.values.timer_is_negative = is_negative
-
-    if timer_value ~= nil and timer_start ~= nil and wgt.last_model_timer_value ~= nil and timer_value == timer_start and wgt.last_model_timer_value ~= timer_start then
-        reset_flight_time(wgt)
-    end
-    wgt.last_model_timer_value = timer_value
 
     local now = getTime() or 0
     if should_track_flight_time(wgt) then

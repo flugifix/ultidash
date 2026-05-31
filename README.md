@@ -12,8 +12,8 @@ run it full-screen.
 
 > ⚠️ **Work in progress / under testing.** Version **0.1** is an early experimental
 > release and is still being tested in the field. Expect rough edges and changes;
-> use at your own risk. Developed on RadioMaster TX16S / EdgeTX 2.12 with
-> Rotorflight 2.x. Feedback and bug reports are very welcome.
+> use at your own risk. Developed on EdgeTX 2.12 with Rotorflight 2.x and **tested on
+> RadioMaster TX15 and TX16S MK3**. Feedback and bug reports are very welcome.
 
 ---
 

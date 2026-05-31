@@ -189,9 +189,11 @@ function M.createValues(wgt)
         label_model = "Model: ",
         label_skp = "Skp",
 
-        -- "Skp" telemetry sensor = counter of skipped/undecoded telemetry packets
+        -- "*Skp" telemetry sensor = counter of skipped/undecoded telemetry packets.
+        -- The sensor label literally starts with '*'; try that first, fall back to "Skp".
         skp_formatted = function()
-            local v = getSourceValue("Skp")
+            local v = getSourceValue("*Skp")
+            if v == nil then v = getSourceValue("Skp") end
             if v == nil then return "-" end
             return string.format("%d", math.floor(v))
         end,
