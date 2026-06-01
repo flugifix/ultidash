@@ -1,5 +1,34 @@
 local M = {}
 
+-- color palette shadows (see ultidash.lua); swapped via M.set_palette
+local COLOR_THEME_PRIMARY1   = COLOR_THEME_PRIMARY1
+local COLOR_THEME_PRIMARY2   = COLOR_THEME_PRIMARY2
+local COLOR_THEME_SECONDARY1 = COLOR_THEME_SECONDARY1
+local COLOR_THEME_SECONDARY2 = COLOR_THEME_SECONDARY2
+local COLOR_THEME_SECONDARY3 = COLOR_THEME_SECONDARY3
+local COLOR_THEME_FOCUS      = COLOR_THEME_FOCUS
+local COLOR_THEME_WARNING    = COLOR_THEME_WARNING
+local COLOR_THEME_DISABLED   = COLOR_THEME_DISABLED
+local THEME_PALETTE = {
+    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2,
+    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED,
+}
+local CLEAN_PALETTE = {
+    lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
+    lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
+}
+
+function M.set_palette(use_clean)
+    local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
+    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
+    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
+end
+
+-- Battery cell-voltage thresholds come from the Rotorflight FC (mspBatteryConfig:
+-- vbatfull/warning/min cellvoltage), fetched on connect/disarm. These DEFAULT_* are only
+-- internal safety values for the brief window before the FC config has been received —
+-- there is intentionally no widget-option fallback (the dashboard is Rotorflight-only).
+local DEFAULT_CELL_FULL_VOLTAGE = 4.1
 local DEFAULT_CELL_WARNING_VOLTAGE = 3.3
 local DEFAULT_CELL_ALARM_VOLTAGE = 3.2
 local GOV_STATE_LABELS = {
@@ -36,6 +65,10 @@ end
 
 local function get_cell_alarm_threshold(wgt)
     return normalize_cell_voltage(wgt.values.rf_cell_alarm_voltage, DEFAULT_CELL_ALARM_VOLTAGE)
+end
+
+local function get_cell_full_threshold(wgt)
+    return normalize_cell_voltage(wgt.values.rf_cell_full_voltage, DEFAULT_CELL_FULL_VOLTAGE)
 end
 
 local function get_display_voltage_threshold(wgt, cell_threshold)
@@ -152,7 +185,7 @@ function M.createValues(wgt)
         label_current = "Current",
         label_fuel = "Fuel",
         label_capacity = "Energy Used (mAh)",
-        label_esc_temp = "ESC Temperature",
+        label_esc_temp = "ESC Temp",
         label_battery_voltage = "Batt Voltage",
         label_headspeed = "Headspeed",
         label_bec_voltage = "BEC Voltage",
@@ -188,6 +221,9 @@ function M.createValues(wgt)
         label_curr = "CURR",
         label_model = "Model: ",
         label_skp = "Skp",
+        label_rqly_cur = "RQly",
+        label_tqly = "TQly",
+        label_tpwr_cur = "TPWR",
 
         -- "*Skp" telemetry sensor = counter of skipped/undecoded telemetry packets.
         -- The sensor label literally starts with '*'; try that first, fall back to "Skp".
@@ -196,6 +232,22 @@ function M.createValues(wgt)
             if v == nil then v = getSourceValue("Skp") end
             if v == nil then return "-" end
             return string.format("%d", math.floor(v))
+        end,
+        -- current link / power values (read directly, like skp)
+        rqly_cur_formatted = function()
+            local v = getSourceValue("RQly")
+            if v == nil then return "-" end
+            return string.format("%d%%", v)
+        end,
+        tqly_cur_formatted = function()
+            local v = getSourceValue("TQly")
+            if v == nil then return "-" end
+            return string.format("%d%%", v)
+        end,
+        tpwr_cur_formatted = function()
+            local v = getSourceValue("TPWR")
+            if v == nil then return "-" end
+            return string.format("%dmW", v)
         end,
 
         headspeed = nil,
@@ -255,6 +307,9 @@ function M.createValues(wgt)
         end,
         vcel_alarm_threshold = function()
             return get_cell_alarm_threshold(wgt)
+        end,
+        vcel_full_threshold = function()
+            return get_cell_full_threshold(wgt)
         end,
         vcel_actual_color = function()
             return get_cell_voltage_color_for_value(wgt, wgt.values.vcel)
@@ -518,7 +573,7 @@ function M.createValues(wgt)
         timer_str_formatted = function() return wgt.values.timer_str end,
 
         flight_time_str = "00:00",
-        flight_time_color = COLOR_THEME_PRIMARY1,
+        flight_time_color = function() return COLOR_THEME_PRIMARY1 end,
         flight_time_str_formatted = function() return wgt.values.flight_time_str end,
 
         rqly_min = nil,
@@ -542,6 +597,7 @@ function M.createValues(wgt)
         rf_battery_profile = nil,
         rf_cell_warning_voltage = nil,
         rf_cell_alarm_voltage = nil,
+        rf_cell_full_voltage = nil,
         rf_battery_profile_display_formatted = function()
             local profile_value = wgt.values.rf_battery_profile
             if profile_value == nil or profile_value < 0 then return "-" end

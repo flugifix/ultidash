@@ -42,16 +42,23 @@ All options appear in the EdgeTX widget configuration.
 | **Mute** | CHOICE | None | None / Voltage alerts / Voltage and fuel alerts | Which voice alerts are muted |
 | **StatsViewMode** | CHOICE | On disarmed | Never / On disarmed / On disconnected | When the statistics page is shown |
 | **VoltageDisplay** | CHOICE | Cell voltage | Cell voltage / Battery voltage | Whether cell or total voltage is shown |
-| **CellFull** | VALUE | 412 | 0–480 | Full cell voltage in **centivolts** (4.12 V) – for the startup cell-check |
-| **CellLow** | VALUE | 345 | 0–440 | Low cell voltage in cv (3.45 V) – low-voltage alert |
-| **CellCritical** | VALUE | 330 | 0–440 | Critical cell voltage in cv (3.30 V) – critical alert |
 | **StartupDelay** | VALUE | 4 | 1–20 | Duration of the startup cell-check (seconds) |
 | **LinkWarn** | BOOL | 1 (on) | – | Link/telemetry warnings on/off (loss + low RQly) |
 | **RQlyWarn** | VALUE | 50 | 0–100 | RQly warning threshold in % (ELRS Link Quality) |
 | **RQlyCrit** | VALUE | 30 | 0–100 | RQly critical threshold in % (with vibration) |
 | **TopLeft** | CHOICE | Model image | Model image / Timer | What the top-left area shows: model image or the `Timer` |
+| **ColorScheme** | CHOICE | UltiDash | UltiDash / by EdgeTX Theme | `UltiDash` = fixed built-in palette (independent of the active EdgeTX theme); `by EdgeTX Theme` = follow the active EdgeTX theme colors |
 
-> **Note:** cell voltages are given in **centivolts** (412 = 4.12 V).
+> **Cell-voltage thresholds come from the Rotorflight FC** (`mspBatteryConfig`:
+> `vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`), read on
+> connect/disarm and cached — there is no widget option for them (dashboard is
+> Rotorflight-only). Cell count and capacity also come from the FC.
+> **ColorScheme = UltiDash** applies a fixed built-in palette (based on the "Clean Theme"
+> by Mate Soos) so the widget looks the same regardless of the active EdgeTX theme;
+> **by EdgeTX Theme** uses the `COLOR_THEME_*` colors of the active theme. With `BGFilled`
+> on, the fill is **white** in UltiDash mode (matching that palette's white background), or
+> `SECONDARY3` in EdgeTX-theme mode. Enable `BGFilled` to get the full UltiDash look on
+> other EdgeTX themes.
 
 ---
 
@@ -81,6 +88,7 @@ UltiDash has two views that switch automatically.
 
 **Top bar** (replaces the EdgeTX top bar for full-screen use):
 - **left:** date + time (`getDateTime()`)
+- **center:** ELRS link quality — `RQ` (RQly, downlink) and `TQ` (TQly, uplink)
 - **right:** radio (TX) battery as a compact icon with the **% drawn on the icon** and the
   voltage beside it; fill green/red depending on the warning threshold (from `getGeneralSettings`)
 - *Volume is intentionally not included* – EdgeTX Lua cannot read the level
@@ -107,7 +115,7 @@ UltiDash has two views that switch automatically.
 - ESC temperature
 - BEC voltage
 
-**Bottom status bar:** `Model: <name>` · arm state (Armed/Disarmed) · `Skp: <n>`
+**Bottom status bar:** `Model: <name>` · arm state (Armed/Disarmed) · `TPWR: <mW>` · `Skp: <n>`
 ("Skp" = counter of skipped/undecoded telemetry packets; the TX battery now sits in the top bar)
 → When arming-disable flags are present, the warning "Arming Disabled: …" is shown instead.
 
@@ -169,7 +177,7 @@ fuel  = (raw − Reserve) / (100 − Reserve) × 100
 ### Startup cell-check
 When the voltage first appears (power-on/connect):
 1. Grey progress bar for `StartupDelay` seconds
-2. Then compare cell voltage vs. `CellFull`:
+2. Then compare cell voltage vs. the FC's full-cell voltage (`vbatfullcellvoltage`):
    - full → green
    - not full → amber + **`batlow` tone** + spoken total voltage
 
@@ -181,16 +189,16 @@ There are **six** triggers:
 
 | # | Trigger | Condition | Output | Gated by | Runs in background? |
 |---|----------|-----------|---------|-------------|----------------------|
-| 1 | **Startup cell-check** | after `StartupDelay`, if cell < `CellFull` | `batlow` + voltage | – | no (active screen only) |
+| 1 | **Startup cell-check** | after `StartupDelay`, if cell < FC full-cell voltage | `batlow` + voltage | – | no (active screen only) |
 | 2 | **Fuel callout** | connected **and** armed; depending on fuel level | `battry`/`batlow`/`batcrt` + % (+ vibration when critical) | `Mute` from "Voltage and fuel alerts" | **yes** |
-| 3 | **Voltage alert** | connected **and** armed; cell ≤ `CellLow`/`CellCritical` | `batlow`/`batcrt` + total voltage (+ vibration when critical) | `Mute` from "Voltage alerts" | **yes** |
+| 3 | **Voltage alert** | connected **and** armed; cell ≤ FC warning/min voltage | `batlow`/`batcrt` + total voltage (+ vibration when critical) | `Mute` from "Voltage alerts" | **yes** |
 | 4 | **Armed/disarm** | arm state change | `armed` / `disarm` | – | no (active screen only) |
 | 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | low tone + vibration (lost) / short high tone (recovered) | `LinkWarn` | **yes** |
 | 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | tone (by severity) + RQly % (+ vibration when critical) | `LinkWarn` | **yes** |
 
 Details:
 - **Fuel callout (2):** value rounded to the 10s (above reserve), singles near critical; the first sample after arming is skipped; min. spacing `CalloutInt`.
-- **Voltage alert (3):** debounce (hold 0.5 s), then at the earliest after `CalloutInt`. Thresholds from `CellLow`/`CellCritical`.
+- **Voltage alert (3):** debounce (hold 0.5 s), then at the earliest after `CalloutInt`. Thresholds from the FC (`vbatwarningcellvoltage`/`vbatmincellvoltage`).
 - **Telemetry lost (5):** **only if the loss happens from the armed state** (a real in-flight loss). Losses on the ground / while disarmed stay silent (logged only). The "recovered" tone only fires if an armed loss was reported before. Source = RF connection state (not raw RSSI). ⚠️ EdgeTX may have its **own** "telemetry lost" callout → it can double up; disable the EdgeTX trigger in that case.
 - **Link quality (6):** ELRS **RQly** (Link Quality %), **armed only**; debounce 0.5 s, then at the earliest after `CalloutInt`. Tones instead of speech files so it's distinct from the battery callouts.
 - **Background:** 2, 3, 5, 6 also run when UltiDash isn't the active screen (when armed).

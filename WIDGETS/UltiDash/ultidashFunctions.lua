@@ -23,6 +23,24 @@ local ultidash_functions = {}
 
 local esc = loadScript("/WIDGETS/UltiDash/ultidashEsc.lua")()
 
+-- color palette shadows (see ultidash.lua); swapped via ultidash_functions.set_palette
+local COLOR_THEME_PRIMARY1   = COLOR_THEME_PRIMARY1
+local COLOR_THEME_PRIMARY2   = COLOR_THEME_PRIMARY2
+local COLOR_THEME_SECONDARY1 = COLOR_THEME_SECONDARY1
+local COLOR_THEME_SECONDARY2 = COLOR_THEME_SECONDARY2
+local COLOR_THEME_SECONDARY3 = COLOR_THEME_SECONDARY3
+local COLOR_THEME_FOCUS      = COLOR_THEME_FOCUS
+local COLOR_THEME_WARNING    = COLOR_THEME_WARNING
+local COLOR_THEME_DISABLED   = COLOR_THEME_DISABLED
+local THEME_PALETTE = {
+    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2,
+    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED,
+}
+local CLEAN_PALETTE = {
+    lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
+    lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
+}
+
 -- ePowerbar-style discrete bar colors (after Rob 'bob00' Gayle)
 local AUDIO_PATH = "/SOUNDS/en/"
 local BAR_COLOR_OK       = lcd.RGB(0x00, 0xff, 0x00)
@@ -38,6 +56,15 @@ local ESC_LEVEL_COLORS = {
     [esc.LEVEL_WARN]  = BAR_COLOR_LOW,
     [esc.LEVEL_ERROR] = BAR_COLOR_CRITICAL,
 }
+
+-- swap the theme color shadows (called from ultidash.lua update())
+function ultidash_functions.set_palette(use_clean)
+    local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
+    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
+    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
+    ESC_LEVEL_COLORS[esc.LEVEL_TRACE] = COLOR_THEME_DISABLED
+    ESC_LEVEL_COLORS[esc.LEVEL_INFO]  = COLOR_THEME_PRIMARY1
+end
 
 local ARM_DISABLE_DESCS = {
     "NOGYRO", "FAILSAFE", "RXLOSS", "BADRX", "BOXFAILSAFE", "RUNAWAY", "CRASH",
@@ -477,7 +504,7 @@ end
 function ultidash_functions.update_battery_gauge(wgt)
     local vbat = wgt.values.vbat
     local startup_delay = math.max(1, wgt.options.StartupDelay or 4) * 100
-    local cell_full = (wgt.options.CellFull or 412) / 100
+    local cell_full = wgt.values.vcel_full_threshold()   -- from FC (mspBatteryConfig)
 
     -- arm the check when voltage first appears
     local had_voltage = wgt.prev_vbat ~= nil and wgt.prev_vbat > 0
@@ -735,10 +762,10 @@ local function crank_voltage_alerts(wgt)
     local now = getTime()
     if now < wgt.alert_next then return end
 
-    -- thresholds are configured in centivolts (ePowerbar CellLow / CellCritical)
+    -- thresholds come from the Rotorflight FC (mspBatteryConfig), in centivolts
     local cv = math.floor(cellv * 100)
-    local alarm = wgt.options.CellCritical or 330
-    local low = wgt.options.CellLow or 345
+    local alarm = math.floor(wgt.values.vcel_alarm_threshold() * 100)
+    local low = math.floor(wgt.values.vcel_warning_threshold() * 100)
 
     local alert_level = (cv <= alarm and ALERTLEVEL_CRITICAL) or (cv <= low and ALERTLEVEL_LOW) or ALERTLEVEL_NONE
 

@@ -3,6 +3,45 @@ local ultidash_functions = loadScript(script_dir .. "ultidashFunctions.lua")()
 local ultidash_values = loadScript(script_dir .. "ultidashValues.lua")()
 local rf_service = loadScript(script_dir .. "ultidashRf.lua")()
 local show_debug_border = 0
+
+-- ============================================================================
+-- COLOR PALETTE
+-- Shadow the EdgeTX theme color constants as file-locals so the whole UI can be
+-- switched to a fixed "Clean" palette (independent of the active EdgeTX theme)
+-- via the ColorScheme option — without touching the many call sites below.
+-- set_palette() reassigns these locals; the call sites just see the new values.
+-- ============================================================================
+local COLOR_THEME_PRIMARY1   = COLOR_THEME_PRIMARY1
+local COLOR_THEME_PRIMARY2   = COLOR_THEME_PRIMARY2
+local COLOR_THEME_SECONDARY1 = COLOR_THEME_SECONDARY1
+local COLOR_THEME_SECONDARY2 = COLOR_THEME_SECONDARY2
+local COLOR_THEME_SECONDARY3 = COLOR_THEME_SECONDARY3
+local COLOR_THEME_FOCUS      = COLOR_THEME_FOCUS
+local COLOR_THEME_WARNING    = COLOR_THEME_WARNING
+local COLOR_THEME_DISABLED   = COLOR_THEME_DISABLED
+
+-- originals (follow active EdgeTX theme)
+local THEME_PALETTE = {
+    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2,
+    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED,
+}
+-- static "Clean Theme" (Mate Soos) values
+local CLEAN_PALETTE = {
+    lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
+    lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
+}
+
+-- panel background used when BGFilled is on. For the Clean palette this is WHITE to match
+-- the Clean theme's actual wallpaper (which is solid white, not SECONDARY3); for the EdgeTX
+-- theme it follows SECONDARY3 as before.
+local PANEL_BG = COLOR_THEME_SECONDARY3
+
+local function set_palette(use_clean)
+    local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
+    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
+    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
+    PANEL_BG = use_clean and lcd.RGB(0xFF, 0xFF, 0xFF) or THEME_PALETTE[5]
+end
 -- Header font - set dynamically in the active UI builder based on available space
 local header_font = MIDSIZE
 local header_h = 0
@@ -376,6 +415,8 @@ local function build_vertical_fuel_gauge_element(container, wgt, x, y, c_w, c_h)
         color = COLOR_THEME_SECONDARY1,
         filled = true
         }, {
+        -- body outline only (filled=false) — the interior between the bars and the
+        -- outline stays transparent so it follows the background (theme/BGFilled/wallpaper)
         type = "rectangle",
         x = body_x,
         y = body_y,
@@ -874,8 +915,9 @@ local function build_status_bar_normal_element(container, wgt, x, y, c_w, c_h)
     local labels = {}
 
     if init_view_state(wgt).current == "flight" then
-        local model_w = math.floor(c_w * 0.50)
-        local tx_w = math.floor(c_w * 0.28)
+        local model_w = math.floor(c_w * 0.46)
+        local skp_w = math.floor(c_w * 0.16)
+        local tpwr_w = math.floor(c_w * 0.24)
         local model_text_x = x + card_padding
         local model_text_w = math.max(1, model_w - 2 * card_padding)
 
@@ -900,9 +942,9 @@ local function build_status_bar_normal_element(container, wgt, x, y, c_w, c_h)
             align = CENTER
         })
         labels[3] = container:label({
-            x = x + c_w - tx_w,
+            x = x + c_w - skp_w,
             y = y + y_offset,
-            w = tx_w,
+            w = skp_w,
             h = header_font_h,
             text = function() return string.format("%s: %s", wgt.values.label_skp, wgt.values.skp_formatted()) end,
             font = header_font,
@@ -910,12 +952,13 @@ local function build_status_bar_normal_element(container, wgt, x, y, c_w, c_h)
             align = RIGHT
         })
 
+        -- TPWR between the (centered) arm state and Skp
         labels[4] = container:label({
-            x = x,
-            y = y,
-            w = 0,
-            h = 0,
-            text = "",
+            x = x + c_w - skp_w - tpwr_w,
+            y = y + y_offset,
+            w = tpwr_w,
+            h = header_font_h,
+            text = function() return string.format("%s: %s", wgt.values.label_tpwr_cur, wgt.values.tpwr_cur_formatted()) end,
             font = header_font,
             color = COLOR_THEME_PRIMARY1,
             align = RIGHT
@@ -1016,18 +1059,6 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h)
     local font_h = measure_font(header_font)
     local y_off = math.floor((c_h - font_h) / 2)
 
-    -- left: date + time
-    container:label({
-        x = x + 1,
-        y = y + y_off,
-        w = math.floor(c_w * 0.55),
-        h = font_h,
-        text = function() return wgt.values.clock_date_formatted() .. "  " .. wgt.values.clock_time_formatted() end,
-        font = header_font,
-        color = COLOR_THEME_PRIMARY1,
-        align = LEFT
-    })
-
     -- right: a compact battery icon with the percentage overlaid ON the icon and
     -- the voltage right-aligned just to its left — one tight, integrated cluster.
     local icon_h = math.max(8, c_h - 2)
@@ -1035,13 +1066,41 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h)
     local term_w = math.max(2, math.floor(icon_w * 0.06))
     local icon_x = x + c_w - icon_w - term_w - 1
     local icon_y = y + math.floor((c_h - icon_h) / 2)
-    local volt_w = math.floor(c_w * 0.22)
+    local volt_w = math.floor(c_w * 0.20)
+    local volt_text_x = icon_x - volt_w - 3
     local pct_font = select_font(icon_h - 2, icon_w - 4, "100%")
     local pct_font_h = measure_font(pct_font)
 
+    -- left: date + time
+    local date_w = math.floor(c_w * 0.36)
+    container:label({
+        x = x + 1,
+        y = y + y_off,
+        w = date_w,
+        h = font_h,
+        text = function() return wgt.values.clock_date_formatted() .. "  " .. wgt.values.clock_time_formatted() end,
+        font = header_font,
+        color = COLOR_THEME_PRIMARY1,
+        align = LEFT
+    })
+
+    -- center: ELRS link quality (RQly downlink + TQly uplink)
+    local center_x = x + date_w + 4
+    local center_w = math.max(1, volt_text_x - center_x - 4)
+    container:label({
+        x = center_x,
+        y = y + y_off,
+        w = center_w,
+        h = font_h,
+        text = function() return string.format("RQ %s  TQ %s", wgt.values.rqly_cur_formatted(), wgt.values.tqly_cur_formatted()) end,
+        font = header_font,
+        color = COLOR_THEME_PRIMARY1,
+        align = CENTER
+    })
+
     -- voltage left of the icon
     container:label({
-        x = icon_x - volt_w - 3,
+        x = volt_text_x,
         y = y + y_off,
         w = volt_w,
         h = font_h,
@@ -1131,7 +1190,7 @@ local function build_flight_ui(wgt, zone)
     wgt.status_bar_elements = nil
     wgt.status_bar_state = nil
 
-    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = COLOR_THEME_SECONDARY3, filled = (wgt.options.BGFilled == 1) })
+    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (wgt.options.BGFilled == 1) })
 
     -- top bar (date/time + radio battery)
     local top_bar_box = main_panel:box({ x = 0, y = outer_pad, w = w - 4, h = top_box_h })
@@ -1178,7 +1237,7 @@ local function build_stats_ui(wgt, zone)
     wgt.status_bar_elements = nil
     wgt.status_bar_state = nil
 
-    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = COLOR_THEME_SECONDARY3, filled = (wgt.options.BGFilled == 1) })
+    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (wgt.options.BGFilled == 1) })
 
     -- top bar (date/time + radio battery)
     local top_bar_box = main_panel:box({ x = 0, y = 1, w = w - 4, h = top_box_h })
@@ -1277,6 +1336,13 @@ local function update(wgt, options)
     if (wgt == nil) then return end
     prepare_widget(wgt)
     wgt.options = options
+
+    -- apply the chosen color palette to all modules before (re)building the UI
+    local use_clean = (options.ColorScheme or 1) == 1   -- 1 = Clean (default), 2 = EdgeTX theme
+    set_palette(use_clean)
+    ultidash_functions.set_palette(use_clean)
+    ultidash_values.set_palette(use_clean)
+
     lvgl.clear()
 
     if init_view_state(wgt).current == "flight" then

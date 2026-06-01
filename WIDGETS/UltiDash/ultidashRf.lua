@@ -3,6 +3,7 @@ local M = {}
 local function ensure_rf_state(wgt)
     wgt.rf = wgt.rf or {
         available = false,
+        provider_ref = nil,
         is_registered = false,
         last_state = nil,
         msp_allowed = false,
@@ -56,6 +57,7 @@ local function on_battery_config_received(wgt, config)
     wgt.values.rf_battery_cell_count = config and config.batteryCellCount and config.batteryCellCount.value
     wgt.values.rf_cell_warning_voltage = config and config.vbatwarningcellvoltage and config.vbatwarningcellvoltage.value
     wgt.values.rf_cell_alarm_voltage = config and config.vbatmincellvoltage and config.vbatmincellvoltage.value
+    wgt.values.rf_cell_full_voltage = config and config.vbatfullcellvoltage and config.vbatfullcellvoltage.value
     sync_active_battery_capacity(wgt)
 
     wgt.rf_data_dirty = true
@@ -98,6 +100,7 @@ function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
         wgt.values.rf_battery_cell_count = nil
         wgt.values.rf_cell_warning_voltage = nil
         wgt.values.rf_cell_alarm_voltage = nil
+        wgt.values.rf_cell_full_voltage = nil
     end
 
     if on_telemetry_state_changed then
@@ -125,9 +128,15 @@ end
 function M.background(wgt, on_telemetry_state_changed)
     local state = M.init(wgt, on_telemetry_state_changed)
     local provider_available = rf2 ~= nil and type(rf2.registerWidget) == "function" and rf2.useApi ~= nil
+    -- also re-init when the rf2 global itself was replaced (RFTool reload), not only when
+    -- availability changed — otherwise we keep a stale registration and stop getting the
+    -- onStateChanged callbacks (gismo2004's HeliDash fix; critical here since rfToolState
+    -- is nil on this RFTool, so state arrives ONLY via the callback).
+    local provider_changed = state.provider_ref ~= rf2
 
-    if provider_available ~= state.available then
+    if provider_changed or provider_available ~= state.available then
         state.available = provider_available
+        state.provider_ref = rf2
         state.is_registered = false
         state.msp_allowed = false
 
