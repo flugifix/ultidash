@@ -59,15 +59,24 @@ local function get_effective_cell_count(wgt)
     return cell_count
 end
 
+-- Cell-voltage thresholds: from the FC (mspBatteryConfig) or manual options, per the
+-- CellSource option (1 = FC config, 2 = Manual). Manual option values are in centivolts.
+local function use_manual_cell_thresholds(wgt)
+    return wgt.options and wgt.options.CellSource == 2
+end
+
 local function get_cell_warning_threshold(wgt)
+    if use_manual_cell_thresholds(wgt) then return (wgt.options.CellLow or 345) / 100 end
     return normalize_cell_voltage(wgt.values.rf_cell_warning_voltage, DEFAULT_CELL_WARNING_VOLTAGE)
 end
 
 local function get_cell_alarm_threshold(wgt)
+    if use_manual_cell_thresholds(wgt) then return (wgt.options.CellCritical or 330) / 100 end
     return normalize_cell_voltage(wgt.values.rf_cell_alarm_voltage, DEFAULT_CELL_ALARM_VOLTAGE)
 end
 
 local function get_cell_full_threshold(wgt)
+    if use_manual_cell_thresholds(wgt) then return (wgt.options.CellFull or 412) / 100 end
     return normalize_cell_voltage(wgt.values.rf_cell_full_voltage, DEFAULT_CELL_FULL_VOLTAGE)
 end
 

@@ -42,17 +42,26 @@ All options appear in the EdgeTX widget configuration.
 | **Mute** | CHOICE | None | None / Voltage alerts / Voltage and fuel alerts | Which voice alerts are muted |
 | **StatsViewMode** | CHOICE | On disarmed | Never / On disarmed / On disconnected | When the statistics page is shown |
 | **VoltageDisplay** | CHOICE | Cell voltage | Cell voltage / Battery voltage | Whether cell or total voltage is shown |
+| **CellSource** | CHOICE | FC config | FC config / Manual | Where the cell-voltage thresholds come from: the Rotorflight FC (`mspBatteryConfig`) or the manual `CellFull`/`CellLow`/`CellCritical` values below |
+| **CellFull** | VALUE | 412 | 0–480 | Full-cell voltage in **centivolts** (e.g. 412 = 4.12 V). Only used when `CellSource = Manual` |
+| **CellLow** | VALUE | 345 | 0–440 | Low/warning cell voltage in centivolts. Only used when `CellSource = Manual` |
+| **CellCritical** | VALUE | 330 | 0–440 | Critical/min cell voltage in centivolts. Only used when `CellSource = Manual` |
 | **StartupDelay** | VALUE | 4 | 1–20 | Duration of the startup cell-check (seconds) |
 | **LinkWarn** | BOOL | 1 (on) | – | Link/telemetry warnings on/off (loss + low RQly) |
 | **RQlyWarn** | VALUE | 50 | 0–100 | RQly warning threshold in % (ELRS Link Quality) |
 | **RQlyCrit** | VALUE | 30 | 0–100 | RQly critical threshold in % (with vibration) |
 | **TopLeft** | CHOICE | Model image | Model image / Timer | What the top-left area shows: model image or the `Timer` |
 | **ColorScheme** | CHOICE | UltiDash | UltiDash / by EdgeTX Theme | `UltiDash` = fixed built-in palette (independent of the active EdgeTX theme); `by EdgeTX Theme` = follow the active EdgeTX theme colors |
+| **ShowRQly** | BOOL | 1 (on) | – | Top bar: show `RQ` (RQly, downlink link quality) |
+| **ShowTQly** | BOOL | 1 (on) | – | Top bar: show `TQ` (TQly, uplink link quality) |
+| **ShowTPWR** | BOOL | 1 (on) | – | Bottom status bar (flight view): show `TPWR` (TX power) |
+| **ShowTxV** | BOOL | 1 (on) | – | Top bar: show the radio (TX) battery voltage next to the icon |
 
-> **Cell-voltage thresholds come from the Rotorflight FC** (`mspBatteryConfig`:
-> `vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`), read on
-> connect/disarm and cached — there is no widget option for them (dashboard is
-> Rotorflight-only). Cell count and capacity also come from the FC.
+> **Cell-voltage thresholds** default to the **Rotorflight FC** (`CellSource = FC config`):
+> `mspBatteryConfig.vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`,
+> read on connect/disarm and cached. Set `CellSource = Manual` to override them with the
+> `CellFull`/`CellLow`/`CellCritical` options (centivolts). Cell count and capacity always
+> come from the FC.
 > **ColorScheme = UltiDash** applies a fixed built-in palette (based on the "Clean Theme"
 > by Mate Soos) so the widget looks the same regardless of the active EdgeTX theme;
 > **by EdgeTX Theme** uses the `COLOR_THEME_*` colors of the active theme. With `BGFilled`
@@ -88,9 +97,11 @@ UltiDash has two views that switch automatically.
 
 **Top bar** (replaces the EdgeTX top bar for full-screen use):
 - **left:** date + time (`getDateTime()`)
-- **center:** ELRS link quality — `RQ` (RQly, downlink) and `TQ` (TQly, uplink)
+- **center:** ELRS link quality — `RQ` (RQly, downlink, option `ShowRQly`) and `TQ`
+  (TQly, uplink, option `ShowTQly`); each can be hidden independently
 - **right:** radio (TX) battery as a compact icon with the **% drawn on the icon** and the
-  voltage beside it; fill green/red depending on the warning threshold (from `getGeneralSettings`)
+  voltage beside it (voltage toggle: `ShowTxV`); fill green/red depending on the warning
+  threshold (from `getGeneralSettings`)
 - *Volume is intentionally not included* – EdgeTX Lua cannot read the level
   (no `getVolume`); see section 9.
 
@@ -115,8 +126,9 @@ UltiDash has two views that switch automatically.
 - ESC temperature
 - BEC voltage
 
-**Bottom status bar:** `Model: <name>` · arm state (Armed/Disarmed) · `TPWR: <mW>` · `Skp: <n>`
-("Skp" = counter of skipped/undecoded telemetry packets; the TX battery now sits in the top bar)
+**Bottom status bar:** `Model: <name>` · arm state (Armed/Disarmed) · `TPWR: <mW>`
+(toggle: `ShowTPWR`) · `Skp: <n>` ("Skp" = counter of skipped/undecoded telemetry packets;
+the TX battery now sits in the top bar)
 → When arming-disable flags are present, the warning "Arming Disabled: …" is shown instead.
 
 ### 3.2 Stats view
@@ -227,7 +239,8 @@ Hard-wired Rotorflight sensor names (no configurable sources):
 | `Thr` | **Throttle (eStatus)** |
 | `Esc#` / `EscF` | **ESC signature + status flags (eStatus)** |
 | `RQly` / `RQly-` | **Link quality current (link warning)** / min |
-| `TPWR+` | TX power (max) |
+| `TQly` | Uplink link quality (top-bar `TQ`) |
+| `TPWR` / `TPWR+` | TX power (top-bar bottom `TPWR`) / max |
 | `*Skp` | Counter of skipped/undecoded telemetry packets (bottom status bars); the sensor label really starts with `*` |
 
 > **Note:** sensor *IDs* differ from radio to radio — sensors are always referenced by
@@ -313,9 +326,21 @@ From the `Gov` sensor (RF internal governor). Values:
   - `batcrt.wav`, `batlow.wav`, `battry.wav` (included)
   - `armed.wav`, `disarm.wav` (for the arm callout – usually in the EdgeTX default voice pack)
 - **Model images** in `/images/`:
-  - Search order: `<model name>-<cell count>S` → `<model name>` → EdgeTX model bitmap
-  - Extensions: `.png`, `.bmp`, `.jpg`, `.jpeg`
-  - If the image is missing the area stays empty (no error)
+  - **The simplest setup is enough:** place a single file named after the **Rotorflight
+    model name** (`rf2.modelName`), e.g. `MyHeli.png` or `MyHeli.jpg`, in `/images/`.
+    That's all that's needed — the cell-count variant below is purely optional.
+  - **`<name>`** is the Rotorflight model name (`rf2.modelName`); if RFTool is not
+    available it falls back to the **EdgeTX model name** (`model.getInfo().name`).
+  - **Full search order** (first existing file wins):
+    1. `<name>-<cell count>S` — *optional*, only tried when a name **and** a cell count
+       (> 0) are known, e.g. `MyHeli-6S`. Use this only if you want a different picture
+       per cell count (e.g. a 6S vs. a 12S build of the same model).
+    2. `<name>` — the plain model name, e.g. `MyHeli`. **This is the normal case.**
+    3. the EdgeTX model bitmap (`model.getInfo().bitmap`) as a last fallback.
+  - For each of those names the extensions are tried in this order: *(none)*, `.png`,
+    `.bmp`, `.jpg`, `.jpeg`. (The "*(none)*" step matches a name that already includes its
+    own extension.)
+  - If no image is found the area simply stays empty (no error).
 
 ---
 

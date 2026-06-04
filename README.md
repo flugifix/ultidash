@@ -31,8 +31,9 @@ here, I will of course respect that.
 
 ## Features
 
-- **Top bar** — date/time and a compact radio (TX) battery icon with voltage + %
-  (fill turns red below the warning threshold). Replaces the EdgeTX top bar.
+- **Top bar** — date/time, ELRS link quality (`RQ` downlink + `TQ` uplink) and a compact
+  radio (TX) battery icon with voltage + % (fill turns red below the warning threshold).
+  Replaces the EdgeTX top bar. RQ/TQ and the TX voltage can be toggled individually.
 - **Center battery gauge** (ePowerbar model) — reserve-adjusted fuel %, discrete
   green/yellow/red colors, cell count (e.g. `6S`), big % and used mAh, plus a
   startup cell-check (grey progress bar + warning if the pack isn't full).
@@ -54,11 +55,16 @@ here, I will of course respect that.
   connection/arm state and MSP data). MSP is only read on connect/disarm — never during
   armed flight.
 - Telemetry sensors (fixed names): `Vbat`, `Vcel`, `Cel#`, `Curr`, `Capa`, `Bat%`,
-  `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `RQly`,
-  `TPWR`, and (for ESC status) `Esc#` + `EscF`, plus `Skp` (skipped-packet counter).
+  `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `RQly`,
+  `TQly`, `TPWR`, `Thr`, and (for ESC status) `Esc#` + `EscF`, plus `*Skp` (skipped-packet
+  counter — the sensor label really starts with `*`).
 - Sounds in `/SOUNDS/en/`: `batcrt/batlow/battry` (included); `armed/disarm` for the
   arm callout (usually in the EdgeTX voice pack).
-- Optional model images in `/images/` (`<model>-<cells>S` → `<model>` → model bitmap).
+- Optional model image in `/images/`: a single file named after the **Rotorflight model
+  name** is enough — e.g. `MyHeli.png` or `MyHeli.jpg`. (Advanced/optional: a
+  `<model>-<cells>S` variant, e.g. `MyHeli-6S.png`, is preferred when present so you can
+  use a different picture per cell count; otherwise the plain name, then the EdgeTX model
+  bitmap, is used.)
 
 ## Installation
 
@@ -75,8 +81,12 @@ Then add the **UltiDash** widget to a (full-screen) widget zone on a model scree
 ## Configuration
 
 The widget options cover reserve %, callout interval, mute, voltage display
-(cell/battery), cell-check thresholds (`CellFull`/`CellLow`/`CellCritical`), startup
-delay, and the ELRS link warning (on/off + RQly warn/critical thresholds).
+(cell/battery), the cell-threshold source (`CellSource` = FC config **or** Manual, with
+manual `CellFull`/`CellLow`/`CellCritical` values), startup delay, the ELRS link warning
+(on/off + RQly warn/critical thresholds), the color scheme (`ColorScheme` = fixed UltiDash
+palette or follow the EdgeTX theme), what the top-left area shows (`TopLeft` = model image
+or a timer), and per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
+`ShowTPWR`).
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full option list, the layout
 breakdown, the callout matrix and the "what is shown when" tables.

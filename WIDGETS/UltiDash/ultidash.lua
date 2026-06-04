@@ -952,17 +952,19 @@ local function build_status_bar_normal_element(container, wgt, x, y, c_w, c_h)
             align = RIGHT
         })
 
-        -- TPWR between the (centered) arm state and Skp
-        labels[4] = container:label({
-            x = x + c_w - skp_w - tpwr_w,
-            y = y + y_offset,
-            w = tpwr_w,
-            h = header_font_h,
-            text = function() return string.format("%s: %s", wgt.values.label_tpwr_cur, wgt.values.tpwr_cur_formatted()) end,
-            font = header_font,
-            color = COLOR_THEME_PRIMARY1,
-            align = RIGHT
-        })
+        -- TPWR between the (centered) arm state and Skp (toggleable)
+        if wgt.options.ShowTPWR == 1 then
+            labels[#labels + 1] = container:label({
+                x = x + c_w - skp_w - tpwr_w,
+                y = y + y_offset,
+                w = tpwr_w,
+                h = header_font_h,
+                text = function() return string.format("%s: %s", wgt.values.label_tpwr_cur, wgt.values.tpwr_cur_formatted()) end,
+                font = header_font,
+                color = COLOR_THEME_PRIMARY1,
+                align = RIGHT
+            })
+        end
 
         return labels
     end
@@ -1084,31 +1086,46 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h)
         align = LEFT
     })
 
-    -- center: ELRS link quality (RQly downlink + TQly uplink)
-    local center_x = x + date_w + 4
-    local center_w = math.max(1, volt_text_x - center_x - 4)
-    container:label({
-        x = center_x,
-        y = y + y_off,
-        w = center_w,
-        h = font_h,
-        text = function() return string.format("RQ %s  TQ %s", wgt.values.rqly_cur_formatted(), wgt.values.tqly_cur_formatted()) end,
-        font = header_font,
-        color = COLOR_THEME_PRIMARY1,
-        align = CENTER
-    })
+    -- display toggles (per options)
+    local show_rq  = wgt.options.ShowRQly == 1
+    local show_tq  = wgt.options.ShowTQly == 1
+    local show_txv = wgt.options.ShowTxV == 1
 
-    -- voltage left of the icon
-    container:label({
-        x = volt_text_x,
-        y = y + y_off,
-        w = volt_w,
-        h = font_h,
-        text = wgt.values.vtx_voltage_formatted,
-        font = header_font,
-        color = function() return wgt.values.vtx_volts_color end,
-        align = RIGHT
-    })
+    -- center: ELRS link quality (RQly downlink + TQly uplink), each toggleable
+    if show_rq or show_tq then
+        local center_x = x + date_w + 4
+        local center_right = show_txv and volt_text_x or icon_x
+        local center_w = math.max(1, center_right - center_x - 4)
+        container:label({
+            x = center_x,
+            y = y + y_off,
+            w = center_w,
+            h = font_h,
+            text = function()
+                local parts = {}
+                if show_rq then parts[#parts + 1] = "RQ " .. wgt.values.rqly_cur_formatted() end
+                if show_tq then parts[#parts + 1] = "TQ " .. wgt.values.tqly_cur_formatted() end
+                return table.concat(parts, "  ")
+            end,
+            font = header_font,
+            color = COLOR_THEME_PRIMARY1,
+            align = CENTER
+        })
+    end
+
+    -- voltage left of the icon (toggleable)
+    if show_txv then
+        container:label({
+            x = volt_text_x,
+            y = y + y_off,
+            w = volt_w,
+            h = font_h,
+            text = wgt.values.vtx_voltage_formatted,
+            font = header_font,
+            color = function() return wgt.values.vtx_volts_color end,
+            align = RIGHT
+        })
+    end
 
     -- battery icon (terminal, reactive fill, outline)
     container:build({

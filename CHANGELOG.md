@@ -2,6 +2,15 @@
 
 All notable changes to UltiDash are documented here.
 
+## Unreleased
+
+### Added
+- **`CellSource`** option (FC config / Manual): cell-voltage thresholds default to the
+  Rotorflight FC (`mspBatteryConfig`) but can be overridden manually via the re-added
+  **`CellFull` / `CellLow` / `CellCritical`** options (centivolts).
+- Per-element bar toggles: **`ShowRQly`** / **`ShowTQly`** (top-bar RQ/TQ link quality),
+  **`ShowTxV`** (top-bar TX voltage) and **`ShowTPWR`** (bottom-bar TX power).
+
 ## v0.1 — 2026-05-30
 
 First release. **Experimental — still under testing in the field.**
