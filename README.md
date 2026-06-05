@@ -8,7 +8,11 @@ UltiDash brings flight telemetry, battery state, ESC status and radio info toget
 on a single self-contained screen — designed so you can drop the EdgeTX top bar and
 run it full-screen.
 
-![UltiDash dashboard](images/ultidash.jpg)
+![UltiDash flight view](images/ultidash.jpg)
+
+*Flight view (above) and the statistics page shown when disarmed/disconnected (below).*
+
+![UltiDash statistics page](images/ultidash02.jpg)
 
 > ⚠️ **Work in progress / under testing.** Version **0.1** is an early experimental
 > release and is still being tested in the field. Expect rough edges and changes;
