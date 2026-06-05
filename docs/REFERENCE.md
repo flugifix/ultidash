@@ -56,6 +56,8 @@ All options appear in the EdgeTX widget configuration.
 | **ShowTQly** | BOOL | 1 (on) | – | Top bar: show `TQ` (TQly, uplink link quality) |
 | **ShowTPWR** | BOOL | 1 (on) | – | Bottom status bar (flight view): show `TPWR` (TX power) |
 | **ShowTxV** | BOOL | 1 (on) | – | Top bar: show the radio (TX) battery voltage next to the icon |
+| **PwrWarn** | BOOL | 1 (on) | – | Main-power-loss warning on/off (separate toggle) |
+| **PwrWarnV** | VALUE | 90 | 30–500 | Main-power-loss threshold in **0.1 V** (90 = 9.0 V). While armed, if `Vbat` drops below this, `pwr_backup` is announced once |
 
 > **Cell-voltage thresholds** default to the **Rotorflight FC** (`CellSource = FC config`):
 > `mspBatteryConfig.vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`,
@@ -191,13 +193,14 @@ When the voltage first appears (power-on/connect):
 1. Grey progress bar for `StartupDelay` seconds
 2. Then compare cell voltage vs. the FC's full-cell voltage (`vbatfullcellvoltage`):
    - full → green
-   - not full → amber + **`batlow` tone** + spoken total voltage
+   - not full → amber + **`batlow` voice** + spoken total voltage
 
 ---
 
 ## 5. Voice callouts & vibration
 
-There are **six** triggers:
+There are **seven** triggers. All outputs are UltiDash's own WAVs in
+`/SOUNDS/en/ultidash/` (spoken numbers/units come from the EdgeTX voice pack):
 
 | # | Trigger | Condition | Output | Gated by | Runs in background? |
 |---|----------|-----------|---------|-------------|----------------------|
@@ -205,15 +208,17 @@ There are **six** triggers:
 | 2 | **Fuel callout** | connected **and** armed; depending on fuel level | `battry`/`batlow`/`batcrt` + % (+ vibration when critical) | `Mute` from "Voltage and fuel alerts" | **yes** |
 | 3 | **Voltage alert** | connected **and** armed; cell ≤ FC warning/min voltage | `batlow`/`batcrt` + total voltage (+ vibration when critical) | `Mute` from "Voltage alerts" | **yes** |
 | 4 | **Armed/disarm** | arm state change | `armed` / `disarm` | – | no (active screen only) |
-| 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | low tone + vibration (lost) / short high tone (recovered) | `LinkWarn` | **yes** |
-| 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | tone (by severity) + RQly % (+ vibration when critical) | `LinkWarn` | **yes** |
+| 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | `telem_lost` + vibration (lost) / `telem_ok` (recovered) | `LinkWarn` | **yes** |
+| 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | `link_warn`/`link_crit` + RQly % (+ vibration when critical) | `LinkWarn` | **yes** |
+| 7 | **Main power lost** | **armed only**; `Vbat` < `PwrWarnV` | `pwr_backup` + vibration | `PwrWarn` | **yes** |
 
 Details:
 - **Fuel callout (2):** value rounded to the 10s (above reserve), singles near critical; the first sample after arming is skipped; min. spacing `CalloutInt`.
 - **Voltage alert (3):** debounce (hold 0.5 s), then at the earliest after `CalloutInt`. Thresholds from the FC (`vbatwarningcellvoltage`/`vbatmincellvoltage`).
-- **Telemetry lost (5):** **only if the loss happens from the armed state** (a real in-flight loss). Losses on the ground / while disarmed stay silent (logged only). The "recovered" tone only fires if an armed loss was reported before. Source = RF connection state (not raw RSSI). ⚠️ EdgeTX may have its **own** "telemetry lost" callout → it can double up; disable the EdgeTX trigger in that case.
-- **Link quality (6):** ELRS **RQly** (Link Quality %), **armed only**; debounce 0.5 s, then at the earliest after `CalloutInt`. Tones instead of speech files so it's distinct from the battery callouts.
-- **Background:** 2, 3, 5, 6 also run when UltiDash isn't the active screen (when armed).
+- **Telemetry lost (5):** **only if the loss happens from the armed state** (a real in-flight loss). Losses on the ground / while disarmed stay silent (logged only). The "recovered" voice only fires if an armed loss was reported before. Source = RF connection state (not raw RSSI). ⚠️ EdgeTX may have its **own** "telemetry lost" callout → it can double up; disable the EdgeTX trigger in that case.
+- **Link quality (6):** ELRS **RQly** (Link Quality %), **armed only**; debounce 0.5 s. Announced **once per low-link episode** — re-armed only when RQly recovers above `RQlyWarn`; a warn→critical escalation announces once more. (No longer repeats on the `CalloutInt` interval.)
+- **Main power lost (7):** **armed only**; reads `Vbat` directly. When it falls below `PwrWarnV` (in 0.1 V, default 9.0 V) the craft is likely on backup power. 0.5 s debounce, announced **once per drop**, re-armed when `Vbat` recovers above the threshold. Separate on/off via `PwrWarn`.
+- **Background:** 2, 3, 5, 6, 7 also run when UltiDash isn't the active screen (when armed).
 
 ---
 
@@ -223,7 +228,7 @@ Hard-wired Rotorflight sensor names (no configurable sources):
 
 | Sensor | Use |
 |--------|-----------|
-| `Vbat` / `Vbat-` / `Vbat+` | Total voltage + min/max |
+| `Vbat` / `Vbat-` / `Vbat+` | Total voltage + min/max; also drives the main-power-loss warning (`PwrWarnV`) |
 | `Vcel` / `Vcel-` / `Vcel+` / `Cel#` | Cell voltage + min/max + cell count |
 | `Curr` | Current |
 | `Capa` | Capacity used (mAh) |
@@ -322,9 +327,13 @@ From the `Gov` sensor (RF internal governor). Values:
   (armed/disarmed/connected/disconnected) and MSP data (battery profile, flight stats).
   If absent, the state stays "disconnected" or the bar shows "RFTools widget missing".
   **MSP is only read on connect/disarm – never during armed flight.**
-- **Sounds** in `/SOUNDS/en/`:
-  - `batcrt.wav`, `batlow.wav`, `battry.wav` (included)
-  - `armed.wav`, `disarm.wav` (for the arm callout – usually in the EdgeTX default voice pack)
+- **Sounds** in `/SOUNDS/en/ultidash/` (own subfolder so they don't clash with the EdgeTX
+  voice pack; `AUDIO_PATH` in `ultidashFunctions.lua`). **All shipped with UltiDash:**
+  - Battery: `batcrt.wav`, `batlow.wav`, `battry.wav`
+  - Arm state: `armed.wav`, `disarm.wav`
+  - Link/telemetry: `telem_lost.wav`, `telem_ok.wav`, `link_warn.wav`, `link_crit.wav`
+  - Power: `pwr_backup.wav`
+  - Spoken numbers/units (digits, `percent`, `volts`) still come from the EdgeTX voice pack.
 - **Model images** in `/images/`:
   - **The simplest setup is enough:** place a single file named after the **Rotorflight
     model name** (`rf2.modelName`), e.g. `MyHeli.png` or `MyHeli.jpg`, in `/images/`.

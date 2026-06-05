@@ -45,7 +45,8 @@ here, I will of course respect that.
 - **Statistics view** — auto-shown when disarmed/disconnected: per-value Actual/Min/Max
   table, total flights & total flight time (from Rotorflight MSP), capacity used.
 - **Voice & vibration callouts** — fuel %, low/critical cell voltage, armed/disarm,
-  and ELRS **link-quality / telemetry-lost** warnings (armed only). Configurable.
+  ELRS **link-quality / telemetry-lost** warnings, and a **main-power-loss** warning
+  (link + power warnings are armed only). All spoken via UltiDash's own WAVs; configurable.
 - **No external libraries** — UltiDash loads only its own files.
 
 ## Requirements
@@ -58,8 +59,10 @@ here, I will of course respect that.
   `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `RQly`,
   `TQly`, `TPWR`, `Thr`, and (for ESC status) `Esc#` + `EscF`, plus `*Skp` (skipped-packet
   counter — the sensor label really starts with `*`).
-- Sounds in `/SOUNDS/en/`: `batcrt/batlow/battry` (included); `armed/disarm` for the
-  arm callout (usually in the EdgeTX voice pack).
+- Sounds in `/SOUNDS/en/ultidash/` (all included, in their own subfolder so they don't
+  clash with the EdgeTX voice pack): `battry`, `batlow`, `batcrt`, `armed`, `disarm`,
+  `telem_lost`, `telem_ok`, `link_warn`, `link_crit`, `pwr_backup`. Spoken numbers/units
+  (`percent`, `volts`, digits) still come from your EdgeTX voice pack.
 - Optional model image in `/images/`: a single file named after the **Rotorflight model
   name** is enough — e.g. `MyHeli.png` or `MyHeli.jpg`. (Advanced/optional: a
   `<model>-<cells>S` variant, e.g. `MyHeli-6S.png`, is preferred when present so you can
@@ -72,8 +75,8 @@ Copy the folders from this repo to the **root of your radio's SD card**, merging
 what's already there:
 
 ```
-WIDGETS/UltiDash/   →  <SD>/WIDGETS/UltiDash/
-SOUNDS/en/          →  <SD>/SOUNDS/en/
+WIDGETS/UltiDash/      →  <SD>/WIDGETS/UltiDash/
+SOUNDS/en/ultidash/    →  <SD>/SOUNDS/en/ultidash/
 ```
 
 Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen.
@@ -85,8 +88,8 @@ The widget options cover reserve %, callout interval, mute, voltage display
 manual `CellFull`/`CellLow`/`CellCritical` values), startup delay, the ELRS link warning
 (on/off + RQly warn/critical thresholds), the color scheme (`ColorScheme` = fixed UltiDash
 palette or follow the EdgeTX theme), what the top-left area shows (`TopLeft` = model image
-or a timer), and per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
-`ShowTPWR`).
+or a timer), per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
+`ShowTPWR`), and a main-power-loss warning (`PwrWarn` on/off + `PwrWarnV` voltage threshold).
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full option list, the layout
 breakdown, the callout matrix and the "what is shown when" tables.

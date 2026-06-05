@@ -42,7 +42,7 @@ local CLEAN_PALETTE = {
 }
 
 -- ePowerbar-style discrete bar colors (after Rob 'bob00' Gayle)
-local AUDIO_PATH = "/SOUNDS/en/"
+local AUDIO_PATH = "/SOUNDS/en/ultidash/"
 local BAR_COLOR_OK       = lcd.RGB(0x00, 0xff, 0x00)
 local BAR_COLOR_WARN     = lcd.RGB(0xf8, 0xc0, 0x00)
 local BAR_COLOR_LOW      = lcd.RGB(0xff, 0xff, 0x00)
@@ -236,7 +236,10 @@ local function clear_live_telemetry_values(wgt)
     -- link warning state
     wgt.link_pending = 0
     wgt.link_level = 0
-    wgt.link_next = 0
+    wgt.link_announced = 0
+    -- main-power-loss warning state
+    wgt.pwr_pending = 0
+    wgt.pwr_announced = false
     esc.reset()
 end
 
@@ -675,9 +678,9 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
     if previous_state == "disconnected" and new_state ~= "disconnected" then
         clear_live_telemetry_values(wgt)
         ultidash_functions.reset_telemetry_stats(wgt)
-        -- telemetry recovered: chime only if the loss happened while armed (in flight)
+        -- telemetry recovered: announce only if the loss happened while armed (in flight)
         if link_warn and wgt.link_lost_armed then
-            playTone(880, 120, 0, PLAY_NOW)
+            play_audio("telem_ok")
         end
         wgt.link_lost_armed = false
         return
@@ -689,7 +692,7 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
         if previous_state == "armed" then
             ultidash_functions.log("Connection lost (armed)")
             if link_warn then
-                playTone(220, 400, 0, PLAY_NOW)
+                play_audio("telem_lost")
                 play_vibe(wgt)
                 wgt.link_lost_armed = true
             end
@@ -819,21 +822,24 @@ function ultidash_functions.update_battery_callout(wgt)
 end
 
 -- ExpressLRS link-quality warning on the RQly (Link Quality %) sensor.
--- Two stages (warn / critical) with a short debounce and CalloutInt repeat gap.
--- Only fires while ARMED (in flight); telemetry-lost itself is handled in
--- on_telemetry_state_changed (also armed-gated via previous_state).
+-- Two stages (warn / critical) with a short debounce. Spoken ONCE per low-link
+-- episode (re-armed when the link recovers above the warn threshold; a warn->crit
+-- escalation announces once more). Only fires while ARMED (in flight);
+-- telemetry-lost itself is handled in on_telemetry_state_changed (armed-gated).
 local LINK_SAMPLE_CS = 50
 
 function ultidash_functions.update_link_warning(wgt)
     if wgt.options.LinkWarn ~= 1 then
         wgt.link_pending = 0
         wgt.link_level = 0
+        wgt.link_announced = 0
         return
     end
     -- only while armed (in flight); no link callouts on the bench / disarmed
     if not is_craft_armed(wgt) then
         wgt.link_pending = 0
         wgt.link_level = 0
+        wgt.link_announced = 0
         return
     end
 
@@ -842,40 +848,86 @@ function ultidash_functions.update_link_warning(wgt)
     if rqly == nil then return end
 
     local now = getTime()
-    if now < (wgt.link_next or 0) then return end
-
     local warn = wgt.options.RQlyWarn or 50
     local crit = wgt.options.RQlyCrit or 30
     local level = (rqly <= crit and 2) or (rqly <= warn and 1) or 0
 
-    if (wgt.link_pending or 0) ~= 0 then
-        if level == 0 then
-            -- recovered above threshold while pending
-            wgt.link_pending = 0
-            wgt.link_level = 0
-            return
-        elseif level < (wgt.link_level or 0) then
-            -- de-escalated to a less severe level while pending
-            wgt.link_level = level
-        end
+    -- recovered above the warn threshold: re-arm so the next drop announces again
+    if level == 0 then
+        wgt.link_pending = 0
+        wgt.link_level = 0
+        wgt.link_announced = 0
+        return
+    end
 
-        if now >= wgt.link_pending then
-            if wgt.link_level >= 2 then
-                playTone(330, 300, 0, PLAY_NOW)
-                play_vibe(wgt)
-            else
-                playTone(660, 150, 0, PLAY_NOW)
-            end
-            -- announce the actual link quality value
-            playNumber(rqly, UNIT_PERCENT)
+    -- already announced this severity (or worse) this episode: stay silent until
+    -- the link recovers or escalates to a more severe level (announce once)
+    if level <= (wgt.link_announced or 0) then
+        wgt.link_pending = 0
+        return
+    end
 
-            wgt.link_next = now + math.max(1, wgt.options.CalloutInt or 6) * 100
-            wgt.link_pending = 0
-            wgt.link_level = 0
-        end
-    elseif level > 0 then
+    -- new or escalated low-link level: debounce, take the worst seen, announce once
+    if (wgt.link_pending or 0) == 0 then
         wgt.link_level = level
         wgt.link_pending = now + LINK_SAMPLE_CS
+        return
+    end
+    if level > wgt.link_level then wgt.link_level = level end
+
+    if now >= wgt.link_pending then
+        if wgt.link_level >= 2 then
+            play_audio("link_crit")
+            play_vibe(wgt)
+        else
+            play_audio("link_warn")
+        end
+        -- announce the actual link quality value
+        playNumber(rqly, UNIT_PERCENT)
+        wgt.link_announced = wgt.link_level
+        wgt.link_pending = 0
+    end
+end
+
+-- Main-power-loss warning: while ARMED, if Vbat drops below the configurable
+-- threshold (PwrWarnV, in 0.1 V; default 9.0 V) the craft is likely running on
+-- backup power. Announced ONCE per drop (re-armed when Vbat recovers above the
+-- threshold). Separate on/off via the PwrWarn option. Reads Vbat directly so it
+-- also works off-screen (background); sensor read only (no MSP) -> armed-safe.
+function ultidash_functions.update_power_warning(wgt)
+    if not wgt.options or wgt.options.PwrWarn ~= 1 then
+        wgt.pwr_pending = 0
+        wgt.pwr_announced = false
+        return
+    end
+    if not is_craft_armed(wgt) then
+        wgt.pwr_pending = 0
+        wgt.pwr_announced = false
+        return
+    end
+
+    local vbat = getSourceValue("Vbat")
+    if vbat == nil or vbat <= 0 then return end
+
+    local thresh = (wgt.options.PwrWarnV or 90) / 10
+    local now = getTime()
+
+    if vbat < thresh then
+        if wgt.pwr_announced then return end
+        -- debounce: the low reading must hold briefly (avoids transient sag)
+        if (wgt.pwr_pending or 0) == 0 then
+            wgt.pwr_pending = now + ALERT_SAMPLE_CS
+            return
+        end
+        if now >= wgt.pwr_pending then
+            play_audio("pwr_backup")
+            play_vibe(wgt)
+            wgt.pwr_announced = true
+            wgt.pwr_pending = 0
+        end
+    else
+        wgt.pwr_pending = 0
+        wgt.pwr_announced = false
     end
 end
 
@@ -927,6 +979,7 @@ end
 function ultidash_functions.background_refresh(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
+    ultidash_functions.update_power_warning(wgt)
 
     -- refresh the sensors the flight-time condition depends on, then accumulate.
     -- read unconditionally (not gated by RFTool state) so headspeed-based tracking
@@ -951,6 +1004,7 @@ function ultidash_functions.refresh(wgt)
     ultidash_functions.refresh_ui(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
+    ultidash_functions.update_power_warning(wgt)
 end
 
 return ultidash_functions

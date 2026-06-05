@@ -10,6 +10,21 @@ All notable changes to UltiDash are documented here.
   **`CellFull` / `CellLow` / `CellCritical`** options (centivolts).
 - Per-element bar toggles: **`ShowRQly`** / **`ShowTQly`** (top-bar RQ/TQ link quality),
   **`ShowTxV`** (top-bar TX voltage) and **`ShowTPWR`** (bottom-bar TX power).
+- **Main-power-loss warning:** new event that speaks `pwr_backup` once when, while armed,
+  `Vbat` falls below a configurable threshold (likely running on backup power). New options
+  **`PwrWarn`** (on/off) and **`PwrWarnV`** (threshold in 0.1 V, default 9.0 V).
+- Dedicated voice files for all events, shipped with the widget: `armed`, `disarm`,
+  `battry`, `batlow`, `batcrt`, `telem_lost`, `telem_ok`, `link_warn`, `link_crit`,
+  `pwr_backup`.
+
+### Changed
+- **Sound files moved to `/SOUNDS/en/ultidash/`** (own subfolder, `AUDIO_PATH`) so they no
+  longer clash with the EdgeTX voice pack. Install path changes accordingly.
+- **Telemetry-lost/recovered and low-link-quality now use spoken WAVs** instead of tones
+  (`telem_lost`/`telem_ok`/`link_warn`/`link_crit`).
+- **Low-link-quality is announced once per episode** (re-armed on recovery above the warn
+  threshold; a warn→critical escalation announces once more) instead of repeating on the
+  `CalloutInt` interval.
 
 ## v0.1 — 2026-05-30
 
