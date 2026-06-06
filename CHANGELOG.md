@@ -25,6 +25,16 @@ All notable changes to UltiDash are documented here.
 - **Low-link-quality is announced once per episode** (re-armed on recovery above the warn
   threshold; a warn→critical escalation announces once more) instead of repeating on the
   `CalloutInt` interval.
+- **Statistics page:** the first column is renamed **"Actual" → "Latest"** (current while
+  disarmed/connected, frozen at the last value after disconnect); **RQ/TQ are hidden** in
+  the stats top bar; the header keeps showing the **Rotorflight FC** model name after a
+  disconnect (cached) instead of falling back to the EdgeTX model name.
+
+### Fixed
+- **Statistics Min/Max no longer show spurious 0s** from connect/disconnect transients:
+  EdgeTX-sourced min/max are reset once the link is actually up and frozen while it's down,
+  and **ESC-temp Min** is now widget-tracked ignoring the 0 the ESC reports before its
+  temperature telemetry comes up (so it shows the real low instead of 0.0).
 
 ## v0.1 — 2026-05-30
 

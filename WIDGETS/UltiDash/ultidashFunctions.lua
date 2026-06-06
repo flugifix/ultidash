@@ -243,16 +243,68 @@ local function clear_live_telemetry_values(wgt)
     esc.reset()
 end
 
+-- Wipe the EdgeTX min/max sensors and the widget-side extrema. Done once per
+-- connection, the first time telemetry is actually valid ("FC fully available"),
+-- so the 0-readings EdgeTX recorded before the link was up don't survive.
+-- Only clears min/max fields — NOT the MSP data (battery profile/capacity), which
+-- is only re-read on a state change and must not be blanked here.
+local function reset_stat_sensors(wgt)
+    for i = 0, 99 do model.resetSensor(i) end
+    local v = wgt.values
+    v.vbat_min, v.vbat_max = nil, nil
+    v.vcel_min, v.vcel_max = nil, nil
+    v.vbec_min, v.vbec_max = nil, nil
+    v.esc_temp_min, v.esc_temp_max = nil, nil
+    v.curr_min, v.curr_max = nil, nil
+    v.headspeed_min, v.headspeed_max = nil, nil
+    v.rqly_min = nil
+    v.tpwr_max = nil
+    v.mcu_temp_max = nil
+end
+
+-- Per-refresh stats housekeeping based on the RQly (link quality) sensor:
+--  * Freeze flag `telemetry_alive`: false ONLY when the link is positively down
+--    (RQly == 0); unknown/no sensor (nil) -> true so we don't freeze (legacy).
+--    The min/max readers skip their EdgeTX -/+ reads while frozen, so the 0s a
+--    lost link produces never reach the stats.
+--  * One-shot reset: when a reset is pending (set on (re)connect) and the link is
+--    genuinely up (RQly > 0 = "FC fully available"), wipe the stat sensors once so
+--    the 0-readings recorded before the link was up don't survive.
+local function maybe_reset_stats(wgt)
+    if ultidash_functions.simu_mode then
+        wgt.telemetry_alive = true
+        return
+    end
+    if wgt.stats_reset_pending == nil then wgt.stats_reset_pending = true end
+
+    local rqly = getSourceValue("RQly")
+    wgt.telemetry_alive = (rqly == nil) or (rqly > 0)
+
+    if rqly ~= nil and rqly > 0 and wgt.stats_reset_pending then
+        reset_stat_sensors(wgt)
+        wgt.stats_reset_pending = false
+    end
+end
+
 -- ============================================================================
 -- GENERAL INFO UPDATES
 -- ============================================================================
 function ultidash_functions.update_craft_name(wgt)
-    local model_name = rf2 and rf2.modelName
-    if not model_name then
-        local model_info = model.getInfo()
-        model_name = model_info and model_info.name
+    -- Prefer the Rotorflight FC model name and CACHE it, so the stats page (shown
+    -- on disconnect, where rf2.modelName goes nil) keeps showing the FC name rather
+    -- than falling back to the EdgeTX model/profile name. Only fall back to the
+    -- EdgeTX name if no FC name was ever seen.
+    local fc_name = rf2 and rf2.modelName
+    if fc_name and fc_name ~= "" then
+        wgt.values.rf_craft_name = string.gsub(fc_name, "^>", "")
     end
-    wgt.values.craft_name = string.gsub(model_name or "Unknown", "^>", "")
+
+    local name = wgt.values.rf_craft_name
+    if not name then
+        local model_info = model.getInfo()
+        name = string.gsub((model_info and model_info.name) or "Unknown", "^>", "")
+    end
+    wgt.values.craft_name = name
 end
 
 -- eBitmap-style model image: prefer a craft image (optionally cell-count specific),
@@ -382,13 +434,18 @@ function ultidash_functions.update_tx_bat_voltage(wgt)
 end
 
 function ultidash_functions.update_link_quality(wgt)
-    -- Only track minimum link quality; current value not needed
-    wgt.values.rqly_min = getSourceValue("RQly-")
+    -- Only track minimum link quality; current value not needed.
+    -- Freeze (keep last) while telemetry is down so a 0 doesn't pollute the min.
+    if wgt.telemetry_alive ~= false then
+        wgt.values.rqly_min = getSourceValue("RQly-")
+    end
 end
 
 function ultidash_functions.update_transmitter_power(wgt)
-    -- Only track maximum transmitter power; current value not needed
-    wgt.values.tpwr_max = getValue("TPWR+")
+    -- Only track maximum transmitter power; current value not needed.
+    if wgt.telemetry_alive ~= false then
+        wgt.values.tpwr_max = getValue("TPWR+")
+    end
 end
 
 -- ============================================================================
@@ -396,8 +453,10 @@ end
 -- ============================================================================
 function ultidash_functions.update_cell(wgt)
     wgt.values.vbat = getSourceValue("Vbat")
-    wgt.values.vbat_min = getSourceValue("Vbat-")
-    wgt.values.vbat_max = getSourceValue("Vbat+")
+    if wgt.telemetry_alive ~= false then
+        wgt.values.vbat_min = getSourceValue("Vbat-")
+        wgt.values.vbat_max = getSourceValue("Vbat+")
+    end
 
     if ultidash_functions.simu_mode then
         wgt.values.vbat = math.random(1101, 1201) / 100
@@ -408,8 +467,10 @@ end
 
 function ultidash_functions.update_vcel(wgt)
     wgt.values.vcel = getSourceValue("Vcel")
-    wgt.values.vcel_min = getSourceValue("Vcel-")
-    wgt.values.vcel_max = getSourceValue("Vcel+")
+    if wgt.telemetry_alive ~= false then
+        wgt.values.vcel_min = getSourceValue("Vcel-")
+        wgt.values.vcel_max = getSourceValue("Vcel+")
+    end
     wgt.values.cel_count = getSourceValue("Cel#")
 
     if ultidash_functions.simu_mode then
@@ -422,8 +483,10 @@ end
 
 function ultidash_functions.update_vbec(wgt)
     wgt.values.vbec = getSourceValue("Vbec")
-    wgt.values.vbec_max = getSourceValue("Vbec+")
-    wgt.values.vbec_min = getSourceValue("Vbec-")
+    if wgt.telemetry_alive ~= false then
+        wgt.values.vbec_max = getSourceValue("Vbec+")
+        wgt.values.vbec_min = getSourceValue("Vbec-")
+    end
 
     if ultidash_functions.simu_mode then
         wgt.values.vbec = math.random(72, 78) / 10
@@ -434,17 +497,25 @@ end
 
 function ultidash_functions.update_esc_temperature(wgt)
     wgt.values.esc_temp = getSourceValue("Tesc")
-    wgt.values.esc_temp_min = getSourceValue("Tesc-")
-    wgt.values.esc_temp_max = getSourceValue("Tesc+")
 
     if ultidash_functions.simu_mode then
         wgt.values.esc_temp = 60
         wgt.values.esc_temp_max = 75
         wgt.values.esc_temp_min = 45
+        return
+    end
+
+    -- Widget-tracked min/max that ignores the spurious 0 the ESC reports before its
+    -- temperature telemetry is up (EdgeTX's Tesc-/+ would keep that 0 in the min).
+    local t = wgt.values.esc_temp
+    if t ~= nil and t > 0 then
+        update_tracked_extrema(wgt, "esc_temp", "esc_temp_min", "esc_temp_max")
     end
 end
 
-function ultidash_functions.update_mcu_temperature(wgt) wgt.values.mcu_temp_max = getSourceValue("Tmcu+") end
+function ultidash_functions.update_mcu_temperature(wgt)
+    if wgt.telemetry_alive ~= false then wgt.values.mcu_temp_max = getSourceValue("Tmcu+") end
+end
 
 -- ============================================================================
 -- AIRCRAFT TELEMETRY: CURRENT & CAPACITY
@@ -932,13 +1003,15 @@ function ultidash_functions.update_power_warning(wgt)
 end
 
 function ultidash_functions.reset_telemetry_stats(wgt)
-    for i = 0, 99 do model.resetSensor(i) end
-
     model.resetTimer(wgt.options.Timer or 0)
     reset_flight_time(wgt)
 
     -- Reset battery callout state on disconnect
     reset_callout_state(wgt)
+
+    -- Defer the EdgeTX min/max sensor wipe until telemetry is actually valid
+    -- ("FC fully available"), so pre-link 0-readings don't survive the reset.
+    wgt.stats_reset_pending = true
 end
 
 -- ============================================================================
@@ -977,6 +1050,7 @@ end
 -- so the stats-page "Flight Time" reflects the whole flight, not just the time the
 -- widget was on screen.
 function ultidash_functions.background_refresh(wgt)
+    maybe_reset_stats(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
@@ -993,9 +1067,12 @@ end
 -- Main refresh: full telemetry updates (handles both connected and disconnected states)
 function ultidash_functions.refresh(wgt)
     if ultidash_functions.simu_mode then
+        wgt.telemetry_alive = true
         ultidash_functions.refresh_ui(wgt)
         return
     end
+
+    maybe_reset_stats(wgt)
 
     if not is_rf_connected(wgt) then
         ultidash_functions.refresh_ui_no_conn(wgt)

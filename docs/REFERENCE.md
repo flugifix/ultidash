@@ -135,10 +135,28 @@ the TX battery now sits in the top bar)
 
 ### 3.2 Stats view
 
-- **Header:** model name · total flight time · number of flights
-- **Table** (Actual / Min / Max) for: voltage, headspeed, current, ESC temp, BEC
+- **Top bar:** date/time + radio battery only — **RQ/TQ are hidden here** (the momentary
+  link quality is misleading after disconnect; link figures live in the status bar below).
+- **Header:** model name (the **Rotorflight FC** craft name, cached so it stays after
+  disconnect instead of falling back to the EdgeTX model name) · total flight time · flights
+- **Table** (**Latest** / Min / Max) for: voltage, headspeed, current, ESC temp, BEC
 - **Info cards:** flight time · mAh used (%) · batt profile
 - **Status bar:** TPWR+ · RQly- · Tmcu+ · Skp
+
+> **"Latest" column** = the current reading while disarmed/connected (live), frozen at the
+> last value once disconnected (renamed from "Actual", which read as misleading after a
+> disconnect).
+
+#### Min/Max integrity
+The Min/Max are kept clean of the 0-readings that occur during connect/disconnect:
+- **Headspeed & current** are tracked by the widget only while the **governor is running**,
+  so e.g. headspeed Min is the lowest *in-flight* rpm (not 0 from a stopped rotor).
+- **ESC temp** is tracked by the widget ignoring the spurious **0** the ESC reports before
+  its temperature telemetry is up, so ESC-temp Min shows the real low (≈ ambient), not 0.
+- **Voltages / RQly / TPWR / MCU temp** are read from EdgeTX's `-`/`+` min/max sensors, but
+  those are (a) **reset once** when the link is actually up ("FC fully available", RQly > 0),
+  wiping pre-link 0s, and (b) **frozen** while the link is down (RQly = 0) so a lost-link 0
+  can't pollute them. (A brief mid-flight link dropout can still nudge an EdgeTX-sourced Min.)
 
 > The stats card "mAh Used (%)" shows the **raw** Bat% value (not reserve-adjusted).
 > Only the flight-view battery uses the reserve-adjusted value.
@@ -234,7 +252,7 @@ Hard-wired Rotorflight sensor names (no configurable sources):
 | `Capa` | Capacity used (mAh) |
 | `Bat%` | Fuel level (basis for fuel) |
 | `Vbec` / `Vbec-` / `Vbec+` | BEC voltage |
-| `Tesc` / `Tesc-` / `Tesc+` | ESC temperature |
+| `Tesc` | ESC temperature (Min/Max widget-tracked, ignores the startup 0) |
 | `Tmcu+` | MCU temperature (max) |
 | `Hspd` | Headspeed |
 | `Gov` | Governor state |

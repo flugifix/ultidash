@@ -1057,7 +1057,7 @@ end
 
 --- Build the in-widget top bar: date/time (left) + radio (TX) battery icon (right).
 --- Replaces the EdgeTX top bar so the widget can run fullscreen self-contained.
-local function build_top_bar_element(container, wgt, x, y, c_w, c_h)
+local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
     local font_h = measure_font(header_font)
     local y_off = math.floor((c_h - font_h) / 2)
 
@@ -1086,9 +1086,11 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h)
         align = LEFT
     })
 
-    -- display toggles (per options)
-    local show_rq  = wgt.options.ShowRQly == 1
-    local show_tq  = wgt.options.ShowTQly == 1
+    -- display toggles (per options). RQ/TQ are suppressed entirely on the stats
+    -- page (show_link == false) — there the link quality lives in the table/status
+    -- bar and the momentary RQ/TQ would be misleading after disconnect.
+    local show_rq  = show_link ~= false and wgt.options.ShowRQly == 1
+    local show_tq  = show_link ~= false and wgt.options.ShowTQly == 1
     local show_txv = wgt.options.ShowTxV == 1
 
     -- center: ELRS link quality (RQly downlink + TQly uplink), each toggleable
@@ -1256,9 +1258,9 @@ local function build_stats_ui(wgt, zone)
 
     local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (wgt.options.BGFilled == 1) })
 
-    -- top bar (date/time + radio battery)
+    -- top bar (date/time + radio battery); no RQ/TQ on the stats page
     local top_bar_box = main_panel:box({ x = 0, y = 1, w = w - 4, h = top_box_h })
-    build_top_bar_element(top_bar_box, wgt, 0, 0, w - 4, top_box_h)
+    build_top_bar_element(top_bar_box, wgt, 0, 0, w - 4, top_box_h, false)
     main_panel:hline({ y = y_content - line_h, w = w - 3, h = line_h, color = COLOR_THEME_SECONDARY1 })
 
     build_flight_statistics_element(main_panel, wgt, 0, y_content, stats_content_w, h_mid - line_h)

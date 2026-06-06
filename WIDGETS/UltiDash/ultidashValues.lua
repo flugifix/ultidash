@@ -221,7 +221,7 @@ function M.createValues(wgt)
         label_tx_batt = "TX Battery",
         label_model_card = "Model",
         label_status = "Status",
-        label_actual = "Actual",
+        label_actual = "Latest",
         label_min = "Min",
         label_max = "Max",
         label_esc_t = "ESC T",
