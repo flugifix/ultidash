@@ -58,6 +58,8 @@ All options appear in the EdgeTX widget configuration.
 | **ShowTxV** | BOOL | 1 (on) | – | Top bar: show the radio (TX) battery voltage next to the icon |
 | **PwrWarn** | BOOL | 1 (on) | – | Main-power-loss warning on/off (separate toggle) |
 | **PwrWarnV** | VALUE | 90 | 30–500 | Main-power-loss threshold in **0.1 V** (90 = 9.0 V). While armed, if `Vbat` drops below this, `pwr_backup` is announced once |
+| **SkpWarn** | BOOL | 0 (off) | – | Skipped-telemetry-packet warning on/off (separate toggle) |
+| **SkpLimit** | VALUE | 50 | 1–2000 | Skipped-packet limit. While armed, when the `*Skp` counter reaches this, `skp_high` is announced once |
 
 > **Cell-voltage thresholds** default to the **Rotorflight FC** (`CellSource = FC config`):
 > `mspBatteryConfig.vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`,
@@ -217,7 +219,7 @@ When the voltage first appears (power-on/connect):
 
 ## 5. Voice callouts & vibration
 
-There are **seven** triggers. All outputs are UltiDash's own WAVs in
+There are **eight** triggers. All outputs are UltiDash's own WAVs in
 `/SOUNDS/en/ultidash/` (spoken numbers/units come from the EdgeTX voice pack):
 
 | # | Trigger | Condition | Output | Gated by | Runs in background? |
@@ -229,6 +231,7 @@ There are **seven** triggers. All outputs are UltiDash's own WAVs in
 | 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | `telem_lost` + vibration (lost) / `telem_ok` (recovered) | `LinkWarn` | **yes** |
 | 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | `link_warn`/`link_crit` + RQly % (+ vibration when critical) | `LinkWarn` | **yes** |
 | 7 | **Main power lost** | **armed only**; `Vbat` < `PwrWarnV` | `pwr_backup` + vibration | `PwrWarn` | **yes** |
+| 8 | **Skipped packets** | **armed only**; `*Skp` counter ≥ `SkpLimit` | `skp_high` | `SkpWarn` | **yes** |
 
 Details:
 - **Fuel callout (2):** value rounded to the 10s (above reserve), singles near critical; the first sample after arming is skipped; min. spacing `CalloutInt`.
@@ -236,7 +239,8 @@ Details:
 - **Telemetry lost (5):** **only if the loss happens from the armed state** (a real in-flight loss). Losses on the ground / while disarmed stay silent (logged only). The "recovered" voice only fires if an armed loss was reported before. Source = RF connection state (not raw RSSI). ⚠️ EdgeTX may have its **own** "telemetry lost" callout → it can double up; disable the EdgeTX trigger in that case.
 - **Link quality (6):** ELRS **RQly** (Link Quality %), **armed only**; debounce 0.5 s. Announced **once per low-link episode** — re-armed only when RQly recovers above `RQlyWarn`; a warn→critical escalation announces once more. (No longer repeats on the `CalloutInt` interval.)
 - **Main power lost (7):** **armed only**; reads `Vbat` directly. When it falls below `PwrWarnV` (in 0.1 V, default 9.0 V) the craft is likely on backup power. 0.5 s debounce, announced **once per drop**, re-armed when `Vbat` recovers above the threshold. Separate on/off via `PwrWarn`.
-- **Background:** 2, 3, 5, 6, 7 also run when UltiDash isn't the active screen (when armed).
+- **Skipped packets (8):** **armed only**; reads the cumulative `*Skp` counter directly. When it reaches `SkpLimit`, `skp_high` ("high packet loss") is spoken **once per flight** (the counter only climbs and resets on telemetry reconnect, which re-arms it). Voice only, no vibration. Separate on/off via `SkpWarn` (default **off**).
+- **Background:** 2, 3, 5, 6, 7, 8 also run when UltiDash isn't the active screen (when armed).
 
 ---
 
@@ -351,6 +355,7 @@ From the `Gov` sensor (RF internal governor). Values:
   - Arm state: `armed.wav`, `disarm.wav`
   - Link/telemetry: `telem_lost.wav`, `telem_ok.wav`, `link_warn.wav`, `link_crit.wav`
   - Power: `pwr_backup.wav`
+  - Skipped packets: `skp_high.wav`
   - Spoken numbers/units (digits, `percent`, `volts`) still come from the EdgeTX voice pack.
 - **Model images** in `/images/`:
   - **The simplest setup is enough:** place a single file named after the **Rotorflight

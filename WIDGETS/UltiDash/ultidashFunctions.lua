@@ -240,6 +240,8 @@ local function clear_live_telemetry_values(wgt)
     -- main-power-loss warning state
     wgt.pwr_pending = 0
     wgt.pwr_announced = false
+    -- skipped-packet warning state
+    wgt.skp_announced = false
     esc.reset()
 end
 
@@ -1002,6 +1004,36 @@ function ultidash_functions.update_power_warning(wgt)
     end
 end
 
+-- Skipped-telemetry-packet warning: while ARMED, if the cumulative *Skp counter
+-- reaches the configurable limit, speak `skp_high` once. The counter only climbs
+-- and is reset on telemetry (re)connect, so it announces once per flight; re-arms
+-- when it drops below the limit again (i.e. after a reset). Sensor read only (no
+-- MSP) -> armed-safe. Separate on/off via the SkpWarn option.
+function ultidash_functions.update_skp_warning(wgt)
+    if not wgt.options or wgt.options.SkpWarn ~= 1 then
+        wgt.skp_announced = false
+        return
+    end
+    if not is_craft_armed(wgt) then
+        wgt.skp_announced = false
+        return
+    end
+
+    local skp = getSourceValue("*Skp")
+    if skp == nil then skp = getSourceValue("Skp") end
+    if skp == nil then return end
+
+    local limit = wgt.options.SkpLimit or 50
+    if skp >= limit then
+        if not wgt.skp_announced then
+            play_audio("skp_high")
+            wgt.skp_announced = true
+        end
+    else
+        wgt.skp_announced = false
+    end
+end
+
 function ultidash_functions.reset_telemetry_stats(wgt)
     model.resetTimer(wgt.options.Timer or 0)
     reset_flight_time(wgt)
@@ -1054,6 +1086,7 @@ function ultidash_functions.background_refresh(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
+    ultidash_functions.update_skp_warning(wgt)
 
     -- refresh the sensors the flight-time condition depends on, then accumulate.
     -- read unconditionally (not gated by RFTool state) so headspeed-based tracking
@@ -1082,6 +1115,7 @@ function ultidash_functions.refresh(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
+    ultidash_functions.update_skp_warning(wgt)
 end
 
 return ultidash_functions

@@ -25,6 +25,8 @@ local M = {
         { "ShowTxV",        BOOL,   1 },
         { "PwrWarn",        BOOL,   1 },
         { "PwrWarnV",       VALUE,  90, 30, 500 },
+        { "SkpWarn",        BOOL,   0 },
+        { "SkpLimit",       VALUE,  50, 1, 2000 },
     },
 
     translate = function(name)
@@ -53,6 +55,8 @@ local M = {
             ShowTxV = "Top bar: show TX voltage",
             PwrWarn = "Main power loss warning",
             PwrWarnV = "Power warn voltage (0.1V)",
+            SkpWarn = "Skipped-packet warning",
+            SkpLimit = "Skipped-packet limit",
         }
         return translations[name]
     end

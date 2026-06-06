@@ -49,8 +49,9 @@ here, I will of course respect that.
 - **Statistics view** — auto-shown when disarmed/disconnected: per-value Actual/Min/Max
   table, total flights & total flight time (from Rotorflight MSP), capacity used.
 - **Voice & vibration callouts** — fuel %, low/critical cell voltage, armed/disarm,
-  ELRS **link-quality / telemetry-lost** warnings, and a **main-power-loss** warning
-  (link + power warnings are armed only). All spoken via UltiDash's own WAVs; configurable.
+  ELRS **link-quality / telemetry-lost** warnings, a **main-power-loss** warning and a
+  **skipped-packet** warning (link/power/packet warnings are armed only). All spoken via
+  UltiDash's own WAVs; configurable.
 - **No external libraries** — UltiDash loads only its own files.
 
 ## Requirements
@@ -93,7 +94,8 @@ manual `CellFull`/`CellLow`/`CellCritical` values), startup delay, the ELRS link
 (on/off + RQly warn/critical thresholds), the color scheme (`ColorScheme` = fixed UltiDash
 palette or follow the EdgeTX theme), what the top-left area shows (`TopLeft` = model image
 or a timer), per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
-`ShowTPWR`), and a main-power-loss warning (`PwrWarn` on/off + `PwrWarnV` voltage threshold).
+`ShowTPWR`), a main-power-loss warning (`PwrWarn` on/off + `PwrWarnV` voltage threshold) and
+a skipped-packet warning (`SkpWarn` on/off + `SkpLimit`).
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full option list, the layout
 breakdown, the callout matrix and the "what is shown when" tables.
