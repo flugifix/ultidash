@@ -32,34 +32,47 @@ Rob "bob00" Gayle:
 
 All options appear in the EdgeTX widget configuration.
 
+Options are grouped: display/layout, battery/fuel, alert thresholds, and the
+alert on/off switches.
+
 | Option | Type | Default | Range | Meaning |
 |--------|-----|---------|---------|-----------|
 | **Timer** | TIMER | 0 | – | Which model timer is shown in the top-left area when `TopLeft = Timer` |
 | **BGFilled** | BOOL | 0 (off) | – | Fill the background color |
-| **Reserve** | VALUE | 20 | 0–40 | Reserve capacity in %. 0 % displayed = reserve reached (ePowerbar model) |
-| **CalloutInt** | VALUE | 6 | 1–60 | Minimum spacing between voice callouts (seconds) |
-| **Haptic** | BOOL | 1 (on) | – | Vibrate on critical alerts |
-| **Mute** | CHOICE | None | None / Voltage alerts / Voltage and fuel alerts | Which voice alerts are muted |
+| **TopLeft** | CHOICE | Model image | Model image / Timer | What the top-left area shows: model image or the `Timer` |
+| **ColorScheme** | CHOICE | UltiDash | UltiDash / by EdgeTX Theme | `UltiDash` = fixed built-in palette (independent of the active EdgeTX theme); `by EdgeTX Theme` = follow the active EdgeTX theme colors |
 | **StatsViewMode** | CHOICE | On disarmed | Never / On disarmed / On disconnected | When the statistics page is shown |
 | **VoltageDisplay** | CHOICE | Cell voltage | Cell voltage / Battery voltage | Whether cell or total voltage is shown |
+| **ShowRQly** | BOOL | 1 (on) | – | Top bar: show `RQ` (RQly, downlink link quality) |
+| **ShowTQly** | BOOL | 1 (on) | – | Top bar: show `TQ` (TQly, uplink link quality) |
+| **ShowTPWR** | BOOL | 1 (on) | – | Bottom status bar (flight view): show `TPWR` (TX power) |
+| **ShowTxV** | BOOL | 1 (on) | – | Top bar: show the radio (TX) battery voltage next to the icon |
+| **Reserve** | VALUE | 20 | 0–40 | Reserve capacity in %. 0 % displayed = reserve reached (ePowerbar model) |
 | **CellSource** | CHOICE | FC config | FC config / Manual | Where the cell-voltage thresholds come from: the Rotorflight FC (`mspBatteryConfig`) or the manual `CellFull`/`CellLow`/`CellCritical` values below |
 | **CellFull** | VALUE | 412 | 0–480 | Full-cell voltage in **centivolts** (e.g. 412 = 4.12 V). Only used when `CellSource = Manual` |
 | **CellLow** | VALUE | 345 | 0–440 | Low/warning cell voltage in centivolts. Only used when `CellSource = Manual` |
 | **CellCritical** | VALUE | 330 | 0–440 | Critical/min cell voltage in centivolts. Only used when `CellSource = Manual` |
 | **StartupDelay** | VALUE | 4 | 1–20 | Duration of the startup cell-check (seconds) |
-| **LinkWarn** | BOOL | 1 (on) | – | Link/telemetry warnings on/off (loss + low RQly) |
+| **CalloutInt** | VALUE | 6 | 1–60 | Minimum spacing between voice callouts (seconds) |
 | **RQlyWarn** | VALUE | 50 | 0–100 | RQly warning threshold in % (ELRS Link Quality) |
 | **RQlyCrit** | VALUE | 30 | 0–100 | RQly critical threshold in % (with vibration) |
-| **TopLeft** | CHOICE | Model image | Model image / Timer | What the top-left area shows: model image or the `Timer` |
-| **ColorScheme** | CHOICE | UltiDash | UltiDash / by EdgeTX Theme | `UltiDash` = fixed built-in palette (independent of the active EdgeTX theme); `by EdgeTX Theme` = follow the active EdgeTX theme colors |
-| **ShowRQly** | BOOL | 1 (on) | – | Top bar: show `RQ` (RQly, downlink link quality) |
-| **ShowTQly** | BOOL | 1 (on) | – | Top bar: show `TQ` (TQly, uplink link quality) |
-| **ShowTPWR** | BOOL | 1 (on) | – | Bottom status bar (flight view): show `TPWR` (TX power) |
-| **ShowTxV** | BOOL | 1 (on) | – | Top bar: show the radio (TX) battery voltage next to the icon |
-| **PwrWarn** | BOOL | 1 (on) | – | Main-power-loss warning on/off (separate toggle) |
 | **PwrWarnV** | VALUE | 90 | 30–500 | Main-power-loss threshold in **0.1 V** (90 = 9.0 V). While armed, if `Vbat` drops below this, `pwr_backup` is announced once |
-| **SkpWarn** | BOOL | 0 (off) | – | Skipped-telemetry-packet warning on/off (separate toggle) |
 | **SkpLimit** | VALUE | 50 | 1–2000 | Skipped-packet limit. While armed, when the `*Skp` counter reaches this, `skp_high` is announced once |
+| **Mute** | CHOICE | None | None / All | **Master**: `All` silences every voice callout **and** vibration, overriding all per-event switches below |
+| **Haptic** | BOOL | 1 (on) | – | Vibrate on critical alerts (master for vibration) |
+| **SndCellChk** | BOOL | 1 (on) | – | Sound: startup cell-check |
+| **SndFuel** | BOOL | 1 (on) | – | Sound: fuel callouts |
+| **SndVolt** | BOOL | 1 (on) | – | Sound: cell-voltage alerts |
+| **SndArm** | BOOL | 1 (on) | – | Sound: armed/disarm |
+| **SndTelem** | BOOL | 1 (on) | – | Sound: telemetry lost/recovered |
+| **SndLink** | BOOL | 1 (on) | – | Sound: low link quality (RQly) |
+| **PwrWarn** | BOOL | 1 (on) | – | Sound: main-power-loss warning |
+| **SkpWarn** | BOOL | 0 (off) | – | Sound: skipped-packet warning |
+
+> **Alert switches:** each callout/announcement has its own on/off (`Snd*` / `PwrWarn` /
+> `SkpWarn`). `Mute = All` is a master kill-switch that overrides them all (voice +
+> vibration). `Haptic` is the master for vibration. (Replaces the former `Mute` levels and
+> the combined `LinkWarn`.)
 
 > **Cell-voltage thresholds** default to the **Rotorflight FC** (`CellSource = FC config`):
 > `mspBatteryConfig.vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`,
@@ -220,18 +233,22 @@ When the voltage first appears (power-on/connect):
 ## 5. Voice callouts & vibration
 
 There are **eight** triggers. All outputs are UltiDash's own WAVs in
-`/SOUNDS/en/ultidash/` (spoken numbers/units come from the EdgeTX voice pack):
+`/SOUNDS/en/ultidash/` (spoken numbers/units come from the EdgeTX voice pack).
+Each has its own on/off switch; **`Mute = All` overrides them all** (voice + vibration):
 
-| # | Trigger | Condition | Output | Gated by | Runs in background? |
+| # | Trigger | Condition | Output | Switch | Runs in background? |
 |---|----------|-----------|---------|-------------|----------------------|
-| 1 | **Startup cell-check** | after `StartupDelay`, if cell < FC full-cell voltage | `batlow` + voltage | – | no (active screen only) |
-| 2 | **Fuel callout** | connected **and** armed; depending on fuel level | `battry`/`batlow`/`batcrt` + % (+ vibration when critical) | `Mute` from "Voltage and fuel alerts" | **yes** |
-| 3 | **Voltage alert** | connected **and** armed; cell ≤ FC warning/min voltage | `batlow`/`batcrt` + total voltage (+ vibration when critical) | `Mute` from "Voltage alerts" | **yes** |
-| 4 | **Armed/disarm** | arm state change | `armed` / `disarm` | – | no (active screen only) |
-| 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | `telem_lost` + vibration (lost) / `telem_ok` (recovered) | `LinkWarn` | **yes** |
-| 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | `link_warn`/`link_crit` + RQly % (+ vibration when critical) | `LinkWarn` | **yes** |
+| 1 | **Startup cell-check** | after `StartupDelay`, if cell < FC full-cell voltage | `batlow` + voltage | `SndCellChk` | no (active screen only) |
+| 2 | **Fuel callout** | connected **and** armed; depending on fuel level | `battry`/`batlow`/`batcrt` + % (+ vibration when critical) | `SndFuel` | **yes** |
+| 3 | **Voltage alert** | connected **and** armed; cell ≤ FC warning/min voltage | `batlow`/`batcrt` + total voltage (+ vibration when critical) | `SndVolt` | **yes** |
+| 4 | **Armed/disarm** | arm state change | `armed` / `disarm` | `SndArm` | no (active screen only) |
+| 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | `telem_lost` + vibration (lost) / `telem_ok` (recovered) | `SndTelem` | **yes** |
+| 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | `link_warn`/`link_crit` + RQly % (+ vibration when critical) | `SndLink` | **yes** |
 | 7 | **Main power lost** | **armed only**; `Vbat` < `PwrWarnV` | `pwr_backup` + vibration | `PwrWarn` | **yes** |
 | 8 | **Skipped packets** | **armed only**; `*Skp` counter ≥ `SkpLimit` | `skp_high` | `SkpWarn` | **yes** |
+
+> Turning a switch off disables that event's **voice and its vibration** together.
+> `Mute = All` is the master kill-switch (everything); `Haptic` is the vibration master.
 
 Details:
 - **Fuel callout (2):** value rounded to the 10s (above reserve), singles near critical; the first sample after arming is skipped; min. spacing `CalloutInt`.

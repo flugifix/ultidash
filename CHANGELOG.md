@@ -21,6 +21,14 @@ All notable changes to UltiDash are documented here.
   `pwr_backup`, `skp_high`.
 
 ### Changed
+- **Per-event alert switches:** every callout/announcement now has its own on/off —
+  `SndCellChk`, `SndFuel`, `SndVolt`, `SndArm`, `SndTelem`, `SndLink` (plus existing
+  `PwrWarn`/`SkpWarn`). Each switch disables that event's voice **and** its vibration.
+  **Replaces** the former `Mute` levels (fuel/voltage) and the combined `LinkWarn`
+  (telemetry + link). The options list is regrouped (display / battery / thresholds /
+  alerts). ⚠️ Re-place the widget / re-check options after updating.
+- **`Mute` is now a master kill-switch** (`None` / `All`): `All` silences every alert
+  (voice + vibration), overriding all per-event switches. `Haptic` remains the vibration master.
 - **Sound files moved to `/SOUNDS/en/ultidash/`** (own subfolder, `AUDIO_PATH`) so they no
   longer clash with the EdgeTX voice pack. Install path changes accordingly.
 - **Telemetry-lost/recovered and low-link-quality now use spoken WAVs** instead of tones

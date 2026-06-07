@@ -84,11 +84,18 @@ local ALERT_SAMPLE_CS     = 50  -- voltage must hold the level this long before 
 -- LOCAL HELPER FUNCTIONS
 -- ============================================================================
 
+-- Master mute (the `Mute` option) — when set, suppresses ALL voice + vibration,
+-- overriding the per-event toggles. Refreshed from wgt.options at every entry
+-- point that can produce sound (refresh / background_refresh / state change).
+local master_muted = false
+
 local function play_audio(file)
+    if master_muted then return end
     playFile(AUDIO_PATH .. file .. ".wav")
 end
 
 local function play_vibe(wgt)
+    if master_muted then return end
     if wgt.options.Haptic == 1 then playHaptic(100, 0, PLAY_NOW) end
 end
 
@@ -605,8 +612,10 @@ function ultidash_functions.update_battery_gauge(wgt)
                 wgt.batt_warn = false
             else
                 wgt.batt_warn = true
-                play_audio("batlow")
-                if vbat then playNumber(vbat * 10, 1, PREC1) end
+                if wgt.options.SndCellChk == 1 then
+                    play_audio("batlow")
+                    if vbat then playNumber(vbat * 10, 1, PREC1) end
+                end
             end
         else
             wgt.values.batt_check_progress =
@@ -737,7 +746,9 @@ function ultidash_functions.update_estatus(wgt)
     -- armed/disarm voice on state change (skip the very first sample)
     if connected then
         if wgt.estatus_armed ~= nil and wgt.estatus_armed ~= armed then
-            play_audio(armed and "armed" or "disarm")
+            if wgt.options.SndArm == 1 then
+                play_audio(armed and "armed" or "disarm")
+            end
         end
         wgt.estatus_armed = armed
     else
@@ -746,25 +757,26 @@ function ultidash_functions.update_estatus(wgt)
 end
 
 function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_state)
-    local link_warn = wgt.options and wgt.options.LinkWarn == 1
+    master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
+    local telem_snd = wgt.options and wgt.options.SndTelem == 1
 
     if previous_state == "disconnected" and new_state ~= "disconnected" then
         clear_live_telemetry_values(wgt)
         ultidash_functions.reset_telemetry_stats(wgt)
         -- telemetry recovered: announce only if the loss happened while armed (in flight)
-        if link_warn and wgt.link_lost_armed then
+        if telem_snd and wgt.link_lost_armed then
             play_audio("telem_ok")
         end
         wgt.link_lost_armed = false
         return
     end
 
-    -- telemetry lost while ARMED (in flight): low urgent tone + vibrate.
+    -- telemetry lost while ARMED (in flight): urgent voice + vibrate.
     -- losses while disarmed / on the bench stay silent (logged only).
     if new_state == "disconnected" then
         if previous_state == "armed" then
             ultidash_functions.log("Connection lost (armed)")
-            if link_warn then
+            if telem_snd then
                 play_audio("telem_lost")
                 play_vibe(wgt)
                 wgt.link_lost_armed = true
@@ -790,8 +802,8 @@ end
 
 -- ePowerbar crankFuelCalls: announce fuel % on the 10s, singles when critical.
 local function crank_fuel_calls(wgt)
-    -- bail if fuel alerts muted (Mute == "Voltage and fuel alerts")
-    if (wgt.options.Mute or 1) > 2 then return end
+    -- bail if fuel callouts are switched off
+    if wgt.options.SndFuel ~= 1 then return end
 
     local fuel = wgt.values.fuel
     if fuel == nil then return end
@@ -829,8 +841,8 @@ end
 
 -- ePowerbar crankVoltageAlerts: low/critical per-cell voltage alerts with debounce.
 local function crank_voltage_alerts(wgt)
-    -- bail if voltage alerts muted (Mute >= "Voltage alerts")
-    if (wgt.options.Mute or 1) > 1 then return end
+    -- bail if voltage alerts are switched off
+    if wgt.options.SndVolt ~= 1 then return end
 
     local cellv = wgt.values.vcel
     if cellv == nil or cellv <= 0 then return end
@@ -902,7 +914,7 @@ end
 local LINK_SAMPLE_CS = 50
 
 function ultidash_functions.update_link_warning(wgt)
-    if wgt.options.LinkWarn ~= 1 then
+    if wgt.options.SndLink ~= 1 then
         wgt.link_pending = 0
         wgt.link_level = 0
         wgt.link_announced = 0
@@ -1082,6 +1094,7 @@ end
 -- so the stats-page "Flight Time" reflects the whole flight, not just the time the
 -- widget was on screen.
 function ultidash_functions.background_refresh(wgt)
+    master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
     maybe_reset_stats(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
@@ -1099,6 +1112,7 @@ end
 
 -- Main refresh: full telemetry updates (handles both connected and disconnected states)
 function ultidash_functions.refresh(wgt)
+    master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
     if ultidash_functions.simu_mode then
         wgt.telemetry_alive = true
         ultidash_functions.refresh_ui(wgt)

@@ -88,14 +88,19 @@ Then add the **UltiDash** widget to a (full-screen) widget zone on a model scree
 
 ## Configuration
 
-The widget options cover reserve %, callout interval, mute, voltage display
-(cell/battery), the cell-threshold source (`CellSource` = FC config **or** Manual, with
-manual `CellFull`/`CellLow`/`CellCritical` values), startup delay, the ELRS link warning
-(on/off + RQly warn/critical thresholds), the color scheme (`ColorScheme` = fixed UltiDash
+The widget options cover reserve %, voltage display (cell/battery), the cell-threshold
+source (`CellSource` = FC config **or** Manual, with manual `CellFull`/`CellLow`/
+`CellCritical` values), startup delay, the alert thresholds (`CalloutInt`, `RQlyWarn`/
+`RQlyCrit`, `PwrWarnV`, `SkpLimit`), the color scheme (`ColorScheme` = fixed UltiDash
 palette or follow the EdgeTX theme), what the top-left area shows (`TopLeft` = model image
-or a timer), per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
-`ShowTPWR`), a main-power-loss warning (`PwrWarn` on/off + `PwrWarnV` voltage threshold) and
-a skipped-packet warning (`SkpWarn` on/off + `SkpLimit`).
+or a timer), and per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
+`ShowTPWR`).
+
+**Every alert/announcement has its own on/off switch** — startup cell-check (`SndCellChk`),
+fuel (`SndFuel`), voltage (`SndVolt`), armed/disarm (`SndArm`), telemetry (`SndTelem`),
+link quality (`SndLink`), main power loss (`PwrWarn`) and skipped packets (`SkpWarn`).
+**`Mute` (None / All)** is a master kill-switch that silences everything (voice +
+vibration); **`Haptic`** is the master for vibration.
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full option list, the layout
 breakdown, the callout matrix and the "what is shown when" tables.
