@@ -79,6 +79,13 @@ local ALERTLEVEL_LOW      = 1
 local ALERTLEVEL_CRITICAL = 2
 local FUEL_VLOW           = 10  -- % band above critical handled as singles, not 10s
 local ALERT_SAMPLE_CS     = 50  -- voltage must hold the level this long before alerting
+-- A genuinely connected/measured cell never reads in the ~0..3 V "dead zone" while
+-- flying — it shows its real 3.3..4.2 V or collapses to ~0 when the supply is lost
+-- (e.g. a buffer/backup kicking in). So any per-cell reading below this floor is
+-- treated as "no valid data", NOT as a critically low cell -> prevents a misleading
+-- "battery critical 0 V" callout on power loss. Far below the real critical (~3.3 V),
+-- so it can never mask a genuine alert.
+local MIN_PLAUSIBLE_CELL_V = 1.0
 
 -- ============================================================================
 -- LOCAL HELPER FUNCTIONS
@@ -113,6 +120,19 @@ end
 -- Detect simulator mode for testing
 ultidash_functions.simu_mode = string.sub(select(2, getVersion()), -4) == "simu"
 ultidash_functions.log("simu_mode=%s", tostring(ultidash_functions.simu_mode))
+
+-- Simulator demo data: smooth, coherent values driven by getTime() so the dashboard
+-- drifts gently like a real flight instead of flickering with per-frame random noise.
+local SIM_CELLS = 6
+-- 0..1 sine; `period_s` = seconds for a full cycle, `phase` = 0..1 offset.
+local function sim_wave(period_s, phase)
+    local now = getTime() or 0   -- centiseconds
+    return 0.5 + 0.5 * math.sin((now / (period_s * 100) + (phase or 0)) * 6.2831853)
+end
+-- shared simulated per-cell voltage so Vbat = Vcel * cells stays consistent
+local function sim_vcel()
+    return 3.78 + 0.10 * sim_wave(45, 0)   -- ~3.78..3.88 V, slow drift
+end
 
 local function format_time(t1)
     if not t1 or t1.value == nil then return "00:00", false end
@@ -244,6 +264,10 @@ local function clear_live_telemetry_values(wgt)
     wgt.link_pending = 0
     wgt.link_level = 0
     wgt.link_announced = 0
+    -- rssi warning state
+    wgt.rssi_pending = 0
+    wgt.rssi_level = 0
+    wgt.rssi_announced = 0
     -- main-power-loss warning state
     wgt.pwr_pending = 0
     wgt.pwr_announced = false
@@ -458,49 +482,118 @@ function ultidash_functions.update_transmitter_power(wgt)
 end
 
 -- ============================================================================
+-- ELRS LINK INFO (RFMD rate, RQ/TQ, RSSI headroom, diversity)  -- slice 1: data
+-- ============================================================================
+-- RFMD enum -> { rate_str, min_rssi_dBm (sensitivity floor), desc }.
+-- Covers ELRS 3.x sequential (1-13, 2.4GHz) + 4.x 2.4GHz (21-41) + GemX (100+).
+-- 900MHz 4.x (0-16) collides with 3.x and is NOT disambiguated (rare on a heli) —
+-- see ultidash_resourcesandtools/elrs_rfmd_reference.md.
+local RFMD_INFO = {
+    [1]={"25Hz",-123,"25Hz (LORA)"},   [2]={"50Hz",-115,"50Hz (LORA)"},   [3]={"100Hz",-117,"100Hz (LORA)"},
+    [4]={"100HzF",-112,"100Hz (LORA-full)"}, [5]={"150Hz",-112,"150Hz (LORA)"}, [6]={"200Hz",-112,"200Hz (LORA)"},
+    [7]={"250Hz",-108,"250Hz (LORA)"}, [8]={"333HzF",-105,"333Hz (LORA-full)"}, [9]={"500Hz",-105,"500Hz (LORA)"},
+    [10]={"D250",-104,"250Hz (FLRC-DVDA)"}, [11]={"D500",-104,"500Hz (FLRC-DVDA)"}, [12]={"F500",-104,"500Hz (FLRC)"}, [13]={"F1000",-104,"1000Hz (FLRC)"},
+    [21]={"50Hz",-115,"50Hz (LORA)"},  [23]={"100HzF",-112,"100Hz (LORA-full)"}, [24]={"150Hz",-112,"150Hz (LORA)"},
+    [27]={"250Hz",-108,"250Hz (LORA)"}, [28]={"333HzF",-105,"333Hz (LORA-full)"}, [29]={"500Hz",-105,"500Hz (LORA)"},
+    [30]={"D250",-104,"250Hz (FLRC-DVDA)"}, [31]={"D500",-104,"500Hz (FLRC-DVDA)"}, [32]={"F500",-104,"500Hz (FLRC)"}, [33]={"F1000",-103,"1000Hz (FLRC)"},
+    [34]={"DK250",-105,"250Hz (LoRa-DVDA-K)"}, [35]={"DK500",-105,"500Hz (LoRa-DVDA-K)"}, [36]={"K500",-105,"500Hz (Kernel)"}, [37]={"K1000",-102,"1000Hz (Kernel)"},
+    [40]={"AP500",-105,"500Hz (Airport)"}, [41]={"APF1000",-103,"1000Hz FLRC (Airport)"},
+    [100]={"GX100",-112,"100Hz 8CH (GemX)"}, [101]={"GX150",-112,"150Hz (GemX)"}, [102]={"GX333",-105,"333Hz 8CH (GemX)"}, [103]={"GX500",-105,"500Hz (GemX)"},
+}
+local ELRS_MAX_RSSI = -40   -- top of the usable RSSI window (like elrs_rf)
+
+-- Convert an RSSI (dBm, negative) to a 0..100 "headroom" % between the per-rate
+-- sensitivity floor and ELRS_MAX_RSSI. nil/0 (no value) -> nil.
+local function rssi_to_pct(dbm, floor)
+    if dbm == nil or dbm == 0 then return nil end
+    if floor == nil or floor >= ELRS_MAX_RSSI then return nil end
+    local r = math.min(dbm, ELRS_MAX_RSSI)
+    local p = 100 * (r - floor) / (ELRS_MAX_RSSI - floor)
+    if p < 0 then p = 0 elseif p > 100 then p = 100 end
+    return math.floor(p)
+end
+
+-- Read the ELRS link sensors and derive rate label + RSSI headroom + diversity.
+-- Sensor reads only (no CRSF device ping) so it never interferes with RFTool/MSP.
+function ultidash_functions.update_elrs(wgt)
+    local v = wgt.values
+    if ultidash_functions.simu_mode then
+        v.elrs_rfmd  = 24                                   -- 150Hz, 2.4GHz LORA
+        v.elrs_rq    = math.floor(95 + 4 * sim_wave(15, 0.2))
+        v.elrs_tq    = 100
+        v.elrs_r1_dbm = math.floor(-60 - 20 * sim_wave(22, 0.4))
+        v.elrs_r2_dbm = math.floor(-70 - 20 * sim_wave(22, 0.9))
+        v.elrs_snr   = math.floor(8 + 6 * sim_wave(30, 0))
+        v.elrs_diversity = true
+    else
+        v.elrs_rfmd  = getSourceValue("RFMD")
+        v.elrs_rq    = getSourceValue("RQly")
+        v.elrs_tq    = getSourceValue("TQly")
+        v.elrs_r1_dbm = getSourceValue("1RSS")
+        v.elrs_r2_dbm = getSourceValue("2RSS")
+        v.elrs_snr   = getSourceValue("RSNR")
+        local ant = getSourceValue("ANT")
+        v.elrs_diversity = (v.elrs_r2_dbm ~= nil and v.elrs_r2_dbm ~= 0) or (ant ~= nil)
+    end
+
+    local info = v.elrs_rfmd and RFMD_INFO[math.floor(v.elrs_rfmd)] or nil
+    v.elrs_rate_str  = info and info[1] or "-"
+    v.elrs_rate_desc = info and info[3] or "no link"
+    local floor = info and info[2] or nil
+
+    v.elrs_r1_pct = rssi_to_pct(v.elrs_r1_dbm, floor)
+    v.elrs_r2_pct = rssi_to_pct(v.elrs_r2_dbm, floor)
+end
+
+-- ============================================================================
 -- AIRCRAFT TELEMETRY: VOLTAGE & TEMPERATURE
 -- ============================================================================
 function ultidash_functions.update_cell(wgt)
     wgt.values.vbat = getSourceValue("Vbat")
-    if wgt.telemetry_alive ~= false then
-        wgt.values.vbat_min = getSourceValue("Vbat-")
-        wgt.values.vbat_max = getSourceValue("Vbat+")
+    -- Widget-tracked min/max, recorded ONLY while ARMED (operating) — like the RPM
+    -- extrema gate on the governor run-state. This excludes the post-landing unplug
+    -- decay: when the buffer bridges, Vbat collapses 4.x -> 0 V through plausible-looking
+    -- values (e.g. 2.89 V) that the >1 V floor can't catch but that would pollute the
+    -- minimum. The floor stays as a second guard against any armed-time 0 V glitch.
+    if is_craft_armed(wgt) and wgt.values.vbat ~= nil and wgt.values.vbat > MIN_PLAUSIBLE_CELL_V then
+        update_tracked_extrema(wgt, "vbat", "vbat_min", "vbat_max")
     end
 
     if ultidash_functions.simu_mode then
-        wgt.values.vbat = math.random(1101, 1201) / 100
-        wgt.values.vbat_min = 10.80
-        wgt.values.vbat_max = 12.30
+        wgt.values.vbat = sim_vcel() * SIM_CELLS
+        wgt.values.vbat_min = 3.70 * SIM_CELLS
+        wgt.values.vbat_max = 4.15 * SIM_CELLS
     end
 end
 
 function ultidash_functions.update_vcel(wgt)
     wgt.values.vcel = getSourceValue("Vcel")
-    if wgt.telemetry_alive ~= false then
-        wgt.values.vcel_min = getSourceValue("Vcel-")
-        wgt.values.vcel_max = getSourceValue("Vcel+")
+    -- widget-tracked, ARMED-only (see update_cell): excludes the buffer decay on unplug,
+    -- whose plausible-looking mid values (e.g. 2.89 V) the >1 V floor can't catch.
+    if is_craft_armed(wgt) and wgt.values.vcel ~= nil and wgt.values.vcel > MIN_PLAUSIBLE_CELL_V then
+        update_tracked_extrema(wgt, "vcel", "vcel_min", "vcel_max")
     end
     wgt.values.cel_count = getSourceValue("Cel#")
 
     if ultidash_functions.simu_mode then
-        wgt.values.vcel = 3.2
-        wgt.values.vcel_max = 4.2
-        wgt.values.vcel_min = 3.1
-        wgt.values.cel_count = 2
+        wgt.values.vcel = sim_vcel()
+        wgt.values.vcel_max = 4.15
+        wgt.values.vcel_min = 3.70
+        wgt.values.cel_count = SIM_CELLS
     end
 end
 
 function ultidash_functions.update_vbec(wgt)
     wgt.values.vbec = getSourceValue("Vbec")
-    if wgt.telemetry_alive ~= false then
-        wgt.values.vbec_max = getSourceValue("Vbec+")
-        wgt.values.vbec_min = getSourceValue("Vbec-")
+    -- widget-tracked, ARMED-only (see update_cell): excludes the BEC decay on unplug.
+    if is_craft_armed(wgt) and wgt.values.vbec ~= nil and wgt.values.vbec > MIN_PLAUSIBLE_CELL_V then
+        update_tracked_extrema(wgt, "vbec", "vbec_min", "vbec_max")
     end
 
     if ultidash_functions.simu_mode then
-        wgt.values.vbec = math.random(72, 78) / 10
+        wgt.values.vbec = 8.0
         wgt.values.vbec_max = 8.4
-        wgt.values.vbec_min = 7.2
+        wgt.values.vbec_min = 7.8
     end
 end
 
@@ -508,9 +601,9 @@ function ultidash_functions.update_esc_temperature(wgt)
     wgt.values.esc_temp = getSourceValue("Tesc")
 
     if ultidash_functions.simu_mode then
-        wgt.values.esc_temp = 60
-        wgt.values.esc_temp_max = 75
-        wgt.values.esc_temp_min = 45
+        wgt.values.esc_temp = 55 + 10 * sim_wave(60, 0)   -- ~55..65 °C, slow
+        wgt.values.esc_temp_max = 72
+        wgt.values.esc_temp_min = 28
         return
     end
 
@@ -533,7 +626,7 @@ function ultidash_functions.update_curr(wgt)
     wgt.values.curr = getSourceValue("Curr")
 
     if ultidash_functions.simu_mode then
-        wgt.values.curr = math.random(0, 200)
+        wgt.values.curr = 28 + 12 * sim_wave(20, 0.3)   -- ~28..40 A
     end
 
     if should_track_governor_run_extrema(wgt) then
@@ -546,8 +639,8 @@ function ultidash_functions.update_ma_used(wgt)
     wgt.values.capa_percent = getSourceValue("Bat%")
 
     if ultidash_functions.simu_mode then
-        wgt.values.capa = math.random(0, 2000)
-        wgt.values.capa_percent = math.random(0, 100)
+        wgt.values.capa_percent = 40 + 40 * sim_wave(150, 0)   -- ~40..80 %, very slow
+        wgt.values.capa = math.floor((100 - wgt.values.capa_percent) / 100 * 2500)
     end
 
     -- ePowerbar reserve-adjusted fuel: 0% == reserve reached, scaled over usable range
@@ -633,7 +726,7 @@ function ultidash_functions.update_headspeed(wgt)
     wgt.values.headspeed = getSourceValue("Hspd")
 
     if ultidash_functions.simu_mode then
-        wgt.values.headspeed = math.random(2000, 3000)
+        wgt.values.headspeed = 2350 + 150 * sim_wave(25, 0.5)   -- ~2200..2500 rpm
     end
 
     if should_track_governor_run_extrema(wgt) then
@@ -643,7 +736,7 @@ end
 
 function ultidash_functions.update_gov_state(wgt)
     wgt.values.gov_state = getSourceValue("Gov")
-    if ultidash_functions.simu_mode then wgt.values.gov_state = math.random(0, 9) end
+    if ultidash_functions.simu_mode then wgt.values.gov_state = 4 end   -- Gov. Active (stable)
 end
 
 -- ============================================================================
@@ -691,7 +784,7 @@ function ultidash_functions.update_estatus(wgt)
     end
     if ultidash_functions.simu_mode then
         connected, armed = true, true
-        wgt.values.throttle_text = string.format("%d%%", math.random(0, 100))
+        wgt.values.throttle_text = string.format("%d%%", math.floor(55 + 15 * sim_wave(18, 0.7)))
     end
 
     -- ESC signature + status flags
@@ -845,7 +938,8 @@ local function crank_voltage_alerts(wgt)
     if wgt.options.SndVolt ~= 1 then return end
 
     local cellv = wgt.values.vcel
-    if cellv == nil or cellv <= 0 then return end
+    -- ignore implausible (<1V) readings -> a collapsed/lost supply is no real "critical"
+    if cellv == nil or cellv <= MIN_PLAUSIBLE_CELL_V then return end
 
     local now = getTime()
     if now < wgt.alert_next then return end
@@ -929,7 +1023,7 @@ function ultidash_functions.update_link_warning(wgt)
     end
 
     local rqly = getSourceValue("RQly")
-    if ultidash_functions.simu_mode then rqly = math.random(0, 100) end
+    if ultidash_functions.simu_mode then rqly = 99 end
     if rqly == nil then return end
 
     local now = getTime()
@@ -974,11 +1068,80 @@ function ultidash_functions.update_link_warning(wgt)
     end
 end
 
--- Main-power-loss warning: while ARMED, if Vbat drops below the configurable
--- threshold (PwrWarnV, in 0.1 V; default 9.0 V) the craft is likely running on
--- backup power. Announced ONCE per drop (re-armed when Vbat recovers above the
--- threshold). Separate on/off via the PwrWarn option. Reads Vbat directly so it
--- also works off-screen (background); sensor read only (no MSP) -> armed-safe.
+-- ELRS RSSI warning: while ARMED, when the (best-antenna) RSSI headroom % drops to
+-- RssWarn/RssCrit, speak `rssi_warn`/`rssi_crit` ONCE per episode (re-armed when it
+-- recovers above warn; a warn->crit escalation announces once more). Sensor-derived
+-- (elrs_r1_pct/elrs_r2_pct from update_elrs), no MSP -> armed-safe. Toggle: SndRssi.
+function ultidash_functions.update_rssi_warning(wgt)
+    if wgt.options.SndRssi ~= 1 then
+        wgt.rssi_pending = 0
+        wgt.rssi_level = 0
+        wgt.rssi_announced = 0
+        return
+    end
+    if not is_craft_armed(wgt) then
+        wgt.rssi_pending = 0
+        wgt.rssi_level = 0
+        wgt.rssi_announced = 0
+        return
+    end
+
+    -- effective signal = the better antenna's headroom (diversity picks the stronger)
+    local p = wgt.values.elrs_r1_pct
+    if wgt.values.elrs_diversity and wgt.values.elrs_r2_pct then
+        p = math.max(p or 0, wgt.values.elrs_r2_pct)
+    end
+    if ultidash_functions.simu_mode then p = 80 end
+    if p == nil then return end
+
+    local now = getTime()
+    local warn = wgt.options.RssWarn or 50
+    local crit = wgt.options.RssCrit or 25
+    local level = (p <= crit and 2) or (p <= warn and 1) or 0
+
+    if level == 0 then
+        wgt.rssi_pending = 0
+        wgt.rssi_level = 0
+        wgt.rssi_announced = 0
+        return
+    end
+    if level <= (wgt.rssi_announced or 0) then
+        wgt.rssi_pending = 0
+        return
+    end
+    -- RSSI is noisier than RQly (raw dBm, brief rotational antenna nulls last up to
+    -- ~1.5 s and are harmless) -> use a dedicated, longer hold time (RssHold, seconds)
+    -- so only a SUSTAINED low signal alarms. The value must stay at/below the
+    -- threshold for the whole window; any recovery (level 0) above resets it.
+    local hold_cs = (wgt.options.RssHold or 2) * 100
+    if (wgt.rssi_pending or 0) == 0 then
+        wgt.rssi_level = level
+        wgt.rssi_pending = now + hold_cs
+        return
+    end
+    if level > wgt.rssi_level then wgt.rssi_level = level end
+
+    if now >= wgt.rssi_pending then
+        if wgt.rssi_level >= 2 then
+            play_audio("rssi_crit")
+            play_vibe(wgt)
+        else
+            play_audio("rssi_warn")
+        end
+        wgt.rssi_announced = wgt.rssi_level
+        wgt.rssi_pending = 0
+    end
+end
+
+-- Main-power-loss warning: while ARMED *and still connected*, if Vbat drops below the
+-- configurable threshold (PwrWarnV, in 0.1 V; default 9.0 V) the craft is likely
+-- running on backup power. This explicitly INCLUDES a Vbat that has collapsed to ~0
+-- (main pack disconnected, FC alive on the buffer) — telemetry keeps flowing in that
+-- case, so the connection stays live and we can trust the reading; a real telemetry
+-- dropout flips to "disconnected" and is suppressed (handled as telem-lost instead).
+-- Announced ONCE per drop (re-armed when Vbat recovers above the threshold). Separate
+-- on/off via PwrWarn. Reads Vbat directly so it also works off-screen (background);
+-- sensor read only (no MSP) -> armed-safe.
 function ultidash_functions.update_power_warning(wgt)
     if not wgt.options or wgt.options.PwrWarn ~= 1 then
         wgt.pwr_pending = 0
@@ -992,12 +1155,23 @@ function ultidash_functions.update_power_warning(wgt)
     end
 
     local vbat = getSourceValue("Vbat")
-    if vbat == nil or vbat <= 0 then return end
+    if vbat == nil then return end
 
     local thresh = (wgt.options.PwrWarnV or 90) / 10
     local now = getTime()
 
     if vbat < thresh then
+        -- Distinguish a real main-power loss (buffer/backup took over) from a plain
+        -- telemetry dropout: a buffer-kick keeps telemetry flowing, so the connection
+        -- stays live while Vbat collapses to ~0; a dropout flips to "disconnected"
+        -- (and usually clears the armed gate above). Only warn while still connected
+        -- -> a dropout's 0/stale Vbat can't false-trigger "main power lost". (This is
+        -- why the old `vbat <= 0 -> return` guard is gone: a collapsed Vbat IS the
+        -- signal we now want to catch, as long as the link is alive.)
+        if not is_rf_connected(wgt) then
+            wgt.pwr_pending = 0
+            return
+        end
         if wgt.pwr_announced then return end
         -- debounce: the low reading must hold briefly (avoids transient sag)
         if (wgt.pwr_pending or 0) == 0 then
@@ -1067,6 +1241,7 @@ function ultidash_functions.refresh_ui_no_conn(wgt)
     ultidash_functions.update_craft_name(wgt)
     ultidash_functions.update_model_image(wgt)
     ultidash_functions.update_estatus(wgt)
+    ultidash_functions.update_elrs(wgt)
     ultidash_functions.update_timer_count(wgt)
 end
 
@@ -1098,6 +1273,7 @@ function ultidash_functions.background_refresh(wgt)
     maybe_reset_stats(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
+    ultidash_functions.update_rssi_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
     ultidash_functions.update_skp_warning(wgt)
 
@@ -1128,6 +1304,7 @@ function ultidash_functions.refresh(wgt)
     ultidash_functions.refresh_ui(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
+    ultidash_functions.update_rssi_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
     ultidash_functions.update_skp_warning(wgt)
 end

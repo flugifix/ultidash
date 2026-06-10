@@ -259,6 +259,37 @@ function M.createValues(wgt)
             return string.format("%dmW", v)
         end,
 
+        -- ELRS link info (filled by ultidash_functions.update_elrs; slice 1)
+        elrs_rfmd = nil,
+        elrs_rate_str = "-",
+        elrs_rate_desc = "no link",
+        elrs_rq = nil,
+        elrs_tq = nil,
+        elrs_r1_dbm = nil,
+        elrs_r2_dbm = nil,
+        elrs_r1_pct = nil,
+        elrs_r2_pct = nil,
+        elrs_snr = nil,
+        elrs_diversity = false,
+        elrs_rate_formatted = function()
+            return wgt.values.elrs_rate_str or "-"
+        end,
+        elrs_rq_formatted = function()
+            return wgt.values.elrs_rq and string.format("%d%%", wgt.values.elrs_rq) or "-"
+        end,
+        elrs_tq_formatted = function()
+            return wgt.values.elrs_tq and string.format("%d%%", wgt.values.elrs_tq) or "-"
+        end,
+        elrs_rssi1_formatted = function()
+            return wgt.values.elrs_r1_dbm and string.format("%ddBm", wgt.values.elrs_r1_dbm) or "-"
+        end,
+        elrs_rssi2_formatted = function()
+            return wgt.values.elrs_r2_dbm and string.format("%ddBm", wgt.values.elrs_r2_dbm) or "-"
+        end,
+        elrs_snr_formatted = function()
+            return wgt.values.elrs_snr and string.format("%ddB", wgt.values.elrs_snr) or "-"
+        end,
+
         headspeed = nil,
         headspeed_min = nil,
         headspeed_max = nil,
@@ -573,7 +604,8 @@ function M.createValues(wgt)
         clock_date_formatted = function()
             local t = getDateTime()
             if not t then return "--.--." end
-            return string.format("%02d.%02d.%04d", t.day, t.mon, t.year)
+            -- 2-digit year (26 instead of 2026) to save top-bar width
+            return string.format("%02d.%02d.%02d", t.day, t.mon, t.year % 100)
         end,
 
         timer_str = "00:00",

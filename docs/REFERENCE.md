@@ -43,8 +43,9 @@ alert on/off switches.
 | **ColorScheme** | CHOICE | UltiDash | UltiDash / by EdgeTX Theme | `UltiDash` = fixed built-in palette (independent of the active EdgeTX theme); `by EdgeTX Theme` = follow the active EdgeTX theme colors |
 | **StatsViewMode** | CHOICE | On disarmed | Never / On disarmed / On disconnected | When the statistics page is shown |
 | **VoltageDisplay** | CHOICE | Cell voltage | Cell voltage / Battery voltage | Whether cell or total voltage is shown |
-| **ShowRQly** | BOOL | 1 (on) | – | Top bar: show `RQ` (RQly, downlink link quality) |
-| **ShowTQly** | BOOL | 1 (on) | – | Top bar: show `TQ` (TQly, uplink link quality) |
+| **ShowRQly** | BOOL | 1 (on) | – | Top bar: show the `RQ` bar (RQly, downlink link quality) |
+| **ShowTQly** | BOOL | 1 (on) | – | Top bar: show the `TQ` bar (TQly, uplink link quality) |
+| **ShowRSSI** | BOOL | 1 (on) | – | Top bar: show the RSSI signal bars (`1RSS`, plus `2RSS` when antenna diversity is active) |
 | **ShowTPWR** | BOOL | 1 (on) | – | Bottom status bar (flight view): show `TPWR` (TX power) |
 | **ShowTxV** | BOOL | 1 (on) | – | Top bar: show the radio (TX) battery voltage next to the icon |
 | **Reserve** | VALUE | 20 | 0–40 | Reserve capacity in %. 0 % displayed = reserve reached (ePowerbar model) |
@@ -54,9 +55,12 @@ alert on/off switches.
 | **CellCritical** | VALUE | 330 | 0–440 | Critical/min cell voltage in centivolts. Only used when `CellSource = Manual` |
 | **StartupDelay** | VALUE | 4 | 1–20 | Duration of the startup cell-check (seconds) |
 | **CalloutInt** | VALUE | 6 | 1–60 | Minimum spacing between voice callouts (seconds) |
-| **RQlyWarn** | VALUE | 50 | 0–100 | RQly warning threshold in % (ELRS Link Quality) |
-| **RQlyCrit** | VALUE | 30 | 0–100 | RQly critical threshold in % (with vibration) |
-| **PwrWarnV** | VALUE | 90 | 30–500 | Main-power-loss threshold in **0.1 V** (90 = 9.0 V). While armed, if `Vbat` drops below this, `pwr_backup` is announced once |
+| **RQlyWarn** | VALUE | 80 | 0–100 | RQly warning threshold in % (ELRS Link Quality). High by design: RQly sits at ~100 % in a clean flight, so 80 warns early without false alarms |
+| **RQlyCrit** | VALUE | 50 | 0–100 | RQly critical threshold in % (with vibration) |
+| **RssWarn** | VALUE | 15 | 0–100 | RSSI warning threshold in **% headroom** (best-antenna signal margin above the rate's sensitivity floor). Low by design — see the RSSI note below |
+| **RssCrit** | VALUE | 8 | 0–100 | RSSI critical threshold in % headroom (with vibration) |
+| **RssHold** | VALUE | 2 | 1–10 | Hold time (seconds) the RSSI must stay low before the warning fires — filters brief rotational antenna nulls. RQly uses a fixed 0.5 s |
+| **PwrWarnV** | VALUE | 90 | 30–500 | Main-power-loss threshold in **0.1 V** (90 = 9.0 V). While armed and still connected, if `Vbat` drops below this (incl. a collapse to ~0 on the buffer), `pwr_backup` is announced once |
 | **SkpLimit** | VALUE | 50 | 1–2000 | Skipped-packet limit. While armed, when the `*Skp` counter reaches this, `skp_high` is announced once |
 | **Mute** | CHOICE | None | None / All | **Master**: `All` silences every voice callout **and** vibration, overriding all per-event switches below |
 | **Haptic** | BOOL | 1 (on) | – | Vibrate on critical alerts (master for vibration) |
@@ -66,6 +70,7 @@ alert on/off switches.
 | **SndArm** | BOOL | 1 (on) | – | Sound: armed/disarm |
 | **SndTelem** | BOOL | 1 (on) | – | Sound: telemetry lost/recovered |
 | **SndLink** | BOOL | 1 (on) | – | Sound: low link quality (RQly) |
+| **SndRssi** | BOOL | 1 (on) | – | Sound: low RSSI / signal (best-antenna headroom) |
 | **PwrWarn** | BOOL | 1 (on) | – | Sound: main-power-loss warning |
 | **SkpWarn** | BOOL | 0 (off) | – | Sound: skipped-packet warning |
 
@@ -73,6 +78,14 @@ alert on/off switches.
 > `SkpWarn`). `Mute = All` is a master kill-switch that overrides them all (voice +
 > vibration). `Haptic` is the master for vibration. (Replaces the former `Mute` levels and
 > the combined `LinkWarn`.)
+
+> **RSSI thresholds are in `% headroom`, not raw dBm.** The widget maps the ELRS RSSI
+> (`1RSS`/`2RSS`) to 0–100 % between the **current rate's sensitivity floor** (from `RFMD`)
+> and a fixed top of −40 dBm, then warns on the **better** antenna's headroom. So the same
+> `RssWarn`/`RssCrit` work across rates. Defaults (15 / 8) are intentionally low: in real
+> "all fine" logs the headroom stayed ≥ 16 % with RQly at 100 %, so a higher threshold
+> would false-alarm. `RssHold` (default 2 s) requires the low signal to persist, so brief
+> rotational antenna nulls don't trigger.
 
 > **Cell-voltage thresholds** default to the **Rotorflight FC** (`CellSource = FC config`):
 > `mspBatteryConfig.vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`,
@@ -94,10 +107,15 @@ UltiDash has two views that switch automatically.
 
 ### Switching logic (`StatsViewMode`)
 - **armed** → always **flight view**
-- **Never** or never armed yet → always flight view
+- **Never** or not armed yet **this connection** → always flight view
 - **On disarmed** → stats view once disarmed
 - **On disconnected** → stats view only when the link is lost
 - In the **simulator** the views alternate every 5 s (preview)
+
+> **"Armed this connection":** the stats page only appears after the craft has actually
+> been **armed during the current connection**. The has-flown flag (`ever_armed`) is reset
+> on every fresh connect, so a stats page from an earlier flight doesn't reappear on a new
+> connection that never armed — and the dashboard returns to the flight view on reconnect.
 
 ### 3.1 Flight view
 
@@ -114,8 +132,11 @@ UltiDash has two views that switch automatically.
 
 **Top bar** (replaces the EdgeTX top bar for full-screen use):
 - **left:** date + time (`getDateTime()`)
-- **center:** ELRS link quality — `RQ` (RQly, downlink, option `ShowRQly`) and `TQ`
-  (TQly, uplink, option `ShowTQly`); each can be hidden independently
+- **center:** the ELRS link as up to **four thin stacked bars** — `RQ` (RQly, downlink,
+  `ShowRQly`), `TQ` (TQly, uplink, `ShowTQly`), and the RSSI signal headroom `1RSS` + `2RSS`
+  (`ShowRSSI`; `2RSS` only with antenna diversity). Each bar is color-by-zone (green/yellow/
+  red by its warn/crit thresholds) with small threshold ticks; each group can be hidden
+  independently. The rate/mode comes from `RFMD`.
 - **right:** radio (TX) battery as a compact icon with the **% drawn on the icon** and the
   voltage beside it (voltage toggle: `ShowTxV`); fill green/red depending on the warning
   threshold (from `getGeneralSettings`)
@@ -150,8 +171,9 @@ the TX battery now sits in the top bar)
 
 ### 3.2 Stats view
 
-- **Top bar:** date/time + radio battery only — **RQ/TQ are hidden here** (the momentary
-  link quality is misleading after disconnect; link figures live in the status bar below).
+- **Top bar:** date/time + radio battery only — **the link bars (RQ/TQ/1RSS/2RSS) are
+  hidden here** (the momentary link figures are misleading after disconnect; they live in
+  the status bar / table below).
 - **Header:** model name (the **Rotorflight FC** craft name, cached so it stays after
   disconnect instead of falling back to the EdgeTX model name) · total flight time · flights
 - **Table** (**Latest** / Min / Max) for: voltage, headspeed, current, ESC temp, BEC
@@ -163,15 +185,22 @@ the TX battery now sits in the top bar)
 > disconnect).
 
 #### Min/Max integrity
-The Min/Max are kept clean of the 0-readings that occur during connect/disconnect:
-- **Headspeed & current** are tracked by the widget only while the **governor is running**,
-  so e.g. headspeed Min is the lowest *in-flight* rpm (not 0 from a stopped rotor).
-- **ESC temp** is tracked by the widget ignoring the spurious **0** the ESC reports before
-  its temperature telemetry is up, so ESC-temp Min shows the real low (≈ ambient), not 0.
-- **Voltages / RQly / TPWR / MCU temp** are read from EdgeTX's `-`/`+` min/max sensors, but
-  those are (a) **reset once** when the link is actually up ("FC fully available", RQly > 0),
-  wiping pre-link 0s, and (b) **frozen** while the link is down (RQly = 0) so a lost-link 0
-  can't pollute them. (A brief mid-flight link dropout can still nudge an EdgeTX-sourced Min.)
+The Min/Max are kept clean of the 0-readings and power-loss artefacts around
+connect/disconnect:
+- **Headspeed** is widget-tracked only while the **governor is running**, so its Min is the
+  lowest *in-flight* rpm (not 0 from a stopped rotor).
+- **Voltages (`Vbat`/`Vcel`/`Vbec`)** are widget-tracked **only while armed** and only for
+  plausible (> 1 V) readings. This keeps the post-landing **buffer decay** out of the Min:
+  when the pack is unplugged the buffer bridges and the voltage falls 4.x → 0 through
+  plausible-looking values (e.g. a stray 2.89 V) — armed-only tracking means that decay
+  (which happens disarmed) is never recorded. The > 1 V floor also rejects any 0-V dropout.
+- **ESC temp** is widget-tracked ignoring the spurious **0** the ESC reports before its
+  temperature telemetry is up, so ESC-temp Min shows the real low (≈ ambient), not 0.
+- **RQly / TPWR / MCU temp** are read from EdgeTX's `-`/`+` min/max sensors, which are
+  (a) **reset once** when the link is actually up ("FC fully available", RQly > 0), wiping
+  pre-link 0s, and (b) **frozen** while the link is down (RQly = 0) so a lost-link 0 can't
+  pollute them. (A brief mid-flight link dropout can still nudge an EdgeTX-sourced Min.)
+- **Current** Min is naturally ~0 at idle (no load) — that's a real reading, not pollution.
 
 > The stats card "mAh Used (%)" shows the **raw** Bat% value (not reserve-adjusted).
 > Only the flight-view battery uses the reserve-adjusted value.
@@ -232,7 +261,7 @@ When the voltage first appears (power-on/connect):
 
 ## 5. Voice callouts & vibration
 
-There are **eight** triggers. All outputs are UltiDash's own WAVs in
+There are **nine** triggers. All outputs are UltiDash's own WAVs in
 `/SOUNDS/en/ultidash/` (spoken numbers/units come from the EdgeTX voice pack).
 Each has its own on/off switch; **`Mute = All` overrides them all** (voice + vibration):
 
@@ -244,20 +273,22 @@ Each has its own on/off switch; **`Mute = All` overrides them all** (voice + vib
 | 4 | **Armed/disarm** | arm state change | `armed` / `disarm` | `SndArm` | no (active screen only) |
 | 5 | **Telemetry lost / recovered** | **armed only**: loss from the `armed` state; "recovered" only if the loss was armed | `telem_lost` + vibration (lost) / `telem_ok` (recovered) | `SndTelem` | **yes** |
 | 6 | **Low link quality** | **armed only**; RQly ≤ `RQlyWarn`/`RQlyCrit` | `link_warn`/`link_crit` + RQly % (+ vibration when critical) | `SndLink` | **yes** |
-| 7 | **Main power lost** | **armed only**; `Vbat` < `PwrWarnV` | `pwr_backup` + vibration | `PwrWarn` | **yes** |
-| 8 | **Skipped packets** | **armed only**; `*Skp` counter ≥ `SkpLimit` | `skp_high` | `SkpWarn` | **yes** |
+| 7 | **Low RSSI / signal** | **armed only**; best-antenna headroom ≤ `RssWarn`/`RssCrit`, held for `RssHold` s | `rssi_warn`/`rssi_crit` (+ vibration when critical) | `SndRssi` | **yes** |
+| 8 | **Main power lost** | **armed only & still connected**; `Vbat` < `PwrWarnV` (incl. a collapse to ~0 on the buffer) | `pwr_backup` + vibration | `PwrWarn` | **yes** |
+| 9 | **Skipped packets** | **armed only**; `*Skp` counter ≥ `SkpLimit` | `skp_high` | `SkpWarn` | **yes** |
 
 > Turning a switch off disables that event's **voice and its vibration** together.
 > `Mute = All` is the master kill-switch (everything); `Haptic` is the vibration master.
 
 Details:
 - **Fuel callout (2):** value rounded to the 10s (above reserve), singles near critical; the first sample after arming is skipped; min. spacing `CalloutInt`.
-- **Voltage alert (3):** debounce (hold 0.5 s), then at the earliest after `CalloutInt`. Thresholds from the FC (`vbatwarningcellvoltage`/`vbatmincellvoltage`).
+- **Voltage alert (3):** debounce (hold 0.5 s), then at the earliest after `CalloutInt`. Thresholds from the FC (`vbatwarningcellvoltage`/`vbatmincellvoltage`). Implausible readings (≤ 1 V/cell) are ignored, so a collapsed/lost supply (~0 V) never triggers a misleading "battery critical 0 V" — that case is handled by the main-power-loss warning instead.
 - **Telemetry lost (5):** **only if the loss happens from the armed state** (a real in-flight loss). Losses on the ground / while disarmed stay silent (logged only). The "recovered" voice only fires if an armed loss was reported before. Source = RF connection state (not raw RSSI). ⚠️ EdgeTX may have its **own** "telemetry lost" callout → it can double up; disable the EdgeTX trigger in that case.
 - **Link quality (6):** ELRS **RQly** (Link Quality %), **armed only**; debounce 0.5 s. Announced **once per low-link episode** — re-armed only when RQly recovers above `RQlyWarn`; a warn→critical escalation announces once more. (No longer repeats on the `CalloutInt` interval.)
-- **Main power lost (7):** **armed only**; reads `Vbat` directly. When it falls below `PwrWarnV` (in 0.1 V, default 9.0 V) the craft is likely on backup power. 0.5 s debounce, announced **once per drop**, re-armed when `Vbat` recovers above the threshold. Separate on/off via `PwrWarn`.
-- **Skipped packets (8):** **armed only**; reads the cumulative `*Skp` counter directly. When it reaches `SkpLimit`, `skp_high` ("high packet loss") is spoken **once per flight** (the counter only climbs and resets on telemetry reconnect, which re-arms it). Voice only, no vibration. Separate on/off via `SkpWarn` (default **off**).
-- **Background:** 2, 3, 5, 6, 7, 8 also run when UltiDash isn't the active screen (when armed).
+- **Low RSSI / signal (7):** **armed only**; uses the **better antenna's** RSSI headroom % (`1RSS`/`2RSS` mapped via the `RFMD` rate floor). Below `RssWarn`/`RssCrit`, but only after the low reading holds for **`RssHold`** seconds (default 2 — longer than RQly's 0.5 s because raw RSSI is noisy and brief rotational nulls are harmless). Announced **once per episode**, re-armed on recovery; a warn→critical escalation announces once more.
+- **Main power lost (8):** **armed only and still connected**; reads `Vbat` directly. When it falls below `PwrWarnV` (in 0.1 V, default 9.0 V) — **including a collapse to ~0** — the craft is likely on backup power. The "still connected" gate distinguishes a real buffer-kick (telemetry keeps flowing) from a plain telemetry dropout (which flips to disconnected and is handled as telemetry-lost). 0.5 s debounce, announced **once per drop**, re-armed when `Vbat` recovers. Separate on/off via `PwrWarn`.
+- **Skipped packets (9):** **armed only**; reads the cumulative `*Skp` counter directly. When it reaches `SkpLimit`, `skp_high` ("high packet loss") is spoken **once per flight** (the counter only climbs and resets on telemetry reconnect, which re-arms it). Voice only, no vibration. Separate on/off via `SkpWarn` (default **off**).
+- **Background:** 2, 3, 5, 6, 7, 8, 9 also run when UltiDash isn't the active screen (when armed).
 
 ---
 
@@ -284,6 +315,9 @@ Hard-wired Rotorflight sensor names (no configurable sources):
 | `Esc#` / `EscF` | **ESC signature + status flags (eStatus)** |
 | `RQly` / `RQly-` | **Link quality current (link warning)** / min |
 | `TQly` | Uplink link quality (top-bar `TQ`) |
+| `RFMD` | ELRS RF mode/rate enum → readable rate + per-rate RSSI sensitivity floor |
+| `1RSS` / `2RSS` | ELRS RSSI (dBm) of antenna 1 / 2 → headroom bars + RSSI warning (`2RSS` = diversity) |
+| `RSNR` | ELRS downlink SNR (dB) — shown in the ELRS detail (informational) |
 | `TPWR` / `TPWR+` | TX power (top-bar bottom `TPWR`) / max |
 | `*Skp` | Counter of skipped/undecoded telemetry packets (bottom status bars); the sensor label really starts with `*` |
 
@@ -371,6 +405,7 @@ From the `Gov` sensor (RF internal governor). Values:
   - Battery: `batcrt.wav`, `batlow.wav`, `battry.wav`
   - Arm state: `armed.wav`, `disarm.wav`
   - Link/telemetry: `telem_lost.wav`, `telem_ok.wav`, `link_warn.wav`, `link_crit.wav`
+  - Signal/RSSI: `rssi_warn.wav`, `rssi_crit.wav`
   - Power: `pwr_backup.wav`
   - Skipped packets: `skp_high.wav`
   - Spoken numbers/units (digits, `percent`, `volts`) still come from the EdgeTX voice pack.
@@ -409,30 +444,26 @@ following widgets – all credit to their respective authors:
 
 | Widget | Author / Source | License | Reused |
 |--------|----------------|--------|-----------|
-| **HeliDash** | gismo2004 – [HeliWidget](https://github.com/gismo2004/HeliWidget) | **none** (see below) | Base: layout, LVGL UI, telemetry, flight statistics |
+| **HeliDash** | gismo2004 – [HeliWidget](https://github.com/gismo2004/HeliWidget) | **GPL-3.0** (or later) | Base: layout, LVGL UI, telemetry, flight statistics |
 | **ePowerbar** | Rob 'bob00' Gayle – [etx-widgets](https://github.com/bob01/etx-widgets) | GPLv3 | Battery/reserve model, discrete colors, cell-check, callout engine (itself based on "Lipo battery from single analog source" by Offer Shmuely) |
 | **eBitmap** | Rob 'bob00' Gayle – etx-widgets | GPLv3 | Model/heli image from `/images/` |
 | **eStatus** | Rob 'bob00' Gayle – etx-widgets | GPLv3 | Throttle %, multi-vendor ESC decoder, arming-disable reasons |
 | **BattAnalog** | Offer Shmuely – [edgetx-x10-widgets](https://github.com/offer-shmuely/edgetx-x10-widgets) | GPLv2 (per file header) | only the **style** of the compact top-bar battery icon (no verbatim code) |
 
-**License status (verified):**
+**License status (updated June 2026):**
+- **HeliWidget/HeliDash** (gismo2004) – the **base and thus the bulk of the code** – is now
+  licensed **GPL-3.0 (or later)**, resolving the earlier blocker (it previously had no
+  license file).
 - **etx-widgets** (ePowerbar/eBitmap/eStatus): repo LICENSE = **GPLv3** (the file headers
   still say "GPLv2", but the repo LICENSE is authoritative).
-- **HeliWidget/HeliDash** (gismo2004) – the **base and thus the bulk of the code** – has
-  **no** license file. The author describes it as a "personal hobby project shared freely
-  with the community" (as-is). That is **not** a formal open-source license.
 - **BattAnalog** (Offer Shmuely): no repo LICENSE, only a "GPLv2" file header; only the
   icon's visual concept was reimplemented, no code was copied.
 
-**Intended license: GPLv3 – but not yet cleanly licensable as a whole.**
+**License: GPLv3.**
 
-- For UltiDash's own parts and the etx-widgets-derived parts, **GPLv3** is intended
-  (http://www.gnu.org/licenses/gpl-3.0.html).
-- **Important:** "no license" (the HeliDash base) does **not** mean "free to use"; by
-  default it is *all rights reserved*. Only **gismo2004** can license that code – it
-  **cannot** be unilaterally placed under GPLv3 here.
-- Therefore the **whole work is not yet** cleanly GPLv3. A *formal* release requires
-  gismo2004 to license the HeliDash base (ideally GPLv3 or "GPLv2 or later"). For
-  **private use** this does not matter.
+- All reused components are GPL-compatible (HeliDash base GPL-3.0; etx-widgets parts
+  GPL-3.0), so UltiDash as a whole is distributed under **GPLv3**
+  (http://www.gnu.org/licenses/gpl-3.0.html), with the attributions above preserved.
+- **No warranty:** the software is provided *as-is*; use is **at your own risk**.
 
 *(Plain-language summary, not legal advice.)* Full license header also in `main.lua`.

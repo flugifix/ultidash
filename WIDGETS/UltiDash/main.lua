@@ -4,10 +4,10 @@
 #  UltiDash v0.1 - Rotorflight LVGL dashboard widget for EdgeTX         #
 #  Tested on RadioMaster TX15 and TX16S MK3 (EdgeTX 2.12).              #
 #                                                                       #
-#  Intended license: GPLv3 (http://www.gnu.org/licenses/gpl-3.0.html)   #
-#  NOT yet cleanly licensable as a whole - see the license notes below: #
-#  the HeliDash base (gismo2004) currently carries no license, so       #
-#  formal redistribution is pending that base being licensed.           #
+#  License: GPLv3 or later (http://www.gnu.org/licenses/gpl-3.0.html).  #
+#  All components are now GPL-compatible: the HeliDash base (gismo2004) #
+#  is GPL-3.0 and the etx-widgets-derived parts are GPLv3.              #
+#  See NOTICE.md for the full credits and licensing breakdown.          #
 #                                                                       #
 #  Distributed in the hope that it will be useful, but WITHOUT ANY      #
 #  WARRANTY; without even the implied warranty of MERCHANTABILITY or    #
@@ -22,10 +22,9 @@
   - HeliDash  (gismo2004 - https://github.com/gismo2004/HeliWidget)
       Base widget: overall layout, LVGL UI structure, telemetry handling
       and flight-statistics logic.
-      NOTE: that repo carries NO explicit license file; the author describes it
-      as "a personal hobby project shared freely with the community" (as-is).
-      It is therefore not formally GPL — for any formal redistribution of
-      UltiDash the licensing of this base should be clarified with gismo2004.
+      NOTE: the HeliWidget repo is now licensed GPL-3.0 (or later), so this
+      base is GPL-compatible and UltiDash as a whole can be distributed under
+      GPLv3. (Earlier versions noted it as unlicensed — that is now resolved.)
 
   The following three are from the etx-widgets collection by Rob 'bob00' Gayle
   (https://github.com/bob01/etx-widgets), licensed GPLv3:

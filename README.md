@@ -15,9 +15,10 @@ run it full-screen.
 ![UltiDash statistics page](images/ultidash02.jpg)
 
 > ⚠️ **Work in progress / under testing.** Version **0.1** is an early experimental
-> release and is still being tested in the field. Expect rough edges and changes;
-> use at your own risk. Developed on EdgeTX 2.12 with **Rotorflight 2.3 (required)** and
-> **tested on RadioMaster TX15 and TX16S MK3**. Feedback and bug reports are very welcome.
+> release and is still being tested in the field. Expect rough edges and changes.
+> **Use entirely at your own risk — there is NO warranty of any kind (see [License](#license)).**
+> Intended for the **RadioMaster TX15 and TX16S MK3 running ELRS**, on EdgeTX 2.12 with
+> **Rotorflight 2.3 (required)**. Feedback and bug reports are very welcome.
 
 ---
 
@@ -35,9 +36,11 @@ here, I will of course respect that.
 
 ## Features
 
-- **Top bar** — date/time, ELRS link quality (`RQ` downlink + `TQ` uplink) and a compact
-  radio (TX) battery icon with voltage + % (fill turns red below the warning threshold).
-  Replaces the EdgeTX top bar. RQ/TQ and the TX voltage can be toggled individually.
+- **Top bar** — date/time, the ELRS link as up to four thin stacked bars (`RQ`/`TQ` link
+  quality + `1RSS`/`2RSS` signal headroom, color-by-zone with threshold ticks) and a
+  compact radio (TX) battery icon with voltage + % (fill turns red below the warning
+  threshold). Replaces the EdgeTX top bar. Each bar group and the TX voltage can be
+  toggled individually.
 - **Center battery gauge** (ePowerbar model) — reserve-adjusted fuel %, discrete
   green/yellow/red colors, cell count (e.g. `6S`), big % and used mAh, plus a
   startup cell-check (grey progress bar + warning if the pack isn't full).
@@ -49,9 +52,9 @@ here, I will of course respect that.
 - **Statistics view** — auto-shown when disarmed/disconnected: per-value Actual/Min/Max
   table, total flights & total flight time (from Rotorflight MSP), capacity used.
 - **Voice & vibration callouts** — fuel %, low/critical cell voltage, armed/disarm,
-  ELRS **link-quality / telemetry-lost** warnings, a **main-power-loss** warning and a
-  **skipped-packet** warning (link/power/packet warnings are armed only). All spoken via
-  UltiDash's own WAVs; configurable.
+  ELRS **link-quality**, **RSSI/signal** and **telemetry-lost** warnings, a
+  **main-power-loss** warning and a **skipped-packet** warning (link/RSSI/power/packet
+  warnings are armed only). All spoken via UltiDash's own WAVs; individually configurable.
 - **No external libraries** — UltiDash loads only its own files.
 
 ## Requirements
@@ -60,14 +63,17 @@ here, I will of course respect that.
 - **Rotorflight 2.3** (required) with the **RFTool** widget installed (provides
   connection/arm state and MSP data). MSP is only read on connect/disarm — never during
   armed flight.
+- An **ELRS** RF link: the top-bar link bars (RQ / TQ / 1RSS / 2RSS) and the link/RSSI
+  warnings read ELRS telemetry sensors (`RFMD`, `RQly`, `TQly`, `1RSS`, `2RSS`, `RSNR`).
 - Telemetry sensors (fixed names): `Vbat`, `Vcel`, `Cel#`, `Curr`, `Capa`, `Bat%`,
   `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `RQly`,
   `TQly`, `TPWR`, `Thr`, and (for ESC status) `Esc#` + `EscF`, plus `*Skp` (skipped-packet
-  counter — the sensor label really starts with `*`).
+  counter — the sensor label really starts with `*`), and the ELRS link sensors above.
 - Sounds in `/SOUNDS/en/ultidash/` (all included, in their own subfolder so they don't
   clash with the EdgeTX voice pack): `battry`, `batlow`, `batcrt`, `armed`, `disarm`,
-  `telem_lost`, `telem_ok`, `link_warn`, `link_crit`, `pwr_backup`. Spoken numbers/units
-  (`percent`, `volts`, digits) still come from your EdgeTX voice pack.
+  `telem_lost`, `telem_ok`, `link_warn`, `link_crit`, `rssi_warn`, `rssi_crit`,
+  `pwr_backup`, `skp_high`. Spoken numbers/units (`percent`, `volts`, digits) still come
+  from your EdgeTX voice pack.
 - Optional model image in `/images/`: a single file named after the **Rotorflight model
   name** is enough — e.g. `MyHeli.png` or `MyHeli.jpg`. (Advanced/optional: a
   `<model>-<cells>S` variant, e.g. `MyHeli-6S.png`, is preferred when present so you can
@@ -91,16 +97,17 @@ Then add the **UltiDash** widget to a (full-screen) widget zone on a model scree
 The widget options cover reserve %, voltage display (cell/battery), the cell-threshold
 source (`CellSource` = FC config **or** Manual, with manual `CellFull`/`CellLow`/
 `CellCritical` values), startup delay, the alert thresholds (`CalloutInt`, `RQlyWarn`/
-`RQlyCrit`, `PwrWarnV`, `SkpLimit`), the color scheme (`ColorScheme` = fixed UltiDash
+`RQlyCrit` for link quality, `RssWarn`/`RssCrit` for RSSI signal headroom plus `RssHold`
+hold time, `PwrWarnV`, `SkpLimit`), the color scheme (`ColorScheme` = fixed UltiDash
 palette or follow the EdgeTX theme), what the top-left area shows (`TopLeft` = model image
-or a timer), and per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowTxV`,
-`ShowTPWR`).
+or a timer), and per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowRSSI`,
+`ShowTxV`, `ShowTPWR`).
 
 **Every alert/announcement has its own on/off switch** — startup cell-check (`SndCellChk`),
 fuel (`SndFuel`), voltage (`SndVolt`), armed/disarm (`SndArm`), telemetry (`SndTelem`),
-link quality (`SndLink`), main power loss (`PwrWarn`) and skipped packets (`SkpWarn`).
-**`Mute` (None / All)** is a master kill-switch that silences everything (voice +
-vibration); **`Haptic`** is the master for vibration.
+link quality (`SndLink`), RSSI/signal (`SndRssi`), main power loss (`PwrWarn`) and skipped
+packets (`SkpWarn`). **`Mute` (None / All)** is a master kill-switch that silences
+everything (voice + vibration); **`Haptic`** is the master for vibration.
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full option list, the layout
 breakdown, the callout matrix and the "what is shown when" tables.
@@ -110,7 +117,7 @@ breakdown, the callout matrix and the "what is shown when" tables.
 UltiDash is a merged/derivative work. All credit to the original authors:
 
 - **HeliDash** — base widget, layout & telemetry — based on
-  [HeliWidget by gismo2004](https://github.com/gismo2004/HeliWidget)
+  [HeliWidget by gismo2004](https://github.com/gismo2004/HeliWidget) (GPL-3.0)
 - **ePowerbar / eBitmap / eStatus** — battery model, model image, ESC decoder — by
   Rob 'bob00' Gayle, [etx-widgets](https://github.com/bob01/etx-widgets) (GPLv3)
 - **BattAnalog** — top-bar battery icon style — by
@@ -118,11 +125,11 @@ UltiDash is a merged/derivative work. All credit to the original authors:
 
 ## License
 
-GPLv3 is the **intended** license for UltiDash's own code and the etx-widgets-derived
-parts. **However the whole work is not yet cleanly licensable:** the HeliDash base
-(gismo2004) currently carries **no license** — "no license" means *all rights reserved*
-by default, not free to relicense. A formal public release first requires that base to
-be licensed (ideally GPLv3 or "GPLv2 or later"). Private use is unaffected.
+UltiDash is licensed under **GPLv3** (see [`LICENSE`](LICENSE)). All reused components are
+GPL-compatible: the HeliDash base (gismo2004) is **GPL-3.0**, and the etx-widgets-derived
+parts are GPLv3 — so the combined work can be distributed under GPLv3 with the
+attributions in [`NOTICE.md`](NOTICE.md) preserved.
 
-See [`LICENSE`](LICENSE) (GPLv3 text) and [`NOTICE.md`](NOTICE.md) for the full
-attribution and the licensing caveat. *(Plain-language summary, not legal advice.)*
+**No warranty.** This software is provided *as-is*, without warranty of any kind; you use
+it **entirely at your own risk**. See [`NOTICE.md`](NOTICE.md) for the full attribution.
+*(Plain-language summary, not legal advice.)*

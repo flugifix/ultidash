@@ -53,7 +53,7 @@ local STATS_VIEW_MODE_NEVER = 1
 local STATS_VIEW_MODE_DISARMED = 2
 local STATS_VIEW_MODE_DISCONNECTED = 3
 local DEFAULT_STATS_VIEW_MODE = STATS_VIEW_MODE_DISARMED
-local SIM_VIEW_SWITCH_INTERVAL = 5 * 100
+local SIM_VIEW_SWITCH_INTERVAL = 12 * 100
 
 local FONT_CONSTANTS = {
     TINSIZE = TINSIZE,
@@ -144,6 +144,16 @@ end
 --- Propagate telemetry state changes to services and update the selected view.
 local function handle_telemetry_state_change(widget, previous_state, new_state)
     ultidash_functions.on_telemetry_state_changed(widget, previous_state, new_state)
+    -- Scope ever_armed to THIS connection: on every fresh connect (disconnected -> any
+    -- connected state) start a new "session". So the stats page (On disarmed / On
+    -- disconnected) only appears after the craft was armed *this* connection — not
+    -- because an earlier connection in the same widget runtime was armed. Without this,
+    -- ever_armed stayed true for the whole runtime → stats showed on a later connect that
+    -- never armed, and the dashboard stuck on old/stats values instead of returning to the
+    -- flight view. Live values + stats are already cleared in on_telemetry_state_changed.
+    if previous_state == "disconnected" and new_state ~= "disconnected" then
+        init_view_state(widget).ever_armed = false
+    end
     sync_view_for_telemetry(widget)
 end
 
@@ -1073,8 +1083,8 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
     local pct_font = select_font(icon_h - 2, icon_w - 4, "100%")
     local pct_font_h = measure_font(pct_font)
 
-    -- left: date + time
-    local date_w = math.floor(c_w * 0.36)
+    -- left: date + time (2-digit year keeps this compact, freeing the center for ELRS info)
+    local date_w = math.floor(c_w * 0.30)
     container:label({
         x = x + 1,
         y = y + y_off,
@@ -1086,33 +1096,74 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         align = LEFT
     })
 
-    -- display toggles (per options). RQ/TQ are suppressed entirely on the stats
-    -- page (show_link == false) — there the link quality lives in the table/status
-    -- bar and the momentary RQ/TQ would be misleading after disconnect.
-    local show_rq  = show_link ~= false and wgt.options.ShowRQly == 1
-    local show_tq  = show_link ~= false and wgt.options.ShowTQly == 1
     local show_txv = wgt.options.ShowTxV == 1
 
-    -- center: ELRS link quality (RQly downlink + TQly uplink), each toggleable
-    if show_rq or show_tq then
+    -- center: ELRS link as thin stacked bars (RQ, TQ, 1RSS, 2RSS) — unlabeled,
+    -- color-by-zone with a threshold tick. Suppressed on the stats page
+    -- (show_link == false), where the link figures live in the table/status bar.
+    if show_link ~= false then
         local center_x = x + date_w + 4
         local center_right = show_txv and volt_text_x or icon_x
-        local center_w = math.max(1, center_right - center_x - 4)
-        container:label({
-            x = center_x,
-            y = y + y_off,
-            w = center_w,
-            h = font_h,
-            text = function()
-                local parts = {}
-                if show_rq then parts[#parts + 1] = "RQ " .. wgt.values.rqly_cur_formatted() end
-                if show_tq then parts[#parts + 1] = "TQ " .. wgt.values.tqly_cur_formatted() end
-                return table.concat(parts, "  ")
-            end,
-            font = header_font,
-            color = COLOR_THEME_PRIMARY1,
-            align = CENTER
-        })
+        local bar_w = math.max(8, center_right - center_x - 4)
+
+        local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
+        local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
+        local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
+        local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
+        local TICK    = lcd.RGB(0x20, 0x20, 0x20)
+        local rq_warn = wgt.options.RQlyWarn or 50
+        local rq_crit = wgt.options.RQlyCrit or 30
+        local rs_warn = wgt.options.RssWarn or 50
+        local rs_crit = wgt.options.RssCrit or 25
+
+        -- build the bar list (RQ/TQ honor the Show* toggles; 2RSS only if diversity)
+        local bars = {}
+        local show_rssi = wgt.options.ShowRSSI == 1
+        if wgt.options.ShowRQly == 1 then bars[#bars + 1] = { get = function() return wgt.values.elrs_rq end,     warn = rq_warn, crit = rq_crit } end
+        if wgt.options.ShowTQly == 1 then bars[#bars + 1] = { get = function() return wgt.values.elrs_tq end,     warn = rq_warn, crit = rq_crit } end
+        if show_rssi then
+            bars[#bars + 1] = { get = function() return wgt.values.elrs_r1_pct end, warn = rs_warn, crit = rs_crit }
+            if wgt.values.elrs_diversity then
+                bars[#bars + 1] = { get = function() return wgt.values.elrs_r2_pct end, warn = rs_warn, crit = rs_crit }
+            end
+        end
+
+        local n = #bars
+        if n > 0 then
+        local avail_h = math.max(n * 2, c_h - 2)
+        local slot_h  = math.floor(avail_h / n)
+        local bar_h   = math.max(2, slot_h - 1)
+        local top_y   = y + math.floor((c_h - slot_h * n) / 2)
+
+        local elems = {}
+        for i = 1, n do
+            local by   = top_y + (i - 1) * slot_h
+            local get  = bars[i].get
+            local warn = bars[i].warn
+            local crit = bars[i].crit
+            -- track
+            elems[#elems + 1] = { type = "rectangle", x = center_x, y = by, w = bar_w, h = bar_h, filled = true, color = TRACK }
+            -- reactive fill
+            elems[#elems + 1] = {
+                type = "rectangle", x = center_x, y = by, w = 1, h = bar_h, filled = true,
+                color = function()
+                    local v = get()
+                    if v == nil then return TRACK end
+                    if v >= warn then return C_GREEN elseif v >= crit then return C_YELL else return C_RED end
+                end,
+                pos = function() return center_x, by end,
+                size = function()
+                    local v = get() or 0
+                    if v < 0 then v = 0 elseif v > 100 then v = 100 end
+                    return math.floor(bar_w * v / 100), bar_h
+                end
+            }
+            -- two threshold ticks: crit boundary (left) and warn boundary (right)
+            elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * crit / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK }
+            elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * warn / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK }
+        end
+        container:build(elems)
+        end
     end
 
     -- voltage left of the icon (toggleable)
@@ -1179,6 +1230,85 @@ end
 -- ============================================================================
 -- MAIN FUNCTIONS: Widget lifecycle (create, update, background, refresh)
 -- ============================================================================
+
+--- Build the fullscreen ELRS link detail view (shown while the widget is fullscreen).
+--- Labeled horizontal bars (RQ, TQ, 1RSS, 2RSS) with crit/warn ticks + values,
+--- rate/mode header and SNR/diversity footer. Sized from LCD_W/LCD_H since the
+--- widget zone is not reliably updated on fullscreen entry.
+local function build_elrs_ui(wgt, zone)
+    -- ELRS detail as an inset OVERLAY on top of the dashboard (dashboard peeks around
+    -- the margin). Tap anywhere closes it. NO image / NO focusable objects here.
+    local m = 12
+    local w = (LCD_W or (zone and zone.w) or 480) - 2 * m
+    local h = (LCD_H or (zone and zone.h) or 272) - 2 * m
+
+    local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
+    local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
+    local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
+    local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
+    local TICK    = lcd.RGB(0x20, 0x20, 0x20)
+
+    local rq_warn = wgt.options.RQlyWarn or 50
+    local rq_crit = wgt.options.RQlyCrit or 30
+    local rs_warn = wgt.options.RssWarn or 50
+    local rs_crit = wgt.options.RssCrit or 25
+
+    local panel = lvgl.rectangle({ x = m, y = m, w = w, h = h, color = PANEL_BG, filled = true, rounded = 6 })
+    panel:build({ { type = "rectangle", x = 0, y = 0, w = w, h = h, thickness = 2, rounded = 6, color = COLOR_THEME_SECONDARY1 } })
+
+    panel:label({ x = 10, y = 8, text = "ELRS", font = DBLSIZE, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = 95, y = 15, w = w - 200, h = 22, text = function() return wgt.values.elrs_rate_desc or "-" end, font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = LEFT })
+    panel:label({ x = w - 95, y = 16, w = 85, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+
+    local rows = {
+        { lbl = "RQ",   val = function() return wgt.values.elrs_rq_formatted() end,    get = function() return wgt.values.elrs_rq end,    warn = rq_warn, crit = rq_crit },
+        { lbl = "TQ",   val = function() return wgt.values.elrs_tq_formatted() end,    get = function() return wgt.values.elrs_tq end,    warn = rq_warn, crit = rq_crit },
+        { lbl = "1RSS", val = function() return wgt.values.elrs_rssi1_formatted() end, get = function() return wgt.values.elrs_r1_pct end, warn = rs_warn, crit = rs_crit },
+    }
+    if wgt.values.elrs_diversity then
+        rows[#rows + 1] = { lbl = "2RSS", val = function() return wgt.values.elrs_rssi2_formatted() end, get = function() return wgt.values.elrs_r2_pct end, warn = rs_warn, crit = rs_crit }
+    end
+
+    local top = 52
+    local row_h = math.floor((h - top - 38) / 4)
+    local bar_h = math.max(10, row_h - 12)
+    local lbl_w = 70
+    local val_w = 110
+    local bar_x = 12 + lbl_w
+    local bar_w = math.max(20, w - bar_x - val_w - 12)
+
+    for i = 1, #rows do
+        local r = rows[i]
+        local ry = top + (i - 1) * row_h
+        local by = ry
+        local get, warn, crit = r.get, r.warn, r.crit
+        panel:label({ x = 12, y = ry, w = lbl_w, h = bar_h, text = r.lbl, font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = LEFT })
+        panel:build({
+            { type = "rectangle", x = bar_x, y = by, w = bar_w, h = bar_h, filled = true, color = TRACK },
+            {
+                type = "rectangle", x = bar_x, y = by, w = 1, h = bar_h, filled = true,
+                color = function()
+                    local v = get()
+                    if v == nil then return TRACK end
+                    if v >= warn then return C_GREEN elseif v >= crit then return C_YELL else return C_RED end
+                end,
+                pos = function() return bar_x, by end,
+                size = function()
+                    local v = get() or 0
+                    if v < 0 then v = 0 elseif v > 100 then v = 100 end
+                    return math.floor(bar_w * v / 100), bar_h
+                end
+            },
+            { type = "rectangle", x = bar_x + math.floor(bar_w * crit / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK },
+            { type = "rectangle", x = bar_x + math.floor(bar_w * warn / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK },
+            { type = "rectangle", x = bar_x, y = by, w = bar_w, h = bar_h, thickness = 1, color = COLOR_THEME_SECONDARY1 },
+        })
+        panel:label({ x = bar_x + bar_w + 6, y = ry, w = val_w, h = bar_h, text = r.val, font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = LEFT })
+    end
+
+    panel:label({ x = 12, y = h - 28, text = function() return "SNR: " .. wgt.values.elrs_snr_formatted() end, font = MIDSIZE, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = w - 170, y = h - 26, w = 160, h = 20, text = function() return wgt.values.elrs_diversity and "Diversity: yes" or "Diversity: no" end, font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+end
 
 --- Build the flight dashboard layout for the current widget zone.
 local function build_flight_ui(wgt, zone)
@@ -1389,6 +1519,14 @@ local function background(wgt)
     prepare_widget(wgt)
     rf_service.background(wgt, handle_telemetry_state_change)
     ultidash_functions.background_refresh(wgt)
+end
+
+--- Hit-test a touch point against a rect (with a generous margin for fat fingers).
+local function rect_hit(ts, r, margin)
+    if not r or not ts or ts.x == nil or ts.y == nil then return false end
+    margin = margin or 8
+    return ts.x >= r.x - margin and ts.x <= r.x + r.w + margin
+       and ts.y >= r.y - margin and ts.y <= r.y + r.h + margin
 end
 
 --- Refresh live telemetry, switch views if needed, and rebuild only when dirty.

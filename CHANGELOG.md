@@ -18,7 +18,16 @@ All notable changes to UltiDash are documented here.
   default off) and **`SkpLimit`** (default 50).
 - Dedicated voice files for all events, shipped with the widget: `armed`, `disarm`,
   `battry`, `batlow`, `batcrt`, `telem_lost`, `telem_ok`, `link_warn`, `link_crit`,
-  `pwr_backup`, `skp_high`.
+  `rssi_warn`, `rssi_crit`, `pwr_backup`, `skp_high`.
+- **ELRS link bars in the top bar:** the center now shows up to four thin stacked bars —
+  `RQ`/`TQ` link quality and `1RSS`/`2RSS` signal headroom (rate-aware, derived from
+  `RFMD`/`1RSS`/`2RSS` via a per-rate sensitivity floor), color-by-zone with threshold
+  ticks (2RSS only with antenna diversity). New **`ShowRSSI`** toggle for the RSSI bars
+  (RQ/TQ keep `ShowRQly`/`ShowTQly`).
+- **RSSI / signal warning:** speaks `rssi_warn`/`rssi_crit` once per episode (armed only)
+  when the best-antenna RSSI headroom drops below **`RssWarn`/`RssCrit`** (% headroom),
+  with a configurable hold time **`RssHold`** (seconds, default 2) so brief antenna nulls
+  don't trigger. New **`SndRssi`** on/off.
 
 ### Changed
 - **Per-event alert switches:** every callout/announcement now has its own on/off —
@@ -40,12 +49,33 @@ All notable changes to UltiDash are documented here.
   disarmed/connected, frozen at the last value after disconnect); **RQ/TQ are hidden** in
   the stats top bar; the header keeps showing the **Rotorflight FC** model name after a
   disconnect (cached) instead of falling back to the EdgeTX model name.
+- **Default alert thresholds tuned from real flight logs:** link quality `RQlyWarn`/
+  `RQlyCrit` 50/30 → **80/50** (RQly sits at ~100 % in clean flight, so a higher warn is
+  both earlier and false-alarm-free); RSSI `RssWarn`/`RssCrit` default **15/8** (% headroom).
+- **Top-bar date** now shows a 2-digit year to free space for the link bars.
 
 ### Fixed
 - **Statistics Min/Max no longer show spurious 0s** from connect/disconnect transients:
   EdgeTX-sourced min/max are reset once the link is actually up and frozen while it's down,
   and **ESC-temp Min** is now widget-tracked ignoring the 0 the ESC reports before its
   temperature telemetry comes up (so it shows the real low instead of 0.0).
+- **No more "battery critical 0 V" on power loss:** the cell-voltage alert ignores
+  implausible (< 1 V) readings, and a `Vbat` that collapses to ~0 while the link is still
+  up is now reported as **main-power-loss** (`pwr_backup`), not a critical-voltage callout.
+- **Statistics min voltage no longer polluted by the buffer:** `Vbat`/`Vcel`/`Vbec`
+  min/max are widget-tracked **only while armed** (like the RPM extrema), so the
+  post-landing unplug decay (where the buffer bridges and the voltage falls 4.x → 0,
+  e.g. a stray 2.89 V) is no longer recorded as the minimum.
+- **Statistics page scoped per connection:** `ever_armed` now resets on each fresh connect,
+  so the stats page only appears after the craft was armed *this* connection (not because
+  an earlier connection in the same session was armed), and the dashboard returns to the
+  flight view on reconnect.
+
+### Licensing
+- **UltiDash is now cleanly GPLv3.** The HeliDash base (gismo2004 / HeliWidget) is now
+  licensed **GPL-3.0 (or later)**, resolving the earlier blocker (the base was previously
+  unlicensed). `NOTICE.md`, the root `README.md` and the `main.lua` header are updated to
+  reflect that the combined work is distributable under GPLv3.
 
 ## v0.1 — 2026-05-30
 
