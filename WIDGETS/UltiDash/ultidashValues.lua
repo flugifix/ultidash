@@ -234,27 +234,26 @@ function M.createValues(wgt)
         label_tqly = "TQly",
         label_tpwr_cur = "TPWR",
 
-        -- "*Skp" telemetry sensor = counter of skipped/undecoded telemetry packets.
-        -- The sensor label literally starts with '*'; try that first, fall back to "Skp".
+        -- These getters run as REACTIVE label texts (per LVGL frame, ~20 Hz) — they
+        -- must never do sensor NAME lookups themselves. All four values are cached
+        -- by update_elrs in the 5 Hz pass (skp_raw, elrs_rq/tq/tpwr).
         skp_formatted = function()
-            local v = getSourceValue("*Skp")
-            if v == nil then v = getSourceValue("Skp") end
+            local v = wgt.values.skp_raw
             if v == nil then return "-" end
             return string.format("%d", math.floor(v))
         end,
-        -- current link / power values (read directly, like skp)
         rqly_cur_formatted = function()
-            local v = getSourceValue("RQly")
+            local v = wgt.values.elrs_rq
             if v == nil then return "-" end
             return string.format("%d%%", v)
         end,
         tqly_cur_formatted = function()
-            local v = getSourceValue("TQly")
+            local v = wgt.values.elrs_tq
             if v == nil then return "-" end
             return string.format("%d%%", v)
         end,
         tpwr_cur_formatted = function()
-            local v = getSourceValue("TPWR")
+            local v = wgt.values.elrs_tpwr
             if v == nil then return "-" end
             return string.format("%dmW", v)
         end,

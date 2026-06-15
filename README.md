@@ -2,11 +2,12 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.1 — experimental, under testing`
+`Status: v0.2 — experimental, under testing`
 
-UltiDash brings flight telemetry, battery state, ESC status and radio info together
-on a single self-contained screen — designed so you can drop the EdgeTX top bar and
-run it full-screen.
+UltiDash brings flight telemetry, battery state, ESC status, the ELRS link and radio
+info together on a single self-contained screen — designed so you can drop the EdgeTX
+top bar and run it full-screen. Everything is configured **inside the widget** (a
+fullscreen menu), and tapping a panel opens a detailed view of it.
 
 ![UltiDash flight view](images/ultidash.jpg)
 
@@ -14,8 +15,8 @@ run it full-screen.
 
 ![UltiDash statistics page](images/ultidash02.jpg)
 
-> ⚠️ **Work in progress / under testing.** Version **0.1** is an early experimental
-> release and is still being tested in the field. Expect rough edges and changes.
+> ⚠️ **Work in progress / under testing.** UltiDash is an experimental project and is
+> still being tested in the field. Expect rough edges and changes.
 > **Use entirely at your own risk — there is NO warranty of any kind (see [License](#license)).**
 > Intended for the **RadioMaster TX15 and TX16S MK3 running ELRS**, on EdgeTX 2.12 with
 > **Rotorflight 2.3 (required)**. Feedback and bug reports are very welcome.
@@ -36,25 +37,29 @@ here, I will of course respect that.
 
 ## Features
 
-- **Top bar** — date/time, the ELRS link as up to four thin stacked bars (`RQ`/`TQ` link
-  quality + `1RSS`/`2RSS` signal headroom, color-by-zone with threshold ticks) and a
-  compact radio (TX) battery icon with voltage + % (fill turns red below the warning
-  threshold). Replaces the EdgeTX top bar. Each bar group and the TX voltage can be
-  toggled individually.
-- **Center battery gauge** (ePowerbar model) — reserve-adjusted fuel %, discrete
-  green/yellow/red colors, cell count (e.g. `6S`), big % and used mAh, plus a
-  startup cell-check (grey progress bar + warning if the pack isn't full).
-- **Left status panel** — model image (from `/images`), total flights & flight time,
-  Governor state + Throttle, a multi-vendor **ESC status / fault line** (YGE/OpenYGE,
-  Scorpion, HobbyWing, FLYROTOR, OMP, BLHeli_32) with arming-disable reasons, and a
-  compact Profile / Rate / Battery-Profile row.
-- **Right values panel** — cell/battery voltage, headspeed, current, ESC temp, BEC.
-- **Statistics view** — auto-shown when disarmed/disconnected: per-value Actual/Min/Max
-  table, total flights & total flight time (from Rotorflight MSP), capacity used.
-- **Voice & vibration callouts** — fuel %, low/critical cell voltage, armed/disarm,
-  ELRS **link-quality**, **RSSI/signal** and **telemetry-lost** warnings, a
-  **main-power-loss** warning and a **skipped-packet** warning (link/RSSI/power/packet
-  warnings are armed only). All spoken via UltiDash's own WAVs; individually configurable.
+- **Flight dashboard** — top bar (date/time, the ELRS link as up to four stacked bars,
+  radio battery), a central reserve-adjusted battery gauge, a left status panel (model
+  image, flights & flight time, governor + throttle, a multi-vendor ESC status/fault line,
+  profile/rate/battery-profile) and a right values panel (voltage, headspeed, current,
+  ESC temp, BEC).
+- **Statistics view** — auto-shown when disarmed/disconnected: per-value Latest/Min/Max
+  table (headspeed **per PID profile**), total flights & flight time, capacity used.
+- **Tap-to-open detail pages** (full-screen) — tap a panel to drill in:
+  - **ELRS link** (tap the top-bar bars): RQ, TQ, 1RSS, 2RSS, SNR and TPWR as labelled
+    bars with thresholds, plus SNR / active antenna / session RQ-min.
+  - **Status & events** (tap the status line): arm/governor/throttle summary, the live
+    status line and a timestamped ESC event log.
+  - **Battery** (tap the gauge): a cell-voltage scale with the active thresholds marked
+    plus the battery in the dashboard look.
+- **In-widget settings menu** — no EdgeTX option list to fight: open the full-screen menu
+  and edit everything with real toggle switches, dropdowns and +/− steppers. Settings are
+  **saved per model** on the SD card.
+- **Voice & vibration callouts** — fuel %, cell voltage, armed/disarm, ELRS link-quality,
+  RSSI/signal, telemetry-lost, main-power-loss and skipped-packet warnings, plus optional
+  **switch announcements** (motor / rescue / governor / profile). Each individually
+  switchable, with a master mute and an optional fixed callout volume.
+- **Second-screen views** — place UltiDash again on another screen set to **ELRS details**
+  or **Status info**; these passive instances mirror the dashboard's data.
 - **No external libraries** — UltiDash loads only its own files.
 
 ## Requirements
@@ -63,22 +68,19 @@ here, I will of course respect that.
 - **Rotorflight 2.3** (required) with the **RFTool** widget installed (provides
   connection/arm state and MSP data). MSP is only read on connect/disarm — never during
   armed flight.
-- An **ELRS** RF link: the top-bar link bars (RQ / TQ / 1RSS / 2RSS) and the link/RSSI
-  warnings read ELRS telemetry sensors (`RFMD`, `RQly`, `TQly`, `1RSS`, `2RSS`, `RSNR`).
+- An **ELRS** RF link: the link bars and the link/RSSI warnings read ELRS telemetry
+  sensors (`RFMD`, `RQly`, `TQly`, `1RSS`, `2RSS`, `RSNR`, `TPWR`, `ANT`).
 - Telemetry sensors (fixed names): `Vbat`, `Vcel`, `Cel#`, `Curr`, `Capa`, `Bat%`,
-  `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `RQly`,
-  `TQly`, `TPWR`, `Thr`, and (for ESC status) `Esc#` + `EscF`, plus `*Skp` (skipped-packet
-  counter — the sensor label really starts with `*`), and the ELRS link sensors above.
+  `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `Thr`,
+  `Esc#` + `EscF` (ESC status), the ELRS sensors above, and `*Skp` (skipped-packet counter
+  — the label really starts with `*`).
 - Sounds in `/SOUNDS/en/ultidash/` (all included, in their own subfolder so they don't
-  clash with the EdgeTX voice pack): `battry`, `batlow`, `batcrt`, `armed`, `disarm`,
-  `telem_lost`, `telem_ok`, `link_warn`, `link_crit`, `rssi_warn`, `rssi_crit`,
-  `pwr_backup`, `skp_high`. Spoken numbers/units (`percent`, `volts`, digits) still come
-  from your EdgeTX voice pack.
+  clash with the EdgeTX voice pack). Spoken numbers/units (`percent`, `volts`, digits)
+  still come from your EdgeTX voice pack.
 - Optional model image in `/images/`: a single file named after the **Rotorflight model
   name** is enough — e.g. `MyHeli.png` or `MyHeli.jpg`. (Advanced/optional: a
-  `<model>-<cells>S` variant, e.g. `MyHeli-6S.png`, is preferred when present so you can
-  use a different picture per cell count; otherwise the plain name, then the EdgeTX model
-  bitmap, is used.)
+  `<model>-<cells>S` variant is preferred when present; otherwise the plain name, then the
+  EdgeTX model bitmap, is used.)
 
 ## Installation
 
@@ -90,27 +92,51 @@ WIDGETS/UltiDash/      →  <SD>/WIDGETS/UltiDash/
 SOUNDS/en/ultidash/    →  <SD>/SOUNDS/en/ultidash/
 ```
 
-Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen.
+Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen. The
+only EdgeTX widget option is **`ViewMode`** (Dashboard / ELRS details / Status info) —
+leave it on **Dashboard** for the main instance. Everything else is configured inside the
+widget (see below).
 
 ## Configuration
 
-The widget options cover reserve %, voltage display (cell/battery), the cell-threshold
-source (`CellSource` = FC config **or** Manual, with manual `CellFull`/`CellLow`/
-`CellCritical` values), startup delay, the alert thresholds (`CalloutInt`, `RQlyWarn`/
-`RQlyCrit` for link quality, `RssWarn`/`RssCrit` for RSSI signal headroom plus `RssHold`
-hold time, `PwrWarnV`, `SkpLimit`), the color scheme (`ColorScheme` = fixed UltiDash
-palette or follow the EdgeTX theme), what the top-left area shows (`TopLeft` = model image
-or a timer), and per-element top/bottom-bar toggles (`ShowRQly`, `ShowTQly`, `ShowRSSI`,
-`ShowTxV`, `ShowTPWR`).
+There is essentially **one EdgeTX widget option, `ViewMode`** — all real configuration
+lives in an **in-widget settings menu**:
 
-**Every alert/announcement has its own on/off switch** — startup cell-check (`SndCellChk`),
-fuel (`SndFuel`), voltage (`SndVolt`), armed/disarm (`SndArm`), telemetry (`SndTelem`),
-link quality (`SndLink`), RSSI/signal (`SndRssi`), main power loss (`PwrWarn`) and skipped
-packets (`SkpWarn`). **`Mute` (None / All)** is a master kill-switch that silences
-everything (voice + vibration); **`Haptic`** is the master for vibration.
+1. **Long-press** the widget → **Full screen**.
+2. Tap the **menu symbol** (the ☰ glyph, top-left, next to the clock) — *disarmed only*.
+3. The menu offers **Settings**, **Status** and **Reset settings to defaults**.
 
-See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full option list, the layout
-breakdown, the callout matrix and the "what is shown when" tables.
+The **Settings** page has five groups (use the ‹ › arrows in the header to switch):
+
+| Group | Covers |
+|-------|--------|
+| **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, detail-page behaviour, quiet bars, per-craft config |
+| **Battery** | reserve %, cell-threshold source (FC config / manual cell voltages), startup cell-check delay |
+| **Thresholds** | callout interval, link (RQly) warn/crit, RSSI warn/crit/hold, power-warn voltage, skipped-packet limit, TPWR bar max |
+| **Alerts** | callout volume + when it applies, master mute, vibration, and a per-event on/off for every announcement |
+| **Switch voice** | announce motor / rescue / governor / profile from a chosen TX switch (physical **or** logical) |
+
+Edits are **saved automatically** when you leave the page (back arrow or RTN) and stored
+**per model** in `/WIDGETS/UltiDash/cfg_m_<model-slot>.cfg`. The slot keying survives
+Rotorflight's "set model name on TX" renaming. Enable *Config file per craft* to keep a
+separate file per craft flown from the same model slot.
+
+See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full settings list, the layout
+breakdown, the callout matrix, the detail pages and the "what is shown when" tables.
+
+### Touch navigation (full-screen)
+
+| Tap | Opens |
+|-----|-------|
+| ☰ menu glyph (top-left) | the settings menu (disarmed only) |
+| the link bars | the **ELRS** detail page |
+| the ESC/status line | the **Status & events** page |
+| the battery gauge | the **Battery** detail page |
+| anywhere on a detail page / RTN | back to the dashboard |
+| anywhere on the stats page | dismiss it (returns next flight) |
+
+Detail tap-zones can be turned off (*Display → Tap zones for detail pages*); the menu
+glyph always stays active.
 
 ## Credits
 

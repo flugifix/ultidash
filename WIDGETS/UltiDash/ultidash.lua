@@ -2,6 +2,7 @@ local script_dir = "/WIDGETS/UltiDash/"
 local ultidash_functions = loadScript(script_dir .. "ultidashFunctions.lua")()
 local ultidash_values = loadScript(script_dir .. "ultidashValues.lua")()
 local rf_service = loadScript(script_dir .. "ultidashRf.lua")()
+local ultidash_settings = loadScript(script_dir .. "ultidashSettings.lua")()
 local show_debug_border = 0
 
 -- ============================================================================
@@ -76,7 +77,37 @@ if has_xlsize then
     table.insert(FONT_ORDER, 2, "XLSIZE")
 end
 
-local wgt = ultidash_values.createWidget()
+-- NOTE: each placed instance gets its OWN widget table (created in `create`), so a
+-- second instance (ViewMode = ELRS details / Status info) on another screen has its
+-- own zone/options/values. Cross-instance data flows ONLY through the module-local
+-- `Shared` table in ultidashFunctions (publisher = the Dashboard-mode instance).
+
+local VIEW_MODE_DASHBOARD = 1
+local VIEW_MODE_ELRS      = 2
+local VIEW_MODE_STATUS    = 3
+
+--- The Dashboard-mode instance is the publisher: it alone runs the RF state machine,
+--- MSP, audio/stats side effects and publishes the Shared snapshot. ELRS/Status
+--- instances are passive (sensor reads + rendering only).
+local function is_publisher(widget)
+    -- lenient: anything that isn't explicitly a passive mode counts as Dashboard
+    -- (an out-of-range stored value — e.g. after the option-list change — must
+    -- never silently turn a Dashboard placement passive and kill audio/MSP)
+    local vm = widget.options and widget.options.ViewMode
+    return vm ~= VIEW_MODE_ELRS and vm ~= VIEW_MODE_STATUS
+end
+
+--- Signature of everything a passive view inherits from the Dashboard (publisher
+--- alive? which palette/background?). Compared each refresh against the value stored
+--- at build time — on change the passive view rebuilds itself, so it follows the
+--- Dashboard's look live and flips to/from the "no Dashboard" notice automatically.
+local function passive_style_sig()
+    -- numeric on purpose: this runs every refresh cycle of passive instances and
+    -- a string build there would churn the garbage collector
+    if not ultidash_functions.shared_alive() then return -1 end
+    local shared = ultidash_functions.get_shared()
+    return (shared.color_scheme or 0) * 2 + (shared.bg_filled and 1 or 0)
+end
 
 --- Initialize the widget view state and fill in any missing defaults.
 local function init_view_state(widget)
@@ -115,9 +146,15 @@ local function get_target_view(widget)
 
     if widget.values.rf_connection_state == "armed" then
         view.ever_armed = true
+        widget.stats_dismissed = false
         return "flight"
     end
     if mode == STATS_VIEW_MODE_NEVER or view.ever_armed ~= true then
+        return "flight"
+    end
+    -- manually dismissed (tap on the stats page) — stay on flight until the next
+    -- arm or reconnect clears the flag
+    if widget.stats_dismissed then
         return "flight"
     end
     if mode == STATS_VIEW_MODE_DISARMED then
@@ -138,6 +175,8 @@ local function sync_view_for_telemetry(widget)
     view.current = target_view
     view.dirty = true
     widget.layout_dirty = true
+    -- any flight/stats switch closes the ELRS detail page (it only overlays "flight")
+    widget.detail_view = nil
     return true
 end
 
@@ -153,20 +192,30 @@ local function handle_telemetry_state_change(widget, previous_state, new_state)
     -- flight view. Live values + stats are already cleared in on_telemetry_state_changed.
     if previous_state == "disconnected" and new_state ~= "disconnected" then
         init_view_state(widget).ever_armed = false
+        widget.stats_dismissed = false
     end
     sync_view_for_telemetry(widget)
 end
 
---- Prepare a widget instance once and attach shared services and callbacks.
+--- Prepare a widget instance once (view state only — RF services are publisher-only).
 local function prepare_widget(widget)
     if not widget then return nil end
     if not widget.app_prepared then
         init_view_state(widget)
-        rf_service.init(widget, handle_telemetry_state_change)
-        widget.sync_active_battery_capacity = rf_service.sync_active_battery_capacity
         widget.app_prepared = true
     end
     return widget
+end
+
+--- Attach the RF service lazily and only for the publisher (Dashboard) instance.
+--- ELRS/Status instances never register with rf2 → no second MSP consumer, no
+--- duplicate state-machine callbacks. Lazy (not in prepare_widget) so a mode change
+--- via the options menu picks the service up on the next cycle.
+local function ensure_rf_service(widget)
+    if widget.rf_service_ready then return end
+    rf_service.init(widget, handle_telemetry_state_change)
+    widget.sync_active_battery_capacity = rf_service.sync_active_battery_capacity
+    widget.rf_service_ready = true
 end
 
 -- ============================================================================
@@ -603,7 +652,10 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
     add_stacked_field(status_children, pad + gov_w, y_gt, thr_w, gt_pad,
         wgt.values.label_throttle, function() return wgt.values.throttle_text end, thr_font, thr_font_h)
 
-    -- ESC / arming status line (full width, colored; blank when all OK)
+    -- ESC / arming status line (full width, colored; blank when all OK).
+    -- Tapping it (fullscreen) opens the status detail page — remember its rect
+    -- in widget coords for the hit-test in refresh().
+    wgt.estatus_rect = { x = x + pad, y = y + y_esc, w = inner_w, h = h_esc }
     status_children[#status_children + 1] = {
         type = "label",
         x = pad,
@@ -633,6 +685,38 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
 end
 
 local function get_flight_statistics_rows(wgt)
+    -- Headspeed min/max are tracked PER PID PROFILE (see update_headspeed). Three
+    -- FIXED rows (P1-P3) keep every profile's pair visible after a disconnect —
+    -- the PID# sensor freezes then, so a single switched row would be useless.
+    -- "Latest" shows the live rpm only on the active profile's row.
+    local function hs_actual(p)
+        return function()
+            local cur = wgt.values.profile_id
+            if cur ~= nil and math.floor(cur) == p and wgt.values.headspeed ~= nil then
+                return string.format("%d", math.floor(wgt.values.headspeed))
+            end
+            return "-"
+        end
+    end
+    local function hs_get(p, key)
+        return function()
+            local s = wgt.hs_profile_stats and wgt.hs_profile_stats[p]
+            local v = s and s[key]
+            return v and string.format("%d", math.floor(v)) or "-"
+        end
+    end
+    local function hs_row(p)
+        return {
+            label = "Headspeed P" .. p,
+            actual = hs_actual(p),
+            min = hs_get(p, "min"),
+            max = hs_get(p, "max"),
+            actualColor = COLOR_THEME_PRIMARY1,
+            minColor = COLOR_THEME_PRIMARY1,
+            maxColor = COLOR_THEME_PRIMARY1,
+            test = "3200"
+        }
+    end
     return {
         {
             label = wgt.values.display_voltage_label,
@@ -643,16 +727,11 @@ local function get_flight_statistics_rows(wgt)
             minColor = wgt.values.display_voltage_min_color,
             maxColor = wgt.values.display_voltage_max_color,
             test = wgt.values.display_voltage_test()
-        }, {
-        label = wgt.values.label_headspeed,
-        actual = wgt.values.headspeed_formatted,
-        min = wgt.values.headspeed_min_formatted,
-        max = wgt.values.headspeed_max_formatted,
-        actualColor = COLOR_THEME_PRIMARY1,
-        minColor = COLOR_THEME_PRIMARY1,
-        maxColor = COLOR_THEME_PRIMARY1,
-        test = "3200"
-    }, {
+        },
+        hs_row(1),
+        hs_row(2),
+        hs_row(3),
+        {
         label = wgt.values.label_current,
         actual = wgt.values.curr_formatted,
         min = wgt.values.curr_min_formatted,
@@ -1068,6 +1147,7 @@ end
 --- Build the in-widget top bar: date/time (left) + radio (TX) battery icon (right).
 --- Replaces the EdgeTX top bar so the widget can run fullscreen self-contained.
 local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
+    wgt.elrs_bar_rect = nil   -- (re)set by the bar block below when bars are built
     local font_h = measure_font(header_font)
     local y_off = math.floor((c_h - font_h) / 2)
 
@@ -1083,14 +1163,42 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
     local pct_font = select_font(icon_h - 2, icon_w - 4, "100%")
     local pct_font_h = measure_font(pct_font)
 
-    -- left: date + time (2-digit year keeps this compact, freeing the center for ELRS info)
-    local date_w = math.floor(c_w * 0.30)
+    -- fullscreen-only settings entry: small "menu" glyph (3 bars) before the date.
+    -- The tap target is hit-tested in refresh() like the ELRS bars — no lvgl button.
+    wgt.settings_icon_rect = nil
+    local date_x = x + 1
+    local in_fs = lvgl.isFullScreen ~= nil and lvgl.isFullScreen() == true
+    if in_fs then
+        -- compact boxed "hamburger" tight against the date (the visible button is
+        -- deliberately small); the TAP TARGET is the whole top-left corner plus the
+        -- hit-test margin — much larger than the glyph itself
+        local ic_w = 20
+        local bar_x = date_x + 4
+        local bar_w = ic_w - 8
+        local ic_y = y + math.floor((c_h - 10) / 2)
+        container:build({
+            { type = "rectangle", x = date_x, y = y + 1, w = ic_w, h = c_h - 2, thickness = 1, rounded = 3, color = COLOR_THEME_PRIMARY1 },
+            { type = "rectangle", x = bar_x, y = ic_y,     w = bar_w, h = 2, filled = true, color = COLOR_THEME_PRIMARY1 },
+            { type = "rectangle", x = bar_x, y = ic_y + 4, w = bar_w, h = 2, filled = true, color = COLOR_THEME_PRIMARY1 },
+            { type = "rectangle", x = bar_x, y = ic_y + 8, w = bar_w, h = 2, filled = true, color = COLOR_THEME_PRIMARY1 },
+        })
+        wgt.settings_icon_rect = { x = 0, y = 0, w = date_x + ic_w + 16, h = c_h + 8 }
+        date_x = date_x + ic_w + 4
+    end
+
+    -- left: clock (date + time, or time only via ClockMode), width MEASURED (a
+    -- fixed 30% left a huge gap on the 800x480 TX16S and pushed the bars right)
+    local time_only = wgt.options.ClockMode == 2
+    local date_w = lcd.sizeText(time_only and "00:00" or "00.00.00  00:00", header_font) + 8
     container:label({
-        x = x + 1,
+        x = date_x,
         y = y + y_off,
         w = date_w,
         h = font_h,
-        text = function() return wgt.values.clock_date_formatted() .. "  " .. wgt.values.clock_time_formatted() end,
+        text = function()
+            if time_only then return wgt.values.clock_time_formatted() end
+            return wgt.values.clock_date_formatted() .. "  " .. wgt.values.clock_time_formatted()
+        end,
         font = header_font,
         color = COLOR_THEME_PRIMARY1,
         align = LEFT
@@ -1102,15 +1210,24 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
     -- color-by-zone with a threshold tick. Suppressed on the stats page
     -- (show_link == false), where the link figures live in the table/status bar.
     if show_link ~= false then
-        local center_x = x + date_w + 4
-        local center_right = show_txv and volt_text_x or icon_x
-        local bar_w = math.max(8, center_right - center_x - 4)
+        -- The cluster is ALWAYS centered on the top bar's midline so it never
+        -- shifts when the surroundings change (menu glyph, TxV on/off, date width).
+        -- Width: capped at 40% of the bar, shrunk symmetrically if either side
+        -- (date / voltage / battery) would be touched.
+        local left_lim = date_x + date_w + 6
+        local right_lim = (show_txv and volt_text_x or icon_x) - 6
+        local mid = x + math.floor(c_w / 2)
+        local half = math.min(mid - left_lim, right_lim - mid)
+        local bar_w = math.max(8, math.min(2 * half, math.floor(c_w * 0.40)))
+        local center_x = mid - math.floor(bar_w / 2)
 
         local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
         local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
         local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
         local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
-        local TICK    = lcd.RGB(0x20, 0x20, 0x20)
+        local C_NEUT  = lcd.RGB(0x4A, 0x4A, 0x4A)   -- quiet-mode "all fine" fill
+        local TICK    = lcd.RGB(0x90, 0x90, 0x90)
+        local quiet   = wgt.options.BarsQuiet == 1
         local rq_warn = wgt.options.RQlyWarn or 50
         local rq_crit = wgt.options.RQlyCrit or 30
         local rs_warn = wgt.options.RssWarn or 50
@@ -1135,34 +1252,69 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         local bar_h   = math.max(2, slot_h - 1)
         local top_y   = y + math.floor((c_h - slot_h * n) / 2)
 
+        -- V2 "outline look" (matches the TX battery icon): empty rounded track with
+        -- a fine outline, inset fill, threshold NOTCHES at the bottom edge. With the
+        -- BarsQuiet setting the fill stays neutral dark while everything is fine and
+        -- only turns yellow/red on warn/crit ("quiet when good, loud when bad").
+        -- Tiny bars (small screens) fall back to the simple filled-track style.
+        local outlined = bar_h >= 6
+        local function fill_color(get, warn, crit)
+            return function()
+                local v = get()
+                if v == nil then return TRACK end
+                if v < crit then return C_RED end
+                if v < warn then return C_YELL end
+                return quiet and C_NEUT or C_GREEN
+            end
+        end
+
         local elems = {}
         for i = 1, n do
             local by   = top_y + (i - 1) * slot_h
             local get  = bars[i].get
             local warn = bars[i].warn
             local crit = bars[i].crit
-            -- track
-            elems[#elems + 1] = { type = "rectangle", x = center_x, y = by, w = bar_w, h = bar_h, filled = true, color = TRACK }
-            -- reactive fill
-            elems[#elems + 1] = {
-                type = "rectangle", x = center_x, y = by, w = 1, h = bar_h, filled = true,
-                color = function()
-                    local v = get()
-                    if v == nil then return TRACK end
-                    if v >= warn then return C_GREEN elseif v >= crit then return C_YELL else return C_RED end
-                end,
-                pos = function() return center_x, by end,
-                size = function()
-                    local v = get() or 0
-                    if v < 0 then v = 0 elseif v > 100 then v = 100 end
-                    return math.floor(bar_w * v / 100), bar_h
-                end
-            }
-            -- two threshold ticks: crit boundary (left) and warn boundary (right)
-            elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * crit / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK }
-            elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * warn / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK }
+            if outlined then
+                local fx, fy, fh = center_x + 1, by + 1, bar_h - 2
+                local fw_max = bar_w - 2
+                elems[#elems + 1] = { type = "rectangle", x = center_x, y = by, w = bar_w, h = bar_h, thickness = 1, rounded = 2, color = COLOR_THEME_SECONDARY1 }
+                elems[#elems + 1] = {
+                    type = "rectangle", x = fx, y = fy, w = 1, h = fh, filled = true, rounded = 1,
+                    color = fill_color(get, warn, crit),
+                    pos = function() return fx, fy end,
+                    size = function()
+                        local v = get() or 0
+                        if v < 0 then v = 0 elseif v > 100 then v = 100 end
+                        return math.floor(fw_max * v / 100), fh
+                    end
+                }
+                local nh = math.max(2, math.floor(bar_h * 0.45))
+                elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * crit / 100), y = by + bar_h - nh, w = 2, h = nh, filled = true, color = TICK }
+                elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * warn / 100), y = by + bar_h - nh, w = 2, h = nh, filled = true, color = TICK }
+            else
+                elems[#elems + 1] = { type = "rectangle", x = center_x, y = by, w = bar_w, h = bar_h, filled = true, color = TRACK }
+                elems[#elems + 1] = {
+                    type = "rectangle", x = center_x, y = by, w = 1, h = bar_h, filled = true,
+                    color = fill_color(get, warn, crit),
+                    pos = function() return center_x, by end,
+                    size = function()
+                        local v = get() or 0
+                        if v < 0 then v = 0 elseif v > 100 then v = 100 end
+                        return math.floor(bar_w * v / 100), bar_h
+                    end
+                }
+                elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * crit / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK }
+                elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * warn / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK }
+            end
         end
         container:build(elems)
+
+        -- bar-cluster rect for the fullscreen tap hit-test in refresh() (box-local ≈
+        -- screen coords here: the widget runs as a full-screen zone, box sits ~2 px in).
+        -- The ELRS detail is fullscreen-only: outside fullscreen touch never reaches
+        -- the script, and the lvgl-button experiment for normal-mode taps did not
+        -- fire on hardware — dropped on purpose.
+        wgt.elrs_bar_rect = { x = center_x, y = y, w = bar_w, h = c_h }
         end
     end
 
@@ -1231,16 +1383,35 @@ end
 -- MAIN FUNCTIONS: Widget lifecycle (create, update, background, refresh)
 -- ============================================================================
 
---- Build the fullscreen ELRS link detail view (shown while the widget is fullscreen).
---- Labeled horizontal bars (RQ, TQ, 1RSS, 2RSS) with crit/warn ticks + values,
---- rate/mode header and SNR/diversity footer. Sized from LCD_W/LCD_H since the
---- widget zone is not reliably updated on fullscreen entry.
-local function build_elrs_ui(wgt, zone)
-    -- ELRS detail as an inset OVERLAY on top of the dashboard (dashboard peeks around
-    -- the margin). Tap anywhere closes it. NO image / NO focusable objects here.
-    local m = 12
-    local w = (LCD_W or (zone and zone.w) or 480) - 2 * m
-    local h = (LCD_H or (zone and zone.h) or 272) - 2 * m
+--- Notice page shown by passive views while NO Dashboard instance is running.
+--- The passive views deliberately have no life of their own ("the main widget is
+--- the boss") — without a publisher there is nothing trustworthy to show.
+local function build_missing_dashboard_view(wgt, zone, title)
+    local w = zone.w
+    local h = zone.h
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = false })
+    panel:label({ x = 10, y = 6, text = title, font = h >= 170 and MIDSIZE or 0, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = 10, y = math.floor(h / 2) - 22, w = w - 20, h = 20,
+        text = "No Dashboard instance running", font = 0, color = COLOR_THEME_PRIMARY1, align = CENTER })
+    panel:label({ x = 10, y = math.floor(h / 2) + 2, w = w - 20, h = 20,
+        text = "place an UltiDash with ViewMode = Dashboard", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = CENTER })
+end
+
+--- Build the ELRS link detail view (ViewMode = "ELRS details", passive instance).
+--- Labeled horizontal bars (RQ, TQ, 1RSS, 2RSS) with reactive crit/warn ticks +
+--- values, rate/mode header and SNR/diversity footer. Thresholds AND look (palette,
+--- background) come exclusively from the Dashboard instance via Shared — requires a
+--- running Dashboard (notice page otherwise).
+--- NO image / NO focusable objects — safe for any screen.
+--- as_detail: built as the Dashboard instance's own detail page (opened by tapping
+--- the top-bar bars) — adds the close hint + a full-area invisible close button in
+--- normal mode (in fullscreen the tap-anywhere close is hit-tested in refresh()).
+local function build_elrs_view(wgt, zone, as_detail)
+    if not ultidash_functions.shared_alive() then
+        return build_missing_dashboard_view(wgt, zone, "ELRS")
+    end
+    local w = zone.w
+    local h = zone.h
 
     local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
     local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
@@ -1248,66 +1419,915 @@ local function build_elrs_ui(wgt, zone)
     local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
     local TICK    = lcd.RGB(0x20, 0x20, 0x20)
 
-    local rq_warn = wgt.options.RQlyWarn or 50
-    local rq_crit = wgt.options.RQlyCrit or 30
-    local rs_warn = wgt.options.RssWarn or 50
-    local rs_crit = wgt.options.RssCrit or 25
+    local shared = ultidash_functions.get_shared()
+    local shared_th = shared.thresholds
+    -- live thresholds from the Dashboard instance (its options drive the warnings);
+    -- plain numeric safety defaults only, never this instance's own options
+    local function rq_warn() return shared_th.rq_warn  or 80 end
+    local function rq_crit() return shared_th.rq_crit  or 50 end
+    local function rs_warn() return shared_th.rss_warn or 15 end
+    local function rs_crit() return shared_th.rss_crit or 8 end
 
-    local panel = lvgl.rectangle({ x = m, y = m, w = w, h = h, color = PANEL_BG, filled = true, rounded = 6 })
-    panel:build({ { type = "rectangle", x = 0, y = 0, w = w, h = h, thickness = 2, rounded = 6, color = COLOR_THEME_SECONDARY1 } })
+    -- FONT-METRIC layout: every column width is measured with lcd.sizeText so the
+    -- page fits both the 480x272 (TX15) and the 800x480 (TX16S MK3) screens — the
+    -- old fixed-pixel version overflowed/wrapped on the larger display.
+    local title_font = h >= 170 and DBLSIZE or MIDSIZE
+    local row_font   = h >= 170 and MIDSIZE or 0
+    local title_w, title_h = lcd.sizeText("ELRS", title_font)
+    local row_tw,  row_th  = lcd.sizeText("TPWR", row_font)
+    local val_w            = lcd.sizeText("-108dBm", row_font) + 8
+    local foot_tw, foot_th = lcd.sizeText("Ag", row_font)
 
-    panel:label({ x = 10, y = 8, text = "ELRS", font = DBLSIZE, color = COLOR_THEME_PRIMARY1 })
-    panel:label({ x = 95, y = 15, w = w - 200, h = 22, text = function() return wgt.values.elrs_rate_desc or "-" end, font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = LEFT })
-    panel:label({ x = w - 95, y = 16, w = 85, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (shared.bg_filled == true) })
 
-    local rows = {
-        { lbl = "RQ",   val = function() return wgt.values.elrs_rq_formatted() end,    get = function() return wgt.values.elrs_rq end,    warn = rq_warn, crit = rq_crit },
-        { lbl = "TQ",   val = function() return wgt.values.elrs_tq_formatted() end,    get = function() return wgt.values.elrs_tq end,    warn = rq_warn, crit = rq_crit },
-        { lbl = "1RSS", val = function() return wgt.values.elrs_rssi1_formatted() end, get = function() return wgt.values.elrs_r1_pct end, warn = rs_warn, crit = rs_crit },
-    }
-    if wgt.values.elrs_diversity then
-        rows[#rows + 1] = { lbl = "2RSS", val = function() return wgt.values.elrs_rssi2_formatted() end, get = function() return wgt.values.elrs_r2_pct end, warn = rs_warn, crit = rs_crit }
+    -- header: title + rate/mode, separated by a line
+    panel:label({ x = 10, y = 4, text = "ELRS", font = title_font, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = 10 + title_w + 14, y = 4 + math.floor((title_h - row_th) / 2),
+        w = w - title_w - 24 - (as_detail and 110 or 10), h = row_th + 2,
+        text = function() return wgt.values.elrs_rate_desc or "-" end,
+        font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
+    if as_detail then
+        -- fullscreen-only page: closing is handled in refresh() (any tap) or by
+        -- leaving fullscreen (RTN) — no lvgl button needed (and none allowed: a
+        -- focusable button would capture PAGE/RTN/TELE in fullscreen)
+        panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
     end
+    local top = 4 + title_h + 4
+    panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
 
-    local top = 52
-    local row_h = math.floor((h - top - 38) / 4)
-    local bar_h = math.max(10, row_h - 12)
-    local lbl_w = 70
-    local val_w = 110
-    local bar_x = 12 + lbl_w
-    local bar_w = math.max(20, w - bar_x - val_w - 12)
+    -- fixed rows (2RSS just stays empty/"-" without diversity) so the layout never
+    -- depends on whether telemetry was already seen at build time. TPWR is INVERTED:
+    -- high transmit power means the link is working hard (dynamic power maxing out),
+    -- so the bar turns yellow/red towards the configurable TxPwrMax.
+    -- TPWR needs the configurable TxPwrMax as its 100% reference — without it the
+    -- bar stays empty and shows a hint instead (the raw mW value is still printed).
+    local function tpwr_max() return shared_th.tpwr_max or 0 end
+    local function tpwr_pct()
+        local t = wgt.values.elrs_tpwr
+        local m = tpwr_max()
+        if t == nil or t <= 0 or m <= 0 then return nil end
+        local p = math.floor(100 * t / m)
+        if p > 100 then p = 100 end
+        return p
+    end
+    -- SNR mapped -10..+10 dB -> 0..100% (LoRa demodulates down to ~-7 dB depending
+    -- on rate; 10 dB+ is comfortable). Yellow below ~4 dB, red below 0 dB.
+    local function snr_pct()
+        local s = wgt.values.elrs_snr
+        if s == nil then return nil end
+        local p = math.floor((s + 10) * 5)
+        if p < 0 then p = 0 elseif p > 100 then p = 100 end
+        return p
+    end
+    local rows = {
+        { lbl = "RQ",   val = function() return wgt.values.elrs_rq_formatted() end,    get = function() return wgt.values.elrs_rq end,     warn = rq_warn, crit = rq_crit },
+        { lbl = "TQ",   val = function() return wgt.values.elrs_tq_formatted() end,    get = function() return wgt.values.elrs_tq end,     warn = rq_warn, crit = rq_crit },
+        { lbl = "1RSS", val = function() return wgt.values.elrs_rssi1_formatted() end, get = function() return wgt.values.elrs_r1_pct end, warn = rs_warn, crit = rs_crit },
+        { lbl = "2RSS", val = function() return wgt.values.elrs_rssi2_formatted() end, get = function() return wgt.values.elrs_r2_pct end, warn = rs_warn, crit = rs_crit },
+        { lbl = "SNR",  val = function() return wgt.values.elrs_snr_formatted() end,   get = snr_pct,
+          warn = function() return 70 end, crit = function() return 50 end },
+        { lbl = "TPWR", invert = true,
+          val = function()
+              local t = wgt.values.elrs_tpwr
+              return (t and t > 0) and (math.floor(t) .. "mW") or "-"
+          end,
+          get = tpwr_pct,
+          warn = function() return 60 end, crit = function() return 85 end,
+          tick_vis = function() return tpwr_max() > 0 end,
+          hint = "set 'TPWR bar max' in settings",
+          hint_vis = function() return tpwr_max() <= 0 end },
+    }
+
+    local foot_h = foot_th + 10
+    local row_h = math.floor((h - top - foot_h - 2) / #rows)
+    local bar_h = math.max(8, row_h - 10)
+    local lbl_w = row_tw + 10
+    local bar_x = 10 + lbl_w
+    local bar_w = math.max(20, w - bar_x - val_w - 14)
 
     for i = 1, #rows do
         local r = rows[i]
-        local ry = top + (i - 1) * row_h
-        local by = ry
-        local get, warn, crit = r.get, r.warn, r.crit
-        panel:label({ x = 12, y = ry, w = lbl_w, h = bar_h, text = r.lbl, font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = LEFT })
+        local ry = top + 4 + (i - 1) * row_h
+        local ty = ry + math.floor((bar_h - row_th) / 2)   -- text vertically centered on the bar
+        local get, warn, crit, invert = r.get, r.warn, r.crit, r.invert
+        panel:label({ x = 10, y = ty, w = lbl_w, h = row_th + 2, text = r.lbl, font = row_font, color = COLOR_THEME_PRIMARY1, align = LEFT })
         panel:build({
-            { type = "rectangle", x = bar_x, y = by, w = bar_w, h = bar_h, filled = true, color = TRACK },
+            { type = "rectangle", x = bar_x, y = ry, w = bar_w, h = bar_h, filled = true, rounded = 3, color = TRACK },
             {
-                type = "rectangle", x = bar_x, y = by, w = 1, h = bar_h, filled = true,
+                type = "rectangle", x = bar_x, y = ry, w = 1, h = bar_h, filled = true, rounded = 3,
                 color = function()
                     local v = get()
                     if v == nil then return TRACK end
-                    if v >= warn then return C_GREEN elseif v >= crit then return C_YELL else return C_RED end
+                    if invert then
+                        if v >= crit() then return C_RED elseif v >= warn() then return C_YELL else return C_GREEN end
+                    end
+                    if v >= warn() then return C_GREEN elseif v >= crit() then return C_YELL else return C_RED end
                 end,
-                pos = function() return bar_x, by end,
+                pos = function() return bar_x, ry end,
                 size = function()
                     local v = get() or 0
                     if v < 0 then v = 0 elseif v > 100 then v = 100 end
                     return math.floor(bar_w * v / 100), bar_h
                 end
             },
-            { type = "rectangle", x = bar_x + math.floor(bar_w * crit / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK },
-            { type = "rectangle", x = bar_x + math.floor(bar_w * warn / 100), y = by, w = 1, h = bar_h, filled = true, color = TICK },
-            { type = "rectangle", x = bar_x, y = by, w = bar_w, h = bar_h, thickness = 1, color = COLOR_THEME_SECONDARY1 },
+            -- threshold ticks (= the color-switch points), reactive so they follow
+            -- the dashboard's live options; hidden via tick_vis when meaningless
+            { type = "rectangle", x = bar_x, y = ry, w = 2, h = bar_h, filled = true, color = TICK, visible = r.tick_vis,
+              pos = function() return bar_x + math.floor(bar_w * crit() / 100), ry end },
+            { type = "rectangle", x = bar_x, y = ry, w = 2, h = bar_h, filled = true, color = TICK, visible = r.tick_vis,
+              pos = function() return bar_x + math.floor(bar_w * warn() / 100), ry end },
+            { type = "rectangle", x = bar_x, y = ry, w = bar_w, h = bar_h, thickness = 1, rounded = 3, color = COLOR_THEME_SECONDARY1 },
         })
-        panel:label({ x = bar_x + bar_w + 6, y = ry, w = val_w, h = bar_h, text = r.val, font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = LEFT })
+        if r.hint then
+            panel:label({ x = bar_x + 6, y = ty, w = bar_w - 12, h = row_th + 2,
+                text = r.hint, font = SMLSIZE, color = COLOR_THEME_DISABLED, align = CENTER,
+                visible = r.hint_vis })
+        end
+        panel:label({ x = bar_x + bar_w + 6, y = ty, w = val_w, h = row_th + 2, text = r.val, font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
     end
 
-    panel:label({ x = 12, y = h - 28, text = function() return "SNR: " .. wgt.values.elrs_snr_formatted() end, font = MIDSIZE, color = COLOR_THEME_PRIMARY1 })
-    panel:label({ x = w - 170, y = h - 26, w = 160, h = 20, text = function() return wgt.values.elrs_diversity and "Diversity: yes" or "Diversity: no" end, font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+    -- footer: link details (left, live) + diversity (right)
+    panel:hline({ y = h - foot_h - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+    panel:label({ x = 10, y = h - foot_h + 4, w = w - 130, h = foot_th + 2,
+        text = function()
+            local v = wgt.values
+            local s = ""
+            if v.elrs_ant ~= nil then s = "Ant " .. (v.elrs_ant + 1) end
+            if v.rqly_min ~= nil then s = s .. (s ~= "" and "    " or "") .. "RQ min " .. math.floor(v.rqly_min) .. "%" end
+            return s
+        end,
+        font = row_font, color = COLOR_THEME_PRIMARY1, align = LEFT })
+    panel:label({ x = w - 124, y = h - foot_h + 6, w = 114, h = 20,
+        text = function() return wgt.values.elrs_diversity and "Diversity: yes" or "Diversity: no" end,
+        font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+end
+
+--- Build the STATUS DETAIL page (opened by tapping the ESC/arming status line,
+--- fullscreen only — modeled after eStatus' app-mode view): current arm/governor/
+--- throttle summary, the colored status line, and the timestamped ESC event log.
+--- All rows are reactive (the log updates live without rebuilds).
+local function build_estatus_view(wgt, zone)
+    local w = zone.w
+    local h = zone.h
+    local C_RED = lcd.RGB(0xE0, 0x30, 0x30)
+
+    local title_font = h >= 170 and DBLSIZE or MIDSIZE
+    local row_font   = h >= 170 and MIDSIZE or 0
+    local title_w, title_h = lcd.sizeText("Status", title_font)
+    local _, row_th = lcd.sizeText("Ag", row_font)
+
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
+        filled = (ultidash_functions.get_shared().bg_filled == true) })
+
+    -- header: title + craft name + close hint
+    panel:label({ x = 10, y = 4, text = "Status", font = title_font, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = 10 + title_w + 14, y = 4 + math.floor((title_h - row_th) / 2),
+        w = w - title_w - 140, h = row_th + 2,
+        text = function() return wgt.values.craft_name_formatted() end,
+        font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
+    panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+    local top = 4 + title_h + 4
+    panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+
+    -- neutral grey for hints/trace/timestamps — deliberately NOT the theme's
+    -- DISABLED color (the Clean palette maps that to orange-red, which made the
+    -- "no events yet" hint look like an error)
+    local C_DIM = lcd.RGB(0x90, 0x90, 0x90)
+
+    -- summary: arm state / governor / throttle — governor gets the widest column
+    -- ("Throttle off" wrapped into the status line below with equal thirds)
+    local sy = top + 4
+    local arm_w = math.floor(w * 0.24)
+    local gov_w = math.floor(w * 0.46)
+    panel:label({ x = 10, y = sy, w = arm_w, h = row_th + 2,
+        text = function() return wgt.armed_now and "ARMED" or "Disarmed" end,
+        font = row_font,
+        color = function() return wgt.armed_now and C_RED or COLOR_THEME_PRIMARY1 end,
+        align = LEFT })
+    panel:label({ x = 10 + arm_w, y = sy, w = gov_w, h = row_th + 2,
+        text = function() return "Gov: " .. wgt.values.gov_state_formatted() end,
+        font = row_font, color = COLOR_THEME_PRIMARY1, align = LEFT })
+    panel:label({ x = 10 + arm_w + gov_w, y = sy, w = w - 20 - arm_w - gov_w, h = row_th + 2,
+        text = function() return "Thr: " .. (wgt.values.throttle_text or "-") end,
+        font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+
+    -- current status line (ESC status / arming-disable reasons / placeholder)
+    local ly = sy + row_th + 8
+    panel:label({ x = 10, y = ly, w = w - 20, h = row_th + 2,
+        text = function() return wgt.values.status_line_text end,
+        font = row_font,
+        color = function() return wgt.values.status_line_color end,
+        align = CENTER })
+
+    -- timestamped event log (newest first), reactive slots — like eStatus' app
+    -- mode. Standard font on purpose: smaller than the summary -> more rows fit.
+    local log_font = 0
+    local time_w, log_th = lcd.sizeText("00:00:00", log_font)
+    time_w = time_w + 10
+    local log_top = ly + row_th + 10
+    panel:hline({ y = log_top - 2, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+    local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
+    panel:label({ x = 10, y = log_top + 2, w = 200, h = sml_h + 2, text = "Event log", font = SMLSIZE, color = C_DIM, align = LEFT })
+    -- dev metrics footer (Lua heap / UI loop rate / 5Hz-pass duration)
+    panel:label({ x = 10, y = h - log_th - 4, w = w - 20, h = log_th + 2,
+        text = function()
+            return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB     UI " .. (wgt.dbg_hz or "-")
+                .. " Hz     pass " .. ((wgt.dbg_pass_cs or 0) * 10) .. " ms"
+        end,
+        font = SMLSIZE, color = C_DIM, align = LEFT })
+
+    local list_y = log_top + sml_h + 6
+    local log_row_h = log_th + 3
+    local slots = math.max(1, math.floor((h - list_y - log_th - 10) / log_row_h))
+    for i = 1, slots do
+        local idx = i   -- 1 = newest
+        local ry = list_y + (i - 1) * log_row_h
+        local function entry()
+            local log = ultidash_functions.get_esc_log(wgt)
+            return log and log[#log - (idx - 1)] or nil
+        end
+        -- dim timestamp column + level-colored text column
+        panel:label({ x = 10, y = ry, w = time_w, h = log_th + 2,
+            text = function()
+                local e = entry()
+                if e then return e.time end
+                return (idx == 1 and ultidash_functions.get_esc_log(wgt) == nil) and "no events yet" or ""
+            end,
+            font = log_font, color = C_DIM, align = LEFT })
+        panel:label({ x = 10 + time_w, y = ry, w = w - 20 - time_w, h = log_th + 2,
+            text = function()
+                local e = entry()
+                return e and e.text or ""
+            end,
+            font = log_font,
+            color = function()
+                local e = entry()
+                if not e then return C_DIM end
+                if e.level >= 3 then return C_RED end
+                if e.level == 2 then return COLOR_THEME_WARNING end
+                if e.level <= 0 then return C_DIM end
+                return COLOR_THEME_PRIMARY1
+            end,
+            align = LEFT })
+    end
+end
+
+--- Build the BATTERY DETAIL page (tap the center fuel gauge, fullscreen only):
+--- a big fuel gauge plus a cell-voltage scale with the RESOLVED thresholds
+--- (FC config or manual) marked, and the key battery numbers. Drawn with
+--- build-table primitives only (no lvgl.box — overlay/window objects swallow
+--- fullscreen taps).
+local function build_battery_view(wgt, zone)
+    local w = zone.w
+    local h = zone.h
+    local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
+    local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
+    local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
+    local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
+    local C_DIM   = lcd.RGB(0x90, 0x90, 0x90)
+    local TICK    = lcd.RGB(0x20, 0x20, 0x20)
+
+    local title_font = h >= 170 and DBLSIZE or MIDSIZE
+    local row_font   = h >= 170 and MIDSIZE or 0
+    local title_w, title_h = lcd.sizeText("Battery", title_font)
+    local _, row_th = lcd.sizeText("Ag", row_font)
+
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
+        filled = (ultidash_functions.get_shared().bg_filled == true) })
+
+    panel:label({ x = 10, y = 4, text = "Battery", font = title_font, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+    local top = 4 + title_h + 4
+    panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+
+    -- cell-voltage scale with the resolved thresholds marked (full width); the
+    -- current value gets the big title-size font
+    local rx = 14
+    local rw = w - 28
+    local val_font = title_font
+    local _, val_h = lcd.sizeText("8.88", val_font)
+    local val_w = lcd.sizeText("88.88", val_font) + 10
+    local bar_w = rw - val_w - 8
+    local bar_h = math.max(12, row_th)
+    local function th_full() return wgt.values.vcel_full_threshold() end
+    local function th_low()  return wgt.values.vcel_warning_threshold() end
+    local function th_crit() return wgt.values.vcel_alarm_threshold() end
+    local function vx(v)
+        local smin = th_crit() - 0.15
+        local smax = th_full() + 0.10
+        if smax <= smin then smax = smin + 1 end
+        local f = (v - smin) / (smax - smin)
+        if f < 0 then f = 0 elseif f > 1 then f = 1 end
+        return math.floor(bar_w * f)
+    end
+
+    local sy = top + 6
+    -- SMLSIZE is taller on 800x480 — measure instead of hardcoding (label used to
+    -- collide with the scale bar on the TX16S)
+    local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
+    panel:label({ x = rx, y = sy, w = rw, h = sml_h + 2, text = "Cell voltage", font = SMLSIZE, color = C_DIM, align = LEFT })
+    local by = sy + sml_h + 4
+    panel:build({
+        { type = "rectangle", x = rx, y = by, w = bar_w, h = bar_h, filled = true, rounded = 3, color = TRACK },
+        { type = "rectangle", x = rx + 1, y = by + 1, w = 1, h = bar_h - 2, filled = true, rounded = 2,
+          color = function()
+              local v = wgt.values.vcel
+              if v == nil then return TRACK end
+              if v <= th_crit() then return C_RED end
+              if v <= th_low() then return C_YELL end
+              return C_GREEN
+          end,
+          pos = function() return rx + 1, by + 1 end,
+          size = function()
+              local v = wgt.values.vcel
+              if v == nil then return 0, bar_h - 2 end
+              return math.max(1, vx(v) - 1), bar_h - 2
+          end },
+        { type = "rectangle", x = rx, y = by, w = 2, h = bar_h, filled = true, color = TICK,
+          pos = function() return rx + vx(th_crit()), by end },
+        { type = "rectangle", x = rx, y = by, w = 2, h = bar_h, filled = true, color = TICK,
+          pos = function() return rx + vx(th_low()), by end },
+        { type = "rectangle", x = rx, y = by, w = 2, h = bar_h, filled = true, color = TICK,
+          pos = function() return rx + vx(th_full()), by end },
+        { type = "rectangle", x = rx, y = by, w = bar_w, h = bar_h, thickness = 1, rounded = 3, color = COLOR_THEME_SECONDARY1 },
+    })
+    panel:label({ x = rx + bar_w + 6, y = by + math.floor((bar_h - val_h) / 2), w = val_w, h = val_h + 2,
+        text = function() return wgt.values.vcel_formatted() end,
+        font = val_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+    -- threshold legend incl. the source (FC config vs manual values)
+    panel:label({ x = rx, y = by + bar_h + 4, w = rw, h = sml_h + 2,
+        text = function()
+            return string.format("crit %.2f   low %.2f   full %.2f V   (%s)",
+                th_crit(), th_low(), th_full(),
+                (wgt.options.CellSource == 2) and "manual" or "FC config")
+        end,
+        font = SMLSIZE, color = C_DIM, align = LEFT })
+
+    -- horizontal battery in the EXACT dashboard look (coarse segments, light grey
+    -- empty area, black overlays) — "laid down" under the voltage scale, cap right,
+    -- filling left -> right. Values are drawn INSIDE the graphic.
+    local bottom_h = row_th + 8
+    local cap_w = math.max(7, math.floor(w * 0.018))
+    local bx = 14
+    local by2 = by + bar_h + 8 + sml_h + 6
+    local bw = w - 28 - cap_w
+    local bh = math.max(40, h - by2 - bottom_h - 10)
+    local body_rounding = math.max(3, math.floor(bh * 0.10))
+    local inner_pad = math.max(3, math.floor(bh * 0.10))
+    local ix = bx + inner_pad
+    local iy = by2 + inner_pad
+    local iw = bw - 2 * inner_pad
+    local ih = bh - 2 * inner_pad
+    local seg_gap = math.max(1, math.floor(iw * 0.01))
+    local seg_count = math.max(6, math.min(9, math.floor(iw / 16)))
+    local seg_w = math.floor((iw - (seg_count - 1) * seg_gap) / seg_count)
+    local seg_last_w = iw - seg_w * (seg_count - 1) - seg_gap * (seg_count - 1)
+    local seg_rounding = math.max(1, math.floor(ih * 0.10))
+    local function seg_color(threshold)
+        return function()
+            local p = wgt.values.gauge_fill_percent()
+            if p >= threshold then return wgt.values.capa_bar_color end
+            return TRACK
+        end
+    end
+
+    -- cap (the "plus pole", right) + body outline
+    local cap_h = math.floor(bh * 0.36)
+    panel:build({
+        { type = "rectangle", x = bx + bw, y = by2 + math.floor((bh - cap_h) / 2), w = cap_w, h = cap_h,
+          rounded = 2, color = COLOR_THEME_SECONDARY1, filled = true },
+        { type = "rectangle", x = bx, y = by2, w = bw, h = bh, thickness = 1, rounded = body_rounding,
+          color = COLOR_THEME_SECONDARY1, filled = false },
+    })
+
+    -- segments, leftmost = lowest threshold (fills from the left towards the cap)
+    for i = 1, seg_count do
+        local sw = (i == seg_count) and seg_last_w or seg_w
+        local sx = ix + (i - 1) * (seg_w + seg_gap)
+        local col = seg_color((i / seg_count) * 100)
+        local flat_w = math.max(1, math.min(seg_rounding, sw))
+        panel:build({
+            { type = "rectangle", x = sx, y = iy, w = sw, h = ih, thickness = 1,
+              rounded = (i == 1 or i == seg_count) and seg_rounding or 0, color = col, filled = true },
+            { type = "rectangle", x = (i == 1) and (sx + sw - flat_w) or sx, y = iy, w = flat_w, h = ih,
+              thickness = 0, color = col, filled = (i == 1 or i == seg_count) },
+        })
+    end
+
+    -- overlays INSIDE the graphic: cells (left), big percent (center), used/capacity (right)
+    local pct_font = select_font(math.floor(bh * 0.50), 220, "100%")
+    local pct_h = measure_font(pct_font)
+    panel:label({ x = ix + 8, y = by2 + math.floor((bh - row_th) / 2), w = math.floor(iw * 0.20), h = row_th + 2,
+        text = function() return wgt.values.gauge_cells_formatted() end,
+        font = row_font, color = BLACK, align = LEFT })
+    panel:label({ x = bx, y = by2 + math.floor((bh - pct_h) / 2), w = bw, h = pct_h,
+        text = function() return wgt.values.gauge_percent_formatted() end,
+        font = pct_font, color = BLACK, align = CENTER })
+    -- used mAh only, like the dashboard gauge — the profile's TOTAL capacity is
+    -- merely informational and "x / total" misreads as usable-until-total (the
+    -- reserve model ends earlier)
+    panel:label({ x = ix + iw - math.floor(iw * 0.30) - 8, y = by2 + math.floor((bh - row_th) / 2),
+        w = math.floor(iw * 0.30), h = row_th + 2,
+        text = function() return wgt.values.gauge_mah_value_formatted() .. " mAh" end,
+        font = row_font, color = BLACK, align = RIGHT })
+
+    -- bottom line: the remaining numbers in one row
+    local byl = h - bottom_h + 2
+    panel:label({ x = 14, y = byl, w = math.floor(w * 0.34), h = row_th + 2,
+        text = function() return "Batt " .. wgt.values.vbat_formatted() end,
+        font = row_font, color = COLOR_THEME_PRIMARY1, align = LEFT })
+    panel:label({ x = math.floor(w * 0.34), y = byl, w = math.floor(w * 0.32), h = row_th + 2,
+        text = function()
+            local v = wgt.values.vcel_min
+            return "Cell min " .. (v and string.format("%.2f V", v) or "-")
+        end,
+        font = row_font, color = COLOR_THEME_PRIMARY1, align = CENTER })
+    panel:label({ x = w - 14 - math.floor(w * 0.30), y = byl, w = math.floor(w * 0.30), h = row_th + 2,
+        text = function() return "Reserve " .. (wgt.options.Reserve or 20) .. " %" end,
+        font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+end
+
+--- Build the status/config view (ViewMode = "Status info", passive instance).
+--- Shows the ACTIVE configuration of the Dashboard instance — read exclusively from
+--- the Shared snapshot it publishes (resolved cell thresholds incl. the MSP-fetched
+--- FC values, alert thresholds, alert switches). Look (palette, background) follows
+--- the Dashboard too. Requires a running Dashboard (notice page otherwise).
+--- as_page: opened from the Dashboard's own menu — rendered as an lvgl.page with
+--- back-to-menu instead of the passive full-zone panel (no alive-gate needed: the
+--- dashboard instance publishes itself).
+local function build_status_view(wgt, zone, as_page)
+    if not as_page and not ultidash_functions.shared_alive() then
+        return build_missing_dashboard_view(wgt, zone, "UltiDash config")
+    end
+    local w = zone.w
+    local h = zone.h
+    local shared = ultidash_functions.get_shared()
+    local th, al = shared.thresholds, shared.alerts
+
+    local function num(v, fmt) if v == nil then return "-" end return string.format(fmt, v) end
+
+    local rows = {
+        { lbl = "Model / link", val = function()
+            if not shared.ready then return "-" end
+            local name = shared.model_name or "-"
+            return name .. (shared.connected and "  (connected)" or "  (disconnected)")
+        end },
+        { lbl = "Cell source", val = function() return th.source or "-" end },
+        { lbl = "Cell full / low / crit", val = function()
+            if th.cell_full == nil then return "-" end
+            return string.format("%.2f / %.2f / %.2f V", th.cell_full or 0, th.cell_warn or 0, th.cell_crit or 0)
+        end },
+        { lbl = "Reserve / callout", val = function()
+            if not shared.ready then return "-" end
+            return num(th.reserve, "%d %%") .. "  /  " .. num(th.callout_int, "%d s")
+        end },
+        { lbl = "RQly warn / crit", val = function()
+            if not shared.ready then return "-" end
+            return num(th.rq_warn, "%d %%") .. "  /  " .. num(th.rq_crit, "%d %%")
+        end },
+        { lbl = "RSSI warn / crit / hold", val = function()
+            if not shared.ready then return "-" end
+            return num(th.rss_warn, "%d %%") .. " / " .. num(th.rss_crit, "%d %%") .. " / " .. num(th.rss_hold, "%d s")
+        end },
+        { lbl = "Power warn / Skp limit", val = function()
+            if not shared.ready then return "-" end
+            return num(th.pwr_warn_v, "%.1f V") .. "  /  " .. num(th.skp_limit, "%d")
+        end },
+        { lbl = "Mute / haptic", val = function()
+            if not shared.ready then return "-" end
+            return (al.mute and "ALL MUTED" or "none") .. "  /  " .. (al.haptic and "on" or "off")
+        end },
+        { lbl = "Sounds off", val = function()
+            if not shared.ready then return "-" end
+            local off = {}
+            if al.cellchk == false then off[#off + 1] = "CellChk" end
+            if al.fuel    == false then off[#off + 1] = "Fuel" end
+            if al.volt    == false then off[#off + 1] = "Volt" end
+            if al.arm     == false then off[#off + 1] = "Arm" end
+            if al.telem   == false then off[#off + 1] = "Telem" end
+            if al.link    == false then off[#off + 1] = "Link" end
+            if al.rssi    == false then off[#off + 1] = "Rssi" end
+            if al.pwr     == false then off[#off + 1] = "Pwr" end
+            if al.skp     == false then off[#off + 1] = "Skp" end
+            if #off == 0 then return "none (all enabled)" end
+            return table.concat(off, ", ")
+        end },
+    }
+
+    if as_page then
+        local pg = lvgl.page({
+            title = "UltiDash",
+            subtitle = "Status",
+            back = function()
+                wgt.menu_view = "menu"
+                init_view_state(wgt).dirty = true
+            end,
+        })
+        local row_h = 28
+        local lblw = math.floor(w * 0.48)
+        for i = 1, #rows do
+            local ry = (i - 1) * row_h + 4
+            pg:label({ x = 10, y = ry, w = lblw, h = 24, text = rows[i].lbl, color = COLOR_THEME_SECONDARY1, align = LEFT })
+            pg:label({ x = 10 + lblw, y = ry, w = w - lblw - 34, h = 24, text = rows[i].val, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+        end
+        -- dev metrics (same line as on the tap-the-status-line event-log page)
+        pg:label({ x = 10, y = #rows * row_h + 10, w = w - 34, h = 20,
+            text = function()
+                return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB     UI " .. (wgt.dbg_hz or "-")
+                    .. " Hz     pass " .. ((wgt.dbg_pass_cs or 0) * 10) .. " ms"
+            end,
+            font = SMLSIZE, color = lcd.RGB(0x90, 0x90, 0x90), align = LEFT })
+        return
+    end
+
+    local big = h >= 170
+    local title_font = big and MIDSIZE or 0
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (shared.bg_filled == true) })
+
+    local top = big and 30 or 22
+    local foot = big and 22 or 16
+    panel:label({ x = 10, y = 4, text = "UltiDash config", font = title_font, color = COLOR_THEME_PRIMARY1 })
+    panel:hline({ y = top - 2, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+
+    local row_h = math.floor((h - top - foot) / #rows)
+    local row_font = select_font(row_h - 1, nil, nil)
+    local lbl_w = math.floor(w * 0.48)
+
+    for i = 1, #rows do
+        local ry = top + (i - 1) * row_h
+        panel:label({ x = 10, y = ry, w = lbl_w, h = row_h, text = rows[i].lbl, font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
+        panel:label({ x = 10 + lbl_w, y = ry, w = w - lbl_w - 14, h = row_h, text = rows[i].val, font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+    end
+
+    panel:label({ x = 10, y = h - foot + 2, w = w - 14, h = foot - 2,
+        text = "live from the Dashboard instance", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = LEFT })
+end
+
+-- ============================================================================
+-- IN-WIDGET SETTINGS PAGE (fullscreen only)
+-- ============================================================================
+-- The EdgeTX widget-options list is flat and survives updates badly (index
+-- shifts); these settings are edited here instead and persisted per model via
+-- ultidashSettings (which overlays them onto wgt.options). First group: alerts.
+
+local function fmt_centivolt(v) return string.format("%.2f V", v / 100) end
+local function fmt_decivolt(v) return string.format("%.1f V", v / 10) end
+
+local SETTINGS_DISPLAY = {
+    { key = "TopLeft",       lbl = "Top-left shows",        kind = "choice", def = 1, vals = { "Model image", "Timer" } },
+    { key = "ClockMode",     lbl = "Top bar clock",         kind = "choice", def = 1, vals = { "Date + time", "Time only" } },
+    { key = "Timer",         lbl = "Timer (for top-left)",  kind = "num", def = 0, min = 0, max = 2, step = 1, big = 1,
+                             fmt = function(v) return "Timer " .. (v + 1) end },
+    { key = "ColorScheme",   lbl = "Color scheme",          kind = "choice", def = 1, vals = { "UltiDash", "EdgeTX theme" } },
+    { key = "BGFilled",      lbl = "Fill background",       kind = "bool", def = 0 },
+    { key = "StatsViewMode", lbl = "Stats page",            kind = "choice", def = 2, vals = { "Never", "On disarmed", "On disconnected" } },
+    { key = "VoltageDisplay",lbl = "Voltage shown as",      kind = "choice", def = 1, vals = { "Cell voltage", "Battery voltage" } },
+    { key = "ShowRQly",      lbl = "Top bar: RQ bar",       kind = "bool", def = 1 },
+    { key = "ShowTQly",      lbl = "Top bar: TQ bar",       kind = "bool", def = 1 },
+    { key = "ShowRSSI",      lbl = "Top bar: RSSI bars",    kind = "bool", def = 1 },
+    { key = "ShowTxV",       lbl = "Top bar: TX voltage",   kind = "bool", def = 1 },
+    { key = "ShowTPWR",      lbl = "Bottom bar: TPWR",      kind = "bool", def = 1 },
+    { key = "ArmClose",      lbl = "Close detail pages on arm", kind = "bool", def = 0 },
+    { key = "TapDetails",    lbl = "Tap zones for detail pages", kind = "bool", def = 1 },
+    { key = "BarsQuiet",     lbl = "Quiet link bars (color only on warn)", kind = "bool", def = 0 },
+    { key = "CfgPerCraft",   lbl = "Config file per craft", kind = "bool", def = 0 },
+}
+
+local SETTINGS_BATTERY = {
+    { key = "Reserve",      lbl = "Reserve (%)",            kind = "num", def = 20,  min = 0,   max = 40,  step = 1, big = 5 },
+    { key = "CellSource",   lbl = "Cell thresholds from",   kind = "choice", def = 1, vals = { "FC config", "Manual" } },
+    { key = "CellFull",     lbl = "Full cell (manual)",     kind = "num", def = 412, min = 300, max = 480, step = 1, big = 10, fmt = fmt_centivolt },
+    { key = "CellLow",      lbl = "Low cell (manual)",      kind = "num", def = 345, min = 300, max = 440, step = 1, big = 10, fmt = fmt_centivolt },
+    { key = "CellCritical", lbl = "Critical cell (manual)", kind = "num", def = 330, min = 300, max = 440, step = 1, big = 10, fmt = fmt_centivolt },
+    { key = "StartupDelay", lbl = "Cell-check delay (s)",   kind = "num", def = 4,   min = 1,   max = 20,  step = 1, big = 5 },
+}
+
+local SETTINGS_THRESHOLDS = {
+    { key = "CalloutInt", lbl = "Callout interval (s)",   kind = "num", def = 6,  min = 1,  max = 60,   step = 1,  big = 5 },
+    { key = "RQlyWarn",   lbl = "Link warn (%)",          kind = "num", def = 80, min = 0,  max = 100,  step = 1,  big = 5 },
+    { key = "RQlyCrit",   lbl = "Link critical (%)",      kind = "num", def = 50, min = 0,  max = 100,  step = 1,  big = 5 },
+    { key = "RssWarn",    lbl = "RSSI warn (% headroom)", kind = "num", def = 15, min = 0,  max = 100,  step = 1,  big = 5 },
+    { key = "RssCrit",    lbl = "RSSI critical (%)",      kind = "num", def = 8,  min = 0,  max = 100,  step = 1,  big = 5 },
+    { key = "RssHold",    lbl = "RSSI hold time (s)",     kind = "num", def = 2,  min = 1,  max = 10,   step = 1,  big = 2 },
+    { key = "PwrWarnV",   lbl = "Power warn voltage",     kind = "num", def = 90, min = 30, max = 500,  step = 5,  big = 20, fmt = fmt_decivolt },
+    { key = "SkpLimit",   lbl = "Skipped-packet limit",   kind = "num", def = 50, min = 10, max = 2000, step = 10, big = 100 },
+    { key = "TxPwrMax",   lbl = "TPWR bar max (mW)",      kind = "num", def = 0, min = 0, max = 1000, step = 10, big = 50,
+                          fmt = function(v) return v == 0 and "not set" or (v .. " mW") end },
+}
+
+local SETTINGS_ALERTS = {
+    { key = "Volume",     lbl = "Callout volume",            kind = "num", def = 0, min = 0, max = 5, step = 1, big = 1,
+                          fmt = function(v)
+                              if v == 0 then return "System" end
+                              if v == 1 then return "1 (min)" end
+                              if v == 5 then return "5 (max)" end
+                              return tostring(v) .. " / 5"
+                          end },
+    { key = "VolWhen",    lbl = "Widget volume applies",     kind = "choice", def = 1, vals = { "Always", "Only connected" } },
+    { key = "Mute",       lbl = "Mute (master)",             kind = "choice", def = 1, vals = { "None", "All" } },
+    { key = "Haptic",     lbl = "Vibrate on critical",       kind = "bool", def = 1 },
+    { key = "SndCellChk", lbl = "Sound: startup cell-check", kind = "bool", def = 1 },
+    { key = "SndFuel",    lbl = "Sound: fuel callouts",      kind = "bool", def = 1 },
+    { key = "SndVolt",    lbl = "Sound: voltage alerts",     kind = "bool", def = 1 },
+    { key = "SndArm",     lbl = "Sound: armed / disarm",     kind = "bool", def = 1 },
+    { key = "SndTelem",   lbl = "Sound: telemetry lost/ok",  kind = "bool", def = 1 },
+    { key = "SndLink",    lbl = "Sound: link quality",       kind = "bool", def = 1 },
+    { key = "SndRssi",    lbl = "Sound: RSSI / signal",      kind = "bool", def = 1 },
+    { key = "PwrWarn",    lbl = "Sound: main power lost",    kind = "bool", def = 1 },
+    { key = "SkpWarn",    lbl = "Sound: skipped packets",    kind = "bool", def = 0 },
+}
+
+-- Switch voice announcements: pick the physical TX switch per function; "inv"
+-- entries flip the position order (e.g. a governor mixed with weight -100).
+-- READ-ONLY — the model's mixer/arming logic is untouched.
+local SWITCH_CHOICES = { "Off",
+    "SA", "SA inv", "SB", "SB inv", "SC", "SC inv", "SD", "SD inv",
+    "SE", "SE inv", "SF", "SF inv", "SG", "SG inv", "SH", "SH inv" }
+
+local SETTINGS_SWITCHES = {
+    { key = "MotorSw",   lbl = "Motor on/off switch",  kind = "switch", def = 1 },
+    { key = "RescueSw",  lbl = "Rescue switch",        kind = "switch", def = 1 },
+    { key = "GovSw",     lbl = "Governor mode switch", kind = "switch", def = 1 },
+    { key = "ProfileSw", lbl = "Profile switch (1-3)", kind = "switch", def = 1 },
+}
+
+-- Dynamic switch list, read from EdgeTX: physical SA..SH (stable codes 2..17,
+-- identical to the static era so stored selections survive) plus every DEFINED
+-- logical switch (codes 100 + 2*ls_index, +1 = inverted). Selections are stored
+-- as CODES, not list positions, so adding/removing logical switches in the model
+-- never silently re-targets a saved selection.
+local function build_switch_list()
+    local labels = {}
+    local codes = {}
+    for i = 1, #SWITCH_CHOICES do
+        labels[#labels + 1] = SWITCH_CHOICES[i]
+        codes[#codes + 1] = i
+    end
+    for i = 0, 63 do
+        local ok, ls = pcall(model.getLogicalSwitch, i)
+        if ok and ls ~= nil and ls.func ~= nil and ls.func ~= 0 then
+            labels[#labels + 1] = "L" .. (i + 1)
+            codes[#codes + 1] = 100 + i * 2
+            labels[#labels + 1] = "L" .. (i + 1) .. " inv"
+            codes[#codes + 1] = 101 + i * 2
+        end
+    end
+    return labels, codes
+end
+
+local SETTINGS_GROUPS = {
+    { name = "Display",      items = SETTINGS_DISPLAY },
+    { name = "Battery",      items = SETTINGS_BATTERY },
+    { name = "Thresholds",   items = SETTINGS_THRESHOLDS },
+    { name = "Alerts",       items = SETTINGS_ALERTS },
+    { name = "Switch voice", items = SETTINGS_SWITCHES },
+}
+
+-- defaults derived from the group tables (single source of truth now that the
+-- EdgeTX option list no longer carries these values) — handed to the settings
+-- layer so apply() can fill anything missing from the file
+local SETTINGS_DEFAULTS = {}
+for g = 1, #SETTINGS_GROUPS do
+    local items = SETTINGS_GROUPS[g].items
+    for i = 1, #items do
+        SETTINGS_DEFAULTS[items[i].key] = items[i].def
+    end
+end
+-- hidden key (no settings row): tracks whether the in-widget menu was opened at
+-- least once — drives the first-placement hint banner on the dashboard
+SETTINGS_DEFAULTS.SetupSeen = 0
+ultidash_settings.set_defaults(SETTINGS_DEFAULTS)
+
+--- Persist pending settings edits (if any) and resolve them into the options.
+--- AUTOSAVE policy: edits are saved no matter HOW the page is left (back arrow,
+--- RTN, arming, fullscreen exit) — losing changes on exit confused more than a
+--- discard path ever helped.
+local function save_pending_settings(wgt)
+    if not wgt.settings_working then return end
+    if not ultidash_settings.save(wgt.settings_working) then
+        ultidash_functions.log("settings save FAILED (cfg file not writable)")
+    end
+    ultidash_settings.apply(wgt)
+    wgt.settings_working = nil
+end
+
+--- Close the settings page back to the menu (autosaves).
+local function close_settings(wgt)
+    save_pending_settings(wgt)
+    wgt.menu_view = "menu"
+    init_view_state(wgt).dirty = true
+end
+
+--- Build the settings page (lvgl.page scrolls; its back arrow catches RTN, the
+--- unfocused-RTN case is handled in refresh). One page per group, navigated with
+--- the page's prev/next arrows. Rows = name label + REACTIVE value label + plain
+--- buttons (no toggle/slider — documented one-time-script-only): bools/choices
+--- cycle with [>], numbers use [-]/[+] (long press = big step). Presses only
+--- mutate the working copy — the reactive labels update by themselves, so the
+--- page is never rebuilt while editing and the scroll position survives.
+--- Back/RTN = save ALL groups to the per-model file; arming/fullscreen-exit discard.
+local function build_settings_view(wgt, zone)
+    if not wgt.settings_working then
+        local t = {}
+        for g = 1, #SETTINGS_GROUPS do
+            local items = SETTINGS_GROUPS[g].items
+            for i = 1, #items do
+                t[items[i].key] = wgt.options[items[i].key]
+            end
+        end
+        wgt.settings_working = t
+    end
+    local working = wgt.settings_working
+
+    wgt.settings_group = wgt.settings_group or 1
+    local gi = wgt.settings_group
+    local grp = SETTINGS_GROUPS[gi]
+
+    local function switch_group(delta)
+        wgt.settings_group = ((wgt.settings_group - 1 + delta) % #SETTINGS_GROUPS) + 1
+        init_view_state(wgt).dirty = true   -- rebuild with the new group (edits persist in working)
+    end
+
+    local pg = lvgl.page({
+        title = "UltiDash settings",
+        subtitle = grp.name .. "  (" .. gi .. "/" .. #SETTINGS_GROUPS .. ")",
+        back = function() close_settings(wgt) end,
+        prevButton = { press = function() switch_group(-1) end },
+        nextButton = { press = function() switch_group(1) end },
+    })
+
+    local w = zone.w
+    local sw_labels, sw_codes = build_switch_list()
+    -- row height adapts to the screen: EdgeTX toggle switches are ~40 px tall on
+    -- the 800x480 TX16S and overlapped each other in 38 px rows
+    local row_h = (zone.h >= 300) and 50 or 38
+    local lbl_dy = math.floor((row_h - 24) / 2)
+    local btn_w = 40
+    local val_w = 120
+    local right = w - 20            -- keep clear of the scrollbar
+    local elems = {}
+
+    for i = 1, #grp.items do
+        local it = grp.items[i]
+        local ry = (i - 1) * row_h + 2
+        local is_num = it.kind == "num"
+
+        -- value text resolver (reactive)
+        local function value_text()
+            local v = working[it.key]
+            if it.kind == "bool" then return (v == 1) and "On" or "Off" end
+            if it.kind == "choice" then return it.vals[v or 1] or "?" end
+            if it.kind == "switch" then
+                for ci = 1, #sw_codes do
+                    if sw_codes[ci] == (v or 1) then return sw_labels[ci] end
+                end
+                return "?"
+            end
+            v = v or it.min or 0
+            if it.fmt then return it.fmt(v) end
+            return tostring(v)
+        end
+
+        if is_num then
+            -- [-] [reactive value] [+]
+            local btn_x2 = right - btn_w
+            local btn_x1 = btn_x2 - val_w - btn_w - 8
+            local val_x  = btn_x1 + btn_w + 4
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = val_x - 14, h = 22,
+                                  text = it.lbl, color = COLOR_THEME_PRIMARY1 }
+            elems[#elems + 1] = { type = "label", x = val_x, y = ry + lbl_dy, w = val_w, h = 22,
+                                  text = value_text, color = COLOR_THEME_PRIMARY1, align = CENTER }
+            local function adjust(delta)
+                local v = (working[it.key] or it.min or 0) + delta
+                if v < it.min then v = it.min elseif v > it.max then v = it.max end
+                working[it.key] = v
+            end
+            elems[#elems + 1] = { type = "button", x = btn_x1, y = ry, w = btn_w, h = row_h - 6, text = "-",
+                                  press = function() adjust(-it.step) end,
+                                  longpress = function() adjust(-(it.big or it.step)) end }
+            elems[#elems + 1] = { type = "button", x = btn_x2, y = ry, w = btn_w, h = row_h - 6, text = "+",
+                                  press = function() adjust(it.step) end,
+                                  longpress = function() adjust(it.big or it.step) end }
+        elseif it.kind == "bool" then
+            -- real toggle switch (works in fullscreen widgets despite the docs'
+            -- one-time-only note — verified in the 2.12 source: no script-type
+            -- guard); pcall'd with the old cycle-button as fallback
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - 110, h = 22,
+                                  text = it.lbl, color = COLOR_THEME_PRIMARY1 }
+            local okt = pcall(function()
+                pg:toggle({ x = right - 90, y = ry + 4,
+                    get = function() return working[it.key] == 1 end,
+                    set = function(v) working[it.key] = (v == 1 or v == true) and 1 or 0 end })
+            end)
+            if not okt then
+                elems[#elems + 1] = { type = "button", x = right - 100, y = ry, w = 100, h = row_h - 6,
+                                      text = value_text,
+                                      press = function() working[it.key] = (working[it.key] == 1) and 0 or 1 end }
+            end
+        elseif it.kind == "switch" then
+            -- switch picker: dynamic list (physical + defined logical switches),
+            -- selection stored as a stable CODE (see build_switch_list)
+            local cyc_w = 120
+            local function cur_index()
+                local v = working[it.key] or 1
+                for ci = 1, #sw_codes do
+                    if sw_codes[ci] == v then return ci end
+                end
+                return 1
+            end
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
+                                  text = it.lbl, color = COLOR_THEME_PRIMARY1 }
+            local oks = pcall(function()
+                pg:choice({ x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                    title = it.lbl, values = sw_labels,
+                    get = cur_index,
+                    set = function(ci) working[it.key] = sw_codes[ci] or 1 end })
+            end)
+            if not oks then
+                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                                      text = value_text,
+                                      press = function()
+                                          local ci = cur_index() % #sw_codes + 1
+                                          working[it.key] = sw_codes[ci]
+                                      end }
+            end
+        else
+            -- real dropdown (lvgl.choice popup picker, 1-based indices like our
+            -- CHOICE values); width follows the longest value text
+            local cyc_w = 100
+            for vi = 1, #it.vals do
+                local tw = lcd.sizeText(it.vals[vi], 0)
+                if tw + 40 > cyc_w then cyc_w = tw + 40 end
+            end
+            local cap = math.floor(w * 0.45)
+            if cyc_w > cap then cyc_w = cap end
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
+                                  text = it.lbl, color = COLOR_THEME_PRIMARY1 }
+            local okc = pcall(function()
+                pg:choice({ x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                    title = it.lbl, values = it.vals,
+                    get = function() return working[it.key] or 1 end,
+                    set = function(i) working[it.key] = i end })
+            end)
+            if not okc then
+                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                                      text = value_text,
+                                      press = function() working[it.key] = ((working[it.key] or 1) % #it.vals) + 1 end }
+            end
+        end
+    end
+    pg:build(elems)
+end
+
+--- Entry menu shown when tapping the fullscreen menu glyph — a general hub in
+--- front of the settings (room for more entries later). Back/RTN = dashboard.
+local function build_menu_view(wgt, zone)
+    local pg = lvgl.page({
+        title = "UltiDash",
+        subtitle = "Menu",
+        back = function()
+            wgt.menu_view = nil
+            init_view_state(wgt).dirty = true
+        end,
+    })
+    local w = zone.w
+
+    local function open(view)
+        return function()
+            wgt.menu_view = view
+            init_view_state(wgt).dirty = true
+        end
+    end
+
+    local function reset_defaults()
+        local function do_reset()
+            if not ultidash_settings.reset() then
+                ultidash_functions.log("settings reset FAILED (cfg file not writable)")
+            end
+            ultidash_settings.apply(wgt)
+            wgt.settings_working = nil
+            init_view_state(wgt).dirty = true
+        end
+        -- confirmation dialog when available; plain reset otherwise
+        local ok = pcall(function()
+            lvgl.confirm({ title = "Reset settings",
+                           message = "Reset ALL settings of this model to defaults?",
+                           confirm = do_reset })
+        end)
+        if not ok then do_reset() end
+    end
+
+    local entries = {
+        { txt = "Settings",                   act = open("settings") },
+        { txt = "Status",                     act = open("status") },
+        { txt = "Reset settings to defaults", act = reset_defaults },
+    }
+    local elems = {}
+    for i = 1, #entries do
+        elems[#elems + 1] = { type = "button", x = 20, y = (i - 1) * 50 + 8, w = w - 56, h = 42,
+                              text = entries[i].txt, press = entries[i].act }
+    end
+    pg:build(elems)
 end
 
 --- Build the flight dashboard layout for the current widget zone.
@@ -1348,6 +2368,8 @@ local function build_flight_ui(wgt, zone)
 
     build_flight_status_panel(main_panel, wgt, outer_pad, y_content, w_left, content_h)
     build_vertical_fuel_gauge_element(main_panel, wgt, x_fuel, y_content, w_fuel, content_h)
+    -- tapping the gauge (fullscreen) opens the battery detail page
+    wgt.battery_rect = { x = x_fuel, y = y_content, w = w_fuel, h = content_h }
     build_flight_values_panel(main_panel, wgt, x_right, y_content, w_right, content_h)
 
     main_panel:hline({ y = y_status - 1, w = w - 3, h = 1, color = COLOR_THEME_SECONDARY1 })
@@ -1357,6 +2379,33 @@ local function build_flight_ui(wgt, zone)
     wgt.status_bar_dims = { x = 0, y = 0, w = w - 4, h = status_box_h }
 
     build_status_bar_element(status_bar_box, wgt, 0, 0, w - 4, status_box_h)
+
+    -- first-placement hint: all options live in the fullscreen menu, which a new
+    -- user cannot know — a clear centered overlay window (built last = on top),
+    -- shown until the menu was opened once (SetupSeen, persisted). The box's
+    -- reactive `visible` hides all children with it.
+    -- IMPORTANT: drawn as plain build-table primitives on the panel, NOT an
+    -- lvgl.box — boxes built while fullscreen keep LV_OBJ_FLAG_CLICKABLE (the old
+    -- touch root cause) and a centered box swallowed every tap on the screen
+    -- middle (status line, stats dismiss) while the hint was visible.
+    local function hint_visible() return (wgt.options.SetupSeen or 0) ~= 1 end
+    local hint_w = math.floor(w * 0.74)
+    local hint_h = math.max(88, math.floor(h * 0.34))
+    local hx = math.floor((w - hint_w) / 2)
+    local hy = math.floor((h - hint_h) / 2)
+    local line_h = math.floor((hint_h - 12) / 4)
+    main_panel:build({
+        { type = "rectangle", x = hx, y = hy, w = hint_w, h = hint_h, filled = true, rounded = 6, color = PANEL_BG, visible = hint_visible },
+        { type = "rectangle", x = hx, y = hy, w = hint_w, h = hint_h, thickness = 2, rounded = 6, color = COLOR_THEME_WARNING, visible = hint_visible },
+        { type = "label", x = hx + 10, y = hy + 6, w = hint_w - 20, h = line_h,
+          text = "UltiDash setup", font = MIDSIZE, color = COLOR_THEME_PRIMARY1, align = CENTER, visible = hint_visible },
+        { type = "label", x = hx + 10, y = hy + 6 + line_h, w = hint_w - 20, h = line_h,
+          text = "All settings live in the widget menu:", color = COLOR_THEME_PRIMARY1, align = CENTER, visible = hint_visible },
+        { type = "label", x = hx + 10, y = hy + 6 + 2 * line_h, w = hint_w - 20, h = line_h,
+          text = "long-press > Full screen,", color = COLOR_THEME_PRIMARY1, align = CENTER, visible = hint_visible },
+        { type = "label", x = hx + 10, y = hy + 6 + 3 * line_h, w = hint_w - 20, h = line_h,
+          text = "then tap the menu symbol (top left)", color = COLOR_THEME_PRIMARY1, align = CENTER, visible = hint_visible },
+    })
 end
 
 --- Build the statistics dashboard layout for the current widget zone.
@@ -1377,7 +2426,10 @@ local function build_stats_ui(wgt, zone)
 
     local y_content = h_top + line_h
     local content_h = h - h_top - h_status - 3 * line_h
-    local h_info = math.max(header_h * 3 + 8, math.floor(content_h * 0.16))
+    -- slim single info line (was a 3-card band Flight Time / mAh Used / Batt
+    -- Profile: the profile is not useful here and the cards ate ~16% height;
+    -- the freed space hosts the per-profile headspeed rows in the table)
+    local h_info = header_h + 6
     local h_mid = content_h - h_info
 
     local y_info = y_content + h_mid + line_h
@@ -1397,79 +2449,13 @@ local function build_stats_ui(wgt, zone)
 
     main_panel:hline({ y = y_info - line_h, w = w - 3, h = line_h, color = COLOR_THEME_SECONDARY1 })
 
-    local info_card_h = h_info
-    local equal_item_w = math.floor(info_content_w / 3)
-    local equal_item_last_w = info_content_w - equal_item_w * 2
-    local weighted_item_w = math.floor(info_content_w * 0.28)
-    local weighted_item_mid_w = math.floor(info_content_w * 0.28)
-    local weighted_item_last_w = info_content_w - weighted_item_w - weighted_item_mid_w
-
-    local equal_shared_font = get_shared_info_font(info_card_h, equal_item_w, equal_item_w, equal_item_last_w)
-    local weighted_shared_font = get_shared_info_font(info_card_h, weighted_item_w, weighted_item_mid_w,
-        weighted_item_last_w)
-
-    local shared_info_font = weighted_shared_font
-    local info_item_w = weighted_item_w
-    local info_item_mid_w = weighted_item_mid_w
-    local info_item_last_w = weighted_item_last_w
-    if measure_font(equal_shared_font) >= measure_font(weighted_shared_font) then
-        shared_info_font = equal_shared_font
-        info_item_w = equal_item_w
-        info_item_mid_w = equal_item_w
-        info_item_last_w = equal_item_last_w
-    end
-    local info_value_font_h = measure_font(shared_info_font)
-    local info_value_y = card_padding + header_h +
-    math.floor((info_card_h - header_h - 2 * card_padding - info_value_font_h) / 2)
-
-    local info_cards = {
-        {
-            x = 0,
-            w = info_item_w,
-            title = wgt.values.label_flight_time,
-            value = wgt.values.flight_time_str_formatted,
-            color = wgt.values.flight_time_color
-        }, {
-        x = info_item_w,
-        w = info_item_mid_w,
-        title = wgt.values.label_capacity_used_short,
-        value = wgt.values.battery_usage_summary_formatted,
-        color = COLOR_THEME_PRIMARY1
-    }, {
-        x = info_item_w + info_item_mid_w,
-        w = info_item_last_w,
-        title = wgt.values.label_battery_profile,
-        value = wgt.values.rf_battery_profile_display_formatted,
-        color = COLOR_THEME_PRIMARY1
-    }
-    }
-
-    for i = 1, #info_cards do
-        local card = info_cards[i]
-        build_card_element(main_panel, card.x, y_info, card.w, info_card_h, {
-            {
-                type = "label",
-                x = card_padding,
-                y = card_padding - 1,
-                w = card.w - 2 * card_padding,
-                h = header_h,
-                text = card.title,
-                font = header_font,
-                color = COLOR_THEME_SECONDARY1,
-                align = CENTER
-            }, {
-            type = "label",
-            x = card_padding,
-            y = info_value_y,
-            w = card.w - 2 * card_padding,
-            h = info_value_font_h,
-            text = card.value,
-            font = shared_info_font,
-            color = card.color,
-            align = CENTER
-        }
-        })
-    end
+    -- one slim line: session flight time + used mAh (raw %)
+    main_panel:label({ x = 0, y = y_info + 3, w = info_content_w, h = header_h,
+        text = function()
+            return wgt.values.label_flight_time .. "  " .. wgt.values.flight_time_str_formatted()
+                .. "        " .. wgt.values.label_capacity_used_short .. "  " .. wgt.values.battery_usage_summary_formatted()
+        end,
+        font = header_font, color = COLOR_THEME_PRIMARY1, align = CENTER })
 
     main_panel:hline({ y = y_status - line_h, w = w - 3, h = line_h, color = COLOR_THEME_SECONDARY1 })
 
@@ -1485,40 +2471,111 @@ local function update(wgt, options)
     if (wgt == nil) then return end
     prepare_widget(wgt)
     wgt.options = options
+    -- overlay the per-model settings file onto the EdgeTX options (file wins for
+    -- saved keys; no file = pure EdgeTX behavior). ViewMode is never overridden.
+    ultidash_settings.apply(wgt)
+    -- One-time migration: when no per-model file exists yet, snapshot the current
+    -- effective option values into it. Only the Dashboard placement does this (its
+    -- options carry the user's tuning; passive instances may sit at defaults).
+    -- Prerequisite for eventually shrinking the EdgeTX option list to ViewMode.
+    if is_publisher(wgt) and ultidash_settings.load() == nil then
+        local snap = {}
+        for g = 1, #SETTINGS_GROUPS do
+            local items = SETTINGS_GROUPS[g].items
+            for i = 1, #items do
+                local k = items[i].key
+                if type(wgt.options[k]) == "number" then snap[k] = wgt.options[k] end
+            end
+        end
+        ultidash_settings.save(snap)
+    end
 
-    -- apply the chosen color palette to all modules before (re)building the UI
-    local use_clean = (options.ColorScheme or 1) == 1   -- 1 = Clean (default), 2 = EdgeTX theme
+    local mode = options.ViewMode or VIEW_MODE_DASHBOARD
+
+    -- apply the chosen color palette to all modules before (re)building the UI.
+    -- Passive views inherit the DASHBOARD's published scheme ("the main widget is
+    -- the boss"); their own ColorScheme option only matters while no Dashboard runs.
+    local scheme = options.ColorScheme or 1   -- 1 = Clean (default), 2 = EdgeTX theme
+    if mode ~= VIEW_MODE_DASHBOARD and ultidash_functions.shared_alive() then
+        scheme = ultidash_functions.get_shared().color_scheme or scheme
+    end
+    local use_clean = scheme == 1
     set_palette(use_clean)
     ultidash_functions.set_palette(use_clean)
     ultidash_values.set_palette(use_clean)
 
     lvgl.clear()
+    -- everything lvgl is gone now — drop the cached element references so nothing
+    -- (e.g. update_status_bar_visibility) touches a cleared object ("Invalid object"
+    -- error). The flight/stats builders repopulate them; the other views have none.
+    wgt.status_bar_elements = nil
+    wgt.status_bar_state = nil
+    wgt.status_bar_box = nil
+    -- tap-target rects: only the builders that exist in the new layout re-set them
+    wgt.estatus_rect = nil
+    wgt.elrs_bar_rect = nil
+    wgt.settings_icon_rect = nil
+    wgt.battery_rect = nil
 
-    if init_view_state(wgt).current == "flight" then
+    -- dispatch by ViewMode: Dashboard keeps the flight/stats switching; the passive
+    -- modes render their dedicated single view (no stats page, no status bar).
+    if mode == VIEW_MODE_ELRS then
+        build_elrs_view(wgt, wgt.zone)
+    elseif mode == VIEW_MODE_STATUS then
+        build_status_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "settings" then
+        build_settings_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "status" then
+        build_status_view(wgt, wgt.zone, true)
+    elseif wgt.menu_view == "menu" then
+        -- in-widget menu hub (opened via the fullscreen menu glyph)
+        build_menu_view(wgt, wgt.zone)
+    elseif wgt.detail_view == "elrs" and init_view_state(wgt).current == "flight" then
+        -- Dashboard's own ELRS detail page (opened by tapping the top-bar bars)
+        build_elrs_view(wgt, wgt.zone, true)
+    elseif wgt.detail_view == "estatus" and init_view_state(wgt).current == "flight" then
+        -- status detail page (opened by tapping the ESC/arming status line)
+        build_estatus_view(wgt, wgt.zone)
+    elseif wgt.detail_view == "battery" and init_view_state(wgt).current == "flight" then
+        -- battery detail page (opened by tapping the center fuel gauge)
+        build_battery_view(wgt, wgt.zone)
+    elseif init_view_state(wgt).current == "flight" then
         build_flight_ui(wgt, wgt.zone)
     else
         build_stats_ui(wgt, wgt.zone)
     end
     init_view_state(wgt).dirty = false
     wgt.layout_dirty = false
-    -- Force status bar visibility update after UI rebuild
-    update_status_bar_visibility(wgt, true)
+    if mode == VIEW_MODE_DASHBOARD then
+        -- Force status bar visibility update after UI rebuild
+        update_status_bar_visibility(wgt, true)
+    else
+        -- remember what this build inherited from the Dashboard; refresh rebuilds
+        -- when it changes (publisher appears/disappears, palette change)
+        wgt.passive_style_sig = passive_style_sig()
+    end
     return wgt
 end
 
---- Create the widget instance and perform the initial layout build.
+--- Create a NEW widget instance (own table per placement) and build its layout.
 local function create(zone, options)
+    local wgt = ultidash_values.createWidget()
     wgt.zone = zone
     wgt.options = options
     return update(wgt, options)
 end
 
 --- Run background RF and telemetry work that should not rebuild the UI.
+--- Publisher only: passive instances (ELRS/Status) do no background work at all —
+--- no MSP, no audio, no stats, no rf2 registration.
 local function background(wgt)
     if not wgt then return end
     prepare_widget(wgt)
+    if not is_publisher(wgt) then return end
+    ensure_rf_service(wgt)
     rf_service.background(wgt, handle_telemetry_state_change)
     ultidash_functions.background_refresh(wgt)
+    ultidash_functions.publish_shared(wgt)
 end
 
 --- Hit-test a touch point against a rect (with a generous margin for fat fingers).
@@ -1533,8 +2590,179 @@ end
 local function refresh(wgt, event, touch_state)
     if not wgt then return end
     prepare_widget(wgt)
+    -- dev metrics (shown in the status detail footer): UI loop rate per second —
+    -- the most honest "load" indicator (scheduler starvation = rate drops) — plus
+    -- the Lua heap, sampled once per window
+    local mnow = getTime() or 0
+    wgt.dbg_calls = (wgt.dbg_calls or 0) + 1
+    if mnow - (wgt.dbg_win or 0) >= 100 then
+        wgt.dbg_hz = wgt.dbg_calls
+        wgt.dbg_calls = 0
+        wgt.dbg_win = mnow
+        local okgc, kb = pcall(collectgarbage, "count")
+        wgt.dbg_lua_kb = (okgc and type(kb) == "number") and math.floor(kb) or nil
+    end
+    -- Rebuild ONCE after leaving fullscreen. Root cause (EdgeTX 2.12 source): lvgl.box
+    -- containers keep LV_OBJ_FLAG_CLICKABLE when built while fullscreen (EdgeTX clears
+    -- the flag only for widget-mode NON-fullscreen builds), and EdgeTX rebuilds the
+    -- tree on fullscreen ENTER (updateWithoutRefresh) but NOT on exit — so the
+    -- leftover clickable boxes swallow taps/long-press and the widget menu stops
+    -- opening. Rebuilding outside fullscreen restores non-clickable boxes. We only
+    -- OBSERVE the state — EdgeTX fully owns the enter/exit lifecycle (lesson learned:
+    -- never intercept RTN / never call exitFullScreen here).
+    local fs = (lvgl.isFullScreen ~= nil) and lvgl.isFullScreen() == true
+    if wgt.was_fullscreen and not fs then
+        wgt.was_fullscreen = false
+        -- ELRS detail + menu/settings/status are fullscreen-only features (normal
+        -- mode gets no touch), so leaving fullscreen always returns to the dashboard.
+        -- Leaving with the settings page open DISCARDS unsaved edits (save = back/RTN).
+        wgt.detail_view = nil
+        save_pending_settings(wgt)
+        wgt.menu_view = nil
+        return update(wgt, wgt.options)
+    end
+    wgt.was_fullscreen = fs
+    -- Fullscreen ELRS-detail taps (touch only reaches refresh while fullscreen):
+    -- tap on the bar cluster opens the detail, any tap closes it again. Strictly the
+    -- discrete EVT_TOUCH_TAP, plus a TIME-based cooldown: one physical tap often
+    -- bounces into several TAP events (EdgeTX double-tap counting), which made the
+    -- detail flicker open-closed-open. The cooldown expires by itself, so unlike the
+    -- old state-based debounce it can never get stuck. No key/RTN interception —
+    -- EdgeTX owns the fullscreen lifecycle.
+    -- RTN navigates the menu pages even when NO control has focus: lvgl.page's
+    -- built-in back catches RTN only while one of its controls is focused; with
+    -- nothing focused the key arrives here as EVT_VIRTUAL_EXIT instead. Same
+    -- semantics as each page's back arrow.
+    -- RTN also closes the ELRS detail (alternative to tap-anywhere)
+    if fs and wgt.detail_view ~= nil and wgt.menu_view == nil
+        and EVT_VIRTUAL_EXIT ~= nil and event == EVT_VIRTUAL_EXIT then
+        wgt.detail_view = nil
+        init_view_state(wgt).dirty = true
+    end
+    if fs and wgt.menu_view ~= nil and EVT_VIRTUAL_EXIT ~= nil and event == EVT_VIRTUAL_EXIT then
+        if wgt.menu_view == "settings" then
+            close_settings(wgt)                   -- autosave, back to the menu
+        elseif wgt.menu_view == "status" then
+            wgt.menu_view = "menu"
+            init_view_state(wgt).dirty = true
+        else
+            wgt.menu_view = nil                   -- menu -> dashboard
+            init_view_state(wgt).dirty = true
+        end
+    end
+    if fs and is_publisher(wgt) and EVT_TOUCH_TAP ~= nil and event == EVT_TOUCH_TAP then
+        local now = getTime() or 0
+        -- Bounce protection, device-robust (the TX16S spreads bounce taps wider
+        -- than the TX15, which re-flickered the detail open-closed-open):
+        -- (a) multi-tap reports (tapCount > 1) are ignored outright;
+        -- (b) ASYMMETRIC cooldown — a long 1 s block right after OPENING the detail
+        --     (only "a tap instantly closes it again" causes the flicker; a
+        --     deliberate close naturally comes later). The SAME 1 s now applies to
+        --     close/dismiss actions too: the view changes under the finger, and a
+        --     late bounce tap would otherwise click through onto whatever tap zone
+        --     sits at the same spot in the NEW view (seen on hardware: stats
+        --     dismiss opened the status detail, closing that opened the battery).
+        -- No tap handling while a menu page is up — its lvgl page/buttons own the
+        -- touch (closing goes through the page's back arrow / RTN).
+        local tap_count = touch_state and touch_state.tapCount
+        if (tap_count == nil or tap_count <= 1)
+            and now >= (wgt.elrs_tap_block or 0) and wgt.menu_view == nil then
+            if wgt.detail_view ~= nil then
+                wgt.elrs_tap_block = now + 100
+                wgt.detail_view = nil
+                init_view_state(wgt).dirty = true
+            elseif rect_hit(touch_state, wgt.settings_icon_rect, 10)
+                and not ultidash_functions.is_armed(wgt) then
+                -- menu entry (menu glyph); disarmed only — no config in flight
+                wgt.elrs_tap_block = now + 100
+                wgt.menu_view = "menu"
+                -- acknowledge the first-placement hint banner (persisted)
+                if (wgt.options.SetupSeen or 0) ~= 1 then
+                    wgt.options.SetupSeen = 1
+                    ultidash_settings.save({ SetupSeen = 1 })
+                end
+                init_view_state(wgt).dirty = true
+            elseif init_view_state(wgt).current == "stats" then
+                -- manual dismiss of the statistics page: any tap (outside the menu
+                -- glyph) returns to the flight view; it reappears with the next
+                -- arm/disarm or reconnect cycle (flags cleared there)
+                wgt.elrs_tap_block = now + 100
+                wgt.stats_dismissed = true
+                init_view_state(wgt).dirty = true
+            elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.elrs_bar_rect, 10) then
+                wgt.elrs_tap_block = now + 100   -- long: any tap closes, see above
+                wgt.detail_view = "elrs"
+                init_view_state(wgt).dirty = true
+            elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.estatus_rect, 6) then
+                wgt.elrs_tap_block = now + 100
+                wgt.detail_view = "estatus"
+                init_view_state(wgt).dirty = true
+            elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.battery_rect, 6) then
+                wgt.elrs_tap_block = now + 100
+                wgt.detail_view = "battery"
+                init_view_state(wgt).dirty = true
+            end
+        end
+    end
+    if not is_publisher(wgt) then
+        -- passive view: sensor-only ELRS data (no MSP/audio/stats side effects);
+        -- the Status view renders reactively straight from Shared. Same 5 Hz
+        -- throttle as the publisher — no need to poll sensors every cycle.
+        local tnow = getTime() or 0
+        if (tnow - (wgt.telem_gate or 0)) >= 20 then
+            wgt.telem_gate = tnow
+            ultidash_functions.update_elrs(wgt)
+        end
+        -- follow the Dashboard: rebuild when the publisher appears/disappears or
+        -- changes its palette/background (notice page <-> live view, look change)
+        if wgt.passive_style_sig ~= passive_style_sig() then
+            return update(wgt, wgt.options)
+        end
+        return
+    end
+    ensure_rf_service(wgt)
     rf_service.background(wgt, handle_telemetry_state_change)
-    ultidash_functions.refresh(wgt)
+    -- THROTTLE the telemetry/alert/publish pass to 5 Hz: with a connected FC the
+    -- full update (~35 sensor-name lookups) on EVERY display cycle starved the Lua
+    -- scheduler enough that fullscreen taps became a lottery (RFTool works the CRSF
+    -- link in parallel). 5 Hz is plenty for the display and for the alerts (their
+    -- debounce windows are 0.5-3 s) — taps above are still handled every cycle.
+    -- While a menu page / the ELRS detail is up, the dashboard isn't visible at
+    -- all: skip the heavy pass entirely (status page reads Shared; the detail only
+    -- needs the cheap update_elrs) so page interaction stays snappy.
+    local tnow = getTime() or 0
+    if (tnow - (wgt.telem_gate or 0)) >= 20 then
+        wgt.telem_gate = tnow
+        -- FULL pass even while the detail/menu pages are up: all dashboard
+        -- functions (alerts, stats, callouts) keep running in the background —
+        -- the ELRS detail may now stay open in flight. The 5 Hz throttle keeps
+        -- the interaction snappy regardless.
+        local pass_t0 = getTime() or 0
+        ultidash_functions.refresh(wgt)
+        ultidash_functions.publish_shared(wgt)
+        wgt.dbg_pass_cs = (getTime() or 0) - pass_t0
+        -- cache the armed state for reactive closures (they run per LVGL frame;
+        -- calling is_armed there would be a sensor name-lookup at ~20 Hz)
+        wgt.armed_now = ultidash_functions.is_armed(wgt)
+        if wgt.armed_now then
+            -- arming starts a fresh stats episode (manual dismiss forgotten)
+            wgt.stats_dismissed = false
+            -- menu/settings/status always close on arm (no configuring in flight;
+            -- pending settings edits are autosaved)
+            if wgt.menu_view ~= nil then
+                save_pending_settings(wgt)
+                wgt.menu_view = nil
+                init_view_state(wgt).dirty = true
+            end
+            -- the ELRS detail only closes on arm when the option says so — with
+            -- it off the pilot can deliberately watch the link details in flight
+            -- (alerts keep running either way)
+            if wgt.detail_view ~= nil and wgt.options.ArmClose == 1 then
+                wgt.detail_view = nil
+                init_view_state(wgt).dirty = true
+            end
+        end
+    end
     sync_view_for_telemetry(wgt)
     if init_view_state(wgt).dirty == true then
         return update(wgt, wgt.options)

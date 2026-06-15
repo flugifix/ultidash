@@ -2,79 +2,91 @@
 
 All notable changes to UltiDash are documented here.
 
-## Unreleased
+## v0.2 — 2026-06-11
+
+A large feature release. **Experimental — still under testing in the field.**
 
 ### Added
-- **`CellSource`** option (FC config / Manual): cell-voltage thresholds default to the
-  Rotorflight FC (`mspBatteryConfig`) but can be overridden manually via the re-added
-  **`CellFull` / `CellLow` / `CellCritical`** options (centivolts).
-- Per-element bar toggles: **`ShowRQly`** / **`ShowTQly`** (top-bar RQ/TQ link quality),
-  **`ShowTxV`** (top-bar TX voltage) and **`ShowTPWR`** (bottom-bar TX power).
-- **Main-power-loss warning:** new event that speaks `pwr_backup` once when, while armed,
-  `Vbat` falls below a configurable threshold (likely running on backup power). New options
-  **`PwrWarn`** (on/off) and **`PwrWarnV`** (threshold in 0.1 V, default 9.0 V).
-- **Skipped-packet warning:** new event that speaks `skp_high` once when, while armed, the
-  cumulative `*Skp` counter reaches a configurable limit. New options **`SkpWarn`** (on/off,
-  default off) and **`SkpLimit`** (default 50).
-- Dedicated voice files for all events, shipped with the widget: `armed`, `disarm`,
-  `battry`, `batlow`, `batcrt`, `telem_lost`, `telem_ok`, `link_warn`, `link_crit`,
-  `rssi_warn`, `rssi_crit`, `pwr_backup`, `skp_high`.
-- **ELRS link bars in the top bar:** the center now shows up to four thin stacked bars —
-  `RQ`/`TQ` link quality and `1RSS`/`2RSS` signal headroom (rate-aware, derived from
-  `RFMD`/`1RSS`/`2RSS` via a per-rate sensitivity floor), color-by-zone with threshold
-  ticks (2RSS only with antenna diversity). New **`ShowRSSI`** toggle for the RSSI bars
-  (RQ/TQ keep `ShowRQly`/`ShowTQly`).
-- **RSSI / signal warning:** speaks `rssi_warn`/`rssi_crit` once per episode (armed only)
-  when the best-antenna RSSI headroom drops below **`RssWarn`/`RssCrit`** (% headroom),
-  with a configurable hold time **`RssHold`** (seconds, default 2) so brief antenna nulls
-  don't trigger. New **`SndRssi`** on/off.
+- **In-widget settings menu.** All configuration moved out of the EdgeTX widget-option
+  list (which now holds only `ViewMode`) into a full-screen menu: long-press → full
+  screen → tap the ☰ menu glyph (top-left, disarmed only). The menu offers **Settings**,
+  **Status** and **Reset settings to defaults** (with confirmation). The Settings page has
+  five groups (Display / Battery / Thresholds / Alerts / Switch voice) navigated with ‹ ›,
+  using real toggle switches, dropdowns and −/+ steppers (long-press = big step). Edits
+  **autosave** on exit.
+- **Per-model settings storage.** Settings persist on the SD card in
+  `/WIDGETS/UltiDash/cfg_m_<slot>.cfg`, keyed by the model **slot** so they survive
+  Rotorflight's "set model name on TX" renaming. Optional **per-craft** files
+  (*Config file per craft*). Legacy name-keyed files are adopted once.
+- **Tap-to-open detail pages** (full-screen):
+  - **ELRS link** (tap the top-bar bars): six labelled bars — RQ, TQ, 1RSS, 2RSS, **SNR**
+    and **TPWR** — with thresholds and values, rate/mode header, and a footer with SNR /
+    active antenna / session RQ-min. New **`TxPwrMax`** sets the TPWR bar's 100 % reference.
+  - **Status & events** (tap the ESC/status line): arm/governor/throttle summary, the live
+    status line, and a **timestamped ESC event log** (every status change, RESTART,
+    arm/disarm). A dev-metrics footer (Lua heap / UI loop Hz / pass ms).
+  - **Battery** (tap the gauge): a cell-voltage scale with the active crit/low/full
+    thresholds marked, plus the battery in the dashboard look with values inside it.
+- **`ViewMode` — second-screen views.** Place UltiDash again on another screen set to
+  **ELRS details** or **Status info**; these passive instances mirror the Dashboard
+  instance's data (and inherit its palette). They show a notice when no Dashboard runs.
+- **Switch voice announcements** (new *Switch voice* settings group): speak motor on/off,
+  rescue, governor and profile (1-3) from a configurable TX switch — **physical SA…SH (+
+  inverted) or any logical switch** defined in the model. Read-only; independent of the
+  model's mixer/arming logic. New voice files `motor_on/off`, `rescue_on/off`, `gov_on/off`,
+  `profile`.
+- **Callout volume override** (`Volume` 1–5 + *Widget volume applies*): play callouts at a
+  fixed level regardless of the radio setting; spoken numbers now honor the master mute.
+- **Per-PID-profile headspeed statistics**: min/max tracked per `PID#` profile, shown as
+  three fixed rows (P1–P3) so every profile stays visible after disconnect.
+- **First-run hint** overlay pointing to the full-screen settings menu (shown until the
+  menu is opened once; per model).
+- **Detail/stats touch controls**: *Tap zones for detail pages* (on/off), *Close detail
+  pages on arm*, manual stats dismiss by tap.
+- **Display options** `ClockMode` (date+time / time-only) and `BarsQuiet` (link bars stay
+  neutral until warn/crit).
+- *(from the prior ELRS round)* ELRS link bars (RQ/TQ/1RSS/2RSS) in the top bar; RSSI/signal
+  warning (`rssi_warn`/`rssi_crit`) with `RssWarn`/`RssCrit`/`RssHold`; main-power-loss
+  (`pwr_backup`, `PwrWarnV`) and skipped-packet (`skp_high`, `SkpLimit`) warnings; cell
+  thresholds from FC or manual.
 
 ### Changed
-- **Per-event alert switches:** every callout/announcement now has its own on/off —
-  `SndCellChk`, `SndFuel`, `SndVolt`, `SndArm`, `SndTelem`, `SndLink` (plus existing
-  `PwrWarn`/`SkpWarn`). Each switch disables that event's voice **and** its vibration.
-  **Replaces** the former `Mute` levels (fuel/voltage) and the combined `LinkWarn`
-  (telemetry + link). The options list is regrouped (display / battery / thresholds /
-  alerts). ⚠️ Re-place the widget / re-check options after updating.
-- **`Mute` is now a master kill-switch** (`None` / `All`): `All` silences every alert
-  (voice + vibration), overriding all per-event switches. `Haptic` remains the vibration master.
-- **Sound files moved to `/SOUNDS/en/ultidash/`** (own subfolder, `AUDIO_PATH`) so they no
-  longer clash with the EdgeTX voice pack. Install path changes accordingly.
-- **Telemetry-lost/recovered and low-link-quality now use spoken WAVs** instead of tones
-  (`telem_lost`/`telem_ok`/`link_warn`/`link_crit`).
-- **Low-link-quality is announced once per episode** (re-armed on recovery above the warn
-  threshold; a warn→critical escalation announces once more) instead of repeating on the
-  `CalloutInt` interval.
-- **Statistics page:** the first column is renamed **"Actual" → "Latest"** (current while
-  disarmed/connected, frozen at the last value after disconnect); **RQ/TQ are hidden** in
-  the stats top bar; the header keeps showing the **Rotorflight FC** model name after a
-  disconnect (cached) instead of falling back to the EdgeTX model name.
-- **Default alert thresholds tuned from real flight logs:** link quality `RQlyWarn`/
-  `RQlyCrit` 50/30 → **80/50** (RQly sits at ~100 % in clean flight, so a higher warn is
-  both earlier and false-alarm-free); RSSI `RssWarn`/`RssCrit` default **15/8** (% headroom).
-- **Top-bar date** now shows a 2-digit year to free space for the link bars.
+- **Configuration model:** the EdgeTX widget option list is reduced to a single `ViewMode`
+  choice; everything else is the in-widget menu (per-event sound switches, `Mute` master,
+  `Haptic`, thresholds, etc.).
+- **Statistics page restructured:** the three info cards (Flight Time / mAh Used / Batt
+  Profile) are replaced by one slim line; the battery-profile card is dropped; headspeed is
+  now three per-profile rows; "Actual" → "Latest".
+- **Top-bar link bars redesigned** to an outline look matching the battery icon, centered on
+  the bar midline, with an optional quiet mode.
+- **Default thresholds tuned from real logs:** link `RQlyWarn/Crit` 50/30 → **80/50**; RSSI
+  `RssWarn/Crit` default **15/8** (% headroom).
+- **All voice WAVs peak-normalized** to match the EdgeTX voice-pack loudness; sounds live in
+  `/SOUNDS/en/ultidash/`. Telemetry-lost/link/RSSI now use spoken WAVs, announced once per
+  episode.
 
 ### Fixed
-- **Statistics Min/Max no longer show spurious 0s** from connect/disconnect transients:
-  EdgeTX-sourced min/max are reset once the link is actually up and frozen while it's down,
-  and **ESC-temp Min** is now widget-tracked ignoring the 0 the ESC reports before its
-  temperature telemetry comes up (so it shows the real low instead of 0.0).
-- **No more "battery critical 0 V" on power loss:** the cell-voltage alert ignores
-  implausible (< 1 V) readings, and a `Vbat` that collapses to ~0 while the link is still
-  up is now reported as **main-power-loss** (`pwr_backup`), not a critical-voltage callout.
-- **Statistics min voltage no longer polluted by the buffer:** `Vbat`/`Vcel`/`Vbec`
-  min/max are widget-tracked **only while armed** (like the RPM extrema), so the
-  post-landing unplug decay (where the buffer bridges and the voltage falls 4.x → 0,
-  e.g. a stray 2.89 V) is no longer recorded as the minimum.
-- **Statistics page scoped per connection:** `ever_armed` now resets on each fresh connect,
-  so the stats page only appears after the craft was armed *this* connection (not because
-  an earlier connection in the same session was armed), and the dashboard returns to the
-  flight view on reconnect.
+- **Full-screen touch / widget-menu regression:** after a full-screen cycle the long-press
+  menu and taps stopped working — root-caused (EdgeTX keeps `lvgl.box` containers clickable
+  when built in full-screen and doesn't rebuild on exit) and fixed by rebuilding once on
+  exit. The model image can stay in full-screen.
+- **No "battery critical 0 V" on power loss**, and **stats Min/Latest no longer polluted by
+  the buffer decay** on unplug: voltages are armed-only, latched against ≤ 1 V readings;
+  the BEC value is held through a supply collapse; a collapsing `Vbat` is reported as
+  main-power-loss instead.
+- **Stats page scoped per connection** (`ever_armed` resets on connect) and **manually
+  dismissable**.
+- **Touch robustness:** uniform tap cooldown so a late bounce tap can't "click through" onto
+  the new view; multi-tap reports ignored.
+- **Performance:** bottom-bar getters (Skp/RQly/TQly/TPWR) and the armed state no longer do
+  per-frame sensor name lookups; the telemetry pass is throttled to 5 Hz.
+- **TX16S (800×480) layout:** adaptive settings row height for the taller toggle switches;
+  font-metric (not hardcoded) heights on the battery and event-log pages.
+- Earlier fixes: spurious stats 0s, ESC-temp Min ignoring the startup 0.
 
 ### Licensing
-- **UltiDash is now cleanly GPLv3.** The HeliDash base (gismo2004 / HeliWidget) is now
-  licensed **GPL-3.0 (or later)**, resolving the earlier blocker (the base was previously
-  unlicensed). `NOTICE.md`, the root `README.md` and the `main.lua` header are updated to
+- **UltiDash is cleanly GPLv3.** The HeliDash base (gismo2004 / HeliWidget) is licensed
+  **GPL-3.0 (or later)**; `LICENSE`, `NOTICE.md`, `README.md` and the `main.lua` header
   reflect that the combined work is distributable under GPLv3.
 
 ## v0.1 — 2026-05-30
@@ -96,8 +108,7 @@ First release. **Experimental — still under testing in the field.**
     flights & total flight time (Rotorflight MSP), capacity used.
   - Compact radio-battery icon style adapted from **BattAnalog**.
 - **Callouts**: fuel %, low/critical cell voltage, armed/disarm, and ELRS
-  link-quality / telemetry-lost warnings (armed only, configurable via `LinkWarn`,
-  `RQlyWarn`, `RQlyCrit`).
+  link-quality / telemetry-lost warnings.
 - Flight-time tracking made governor-independent (headspeed-based) and run in the
   background so it counts off-screen too.
 - `Skp` (skipped-telemetry-packet counter) shown in the bottom status bars.
@@ -105,5 +116,3 @@ First release. **Experimental — still under testing in the field.**
 ### Notes
 - MSP is only read on connect/disarm — never during armed flight.
 - No external libraries (no eLib); UltiDash loads only its own files.
-- Licensing: GPLv3 intended; the unlicensed HeliDash base must be clarified before a
-  formal public release — see [NOTICE.md](NOTICE.md).

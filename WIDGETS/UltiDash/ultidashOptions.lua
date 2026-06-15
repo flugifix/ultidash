@@ -1,86 +1,22 @@
+-- The EdgeTX widget-option list carries ONLY the per-instance ViewMode now.
+-- Everything else is configured via the in-widget settings page (fullscreen →
+-- menu glyph) and persisted per model in /WIDGETS/UltiDash/cfg_<model>.cfg —
+-- see ultidashSettings.lua. Defaults live in the settings-page group tables
+-- (SETTINGS_* in ultidash.lua); ultidash_settings.apply() resolves
+-- file > stored option > default on every update().
 local M = {
 
     options = {
-        -- display / layout
-        { "Timer",          TIMER,  0 },
-        { "BGFilled",       BOOL,   0 },
-        { "TopLeft",        CHOICE, 1,  { "Model image", "Timer" } },
-        { "ColorScheme",    CHOICE, 1,  { "UltiDash", "by EdgeTX Theme" } },
-        { "StatsViewMode",  CHOICE, 2,  { "Never", "On disarmed", "On disconnected" } },
-        { "VoltageDisplay", CHOICE, 1,  { "Cell voltage", "Battery voltage" } },
-        { "ShowRQly",       BOOL,   1 },
-        { "ShowTQly",       BOOL,   1 },
-        { "ShowRSSI",       BOOL,   1 },
-        { "ShowTPWR",       BOOL,   1 },
-        { "ShowTxV",        BOOL,   1 },
-        -- battery / fuel
-        { "Reserve",        VALUE,  20, 0, 40 },
-        { "CellSource",     CHOICE, 1,  { "FC config", "Manual" } },
-        { "CellFull",       VALUE,  412, 0, 480 },
-        { "CellLow",        VALUE,  345, 0, 440 },
-        { "CellCritical",   VALUE,  330, 0, 440 },
-        { "StartupDelay",   VALUE,  4,  1, 20 },
-        -- alert thresholds
-        { "CalloutInt",     VALUE,  6,  1, 60 },
-        { "RQlyWarn",       VALUE,  80, 0, 100 },
-        { "RQlyCrit",       VALUE,  50, 0, 100 },
-        { "RssWarn",        VALUE,  15, 0, 100 },
-        { "RssCrit",        VALUE,  8,  0, 100 },
-        { "RssHold",        VALUE,  2,  1, 10 },
-        { "PwrWarnV",       VALUE,  90, 30, 500 },
-        { "SkpLimit",       VALUE,  50, 1, 2000 },
-        -- alerts on/off (Mute = master kill-switch for all; each event individually below)
-        { "Mute",           CHOICE, 1,  { "None", "All" } },
-        { "Haptic",         BOOL,   1 },
-        { "SndCellChk",     BOOL,   1 },
-        { "SndFuel",        BOOL,   1 },
-        { "SndVolt",        BOOL,   1 },
-        { "SndArm",         BOOL,   1 },
-        { "SndTelem",       BOOL,   1 },
-        { "SndLink",        BOOL,   1 },
-        { "SndRssi",        BOOL,   1 },
-        { "PwrWarn",        BOOL,   1 },
-        { "SkpWarn",        BOOL,   0 },
+        -- Dashboard = full widget incl. all side effects (MSP/audio/stats = publisher).
+        -- ELRS details / Status info = passive extra views for a SECOND instance on
+        -- another screen (no MSP, no audio, no stats — they mirror the Dashboard
+        -- instance via the shared state). Place exactly ONE Dashboard instance.
+        { "ViewMode", CHOICE, 1, { "Dashboard", "ELRS details", "Status info" } },
     },
 
     translate = function(name)
         local translations = {
-            Timer = "Which timer to display",
-            BGFilled = "Fill background color",
-            TopLeft = "Top-left area shows",
-            ColorScheme = "Color scheme",
-            StatsViewMode = "When to show statistics page",
-            VoltageDisplay = "Voltage shown as",
-            ShowRQly = "Top bar: RQ bar",
-            ShowTQly = "Top bar: TQ bar",
-            ShowRSSI = "Top bar: RSSI bars (1/2RSS)",
-            ShowTPWR = "Bottom bar: show TPWR",
-            ShowTxV = "Top bar: TX voltage",
-            Reserve = "Reserve capacity (%)",
-            CellSource = "Cell thresholds from",
-            CellFull = "Full cell voltage (cv, manual)",
-            CellLow = "Low cell voltage (cv, manual)",
-            CellCritical = "Critical cell voltage (cv, manual)",
-            StartupDelay = "Startup cell-check delay (s)",
-            CalloutInt = "Callout interval (sec)",
-            RQlyWarn = "Link quality warn (%)",
-            RQlyCrit = "Link quality critical (%)",
-            RssWarn = "RSSI warn (% headroom)",
-            RssCrit = "RSSI critical (% headroom)",
-            RssHold = "RSSI warn hold time (s)",
-            PwrWarnV = "Power warn voltage (0.1V)",
-            SkpLimit = "Skipped-packet limit",
-            Mute = "Mute (master): None / All",
-            Haptic = "Vibrate on critical alerts",
-            SndCellChk = "Sound: startup cell-check",
-            SndFuel = "Sound: fuel callouts",
-            SndVolt = "Sound: voltage alerts",
-            SndArm = "Sound: armed/disarm",
-            SndTelem = "Sound: telemetry lost/ok",
-            SndLink = "Sound: low link quality",
-            SndRssi = "Sound: low RSSI (signal)",
-            PwrWarn = "Sound: main power lost",
-            SkpWarn = "Sound: skipped packets",
+            ViewMode = "This instance shows",
         }
         return translations[name]
     end

@@ -86,6 +86,15 @@ local ALERT_SAMPLE_CS     = 50  -- voltage must hold the level this long before 
 -- "battery critical 0 V" callout on power loss. Far below the real critical (~3.3 V),
 -- so it can never mask a genuine alert.
 local MIN_PLAUSIBLE_CELL_V = 1.0
+-- The collapse DECAY however passes through plausible-looking values (4.x -> 2.9 ->
+-- 1.4 -> 0) that the floor alone can't catch. Physical distinction: while DISARMED
+-- there is no load, so a real pack voltage never falls quickly — a fast drop while
+-- disarmed is always a supply collapse. Such a reading is only accepted after it
+-- stayed STABLE for VOLT_ACCEPT_CS (which a genuinely lower pack — e.g. swapped at
+-- a powered buffer — does, and a decay never does). While ARMED every plausible
+-- reading is accepted live: real load sag must show immediately.
+local VOLT_ACCEPT_CS = 300   -- stability window (centiseconds) for a suspicious drop
+local VOLT_DROP_CELL = 0.2   -- per-cell drop (V) considered suspicious while disarmed
 
 -- ============================================================================
 -- LOCAL HELPER FUNCTIONS
@@ -96,9 +105,122 @@ local MIN_PLAUSIBLE_CELL_V = 1.0
 -- point that can produce sound (refresh / background_refresh / state change).
 local master_muted = false
 
+-- Widget callout volume (the `Volume` setting, 1..5; 0/nil = follow the system
+-- volume). EdgeTX's playFile/playNumber accept a per-playback volume override, so
+-- every callout can play at this level regardless of the radio's volume setting.
+-- Refreshed alongside master_muted at every sound-capable entry point; honors the
+-- `VolWhen` setting ("Only connected": override only while telemetry is up).
+local audio_volume = nil
+
+-- ============================================================================
+-- SHARED STATE (cross-instance)
+-- ============================================================================
+-- Module-local table shared by ALL instances of this widget (the script chunk is
+-- loaded once; its upvalues are common to every instance). Discipline, unlike the
+-- looser master_muted above: ONLY the Dashboard-mode instance (the "publisher",
+-- ViewMode = Dashboard) writes here — via publish_shared in its refresh/background
+-- cycle. ELRS-details / Status-info instances are read-only subscribers, so a
+-- passive view on a second screen can show the dashboard's REAL active config
+-- (incl. the MSP-fetched FC thresholds) without doing MSP or audio itself.
+-- Tables are mutated in place (no per-cycle allocations).
+local Shared = {
+    ready      = false,   -- true once a Dashboard instance has published
+    ts         = nil,     -- getTime() of the last publish (staleness detection)
+    model_name = nil,     -- FC craft name (cached by the publisher)
+    connected  = false,
+    -- style: passive views follow the Dashboard's look (the main widget is the boss)
+    color_scheme = nil,   -- ColorScheme option value of the Dashboard instance
+    bg_filled    = nil,   -- BGFilled as boolean
+    thresholds = {
+        source = nil,                                  -- "FC config" / "Manual"
+        cell_full = nil, cell_warn = nil, cell_crit = nil,  -- volts (resolved)
+        reserve = nil, callout_int = nil,
+        rq_warn = nil, rq_crit = nil,
+        rss_warn = nil, rss_crit = nil, rss_hold = nil,
+        pwr_warn_v = nil, skp_limit = nil,
+    },
+    alerts = {
+        mute = nil, haptic = nil,
+        cellchk = nil, fuel = nil, volt = nil, arm = nil,
+        telem = nil, link = nil, rssi = nil, pwr = nil, skp = nil,
+    },
+}
+
+function ultidash_functions.get_shared()
+    return Shared
+end
+
+-- True while a Dashboard instance is actually RUNNING (published recently). Passive
+-- views require this: without a live publisher they show a notice instead of stale
+-- or instance-local data ("the main widget is the boss"). Window is generous (10 s)
+-- because EdgeTX schedules background() for off-screen widgets at a coarse interval —
+-- a too-tight window would flicker the passive views between notice and live.
+function ultidash_functions.shared_alive()
+    if not Shared.ready then return false end
+    local now = getTime() or 0
+    return (now - (Shared.ts or 0)) < 1000
+end
+
+-- Publisher snapshot: called from the Dashboard instance's refresh/background.
+function ultidash_functions.publish_shared(wgt)
+    local o, v = wgt.options, wgt.values
+    if not o or not v then return end
+    local t, a = Shared.thresholds, Shared.alerts
+
+    Shared.ts         = getTime() or 0
+    Shared.model_name = v.craft_name
+    Shared.connected  = v.rf_connection_state ~= nil and v.rf_connection_state ~= "disconnected"
+    Shared.color_scheme = o.ColorScheme or 1
+    Shared.bg_filled    = (o.BGFilled == 1)
+
+    t.source      = (o.CellSource == 2) and "Manual" or "FC config"
+    t.cell_full   = v.vcel_full_threshold()
+    t.cell_warn   = v.vcel_warning_threshold()
+    t.cell_crit   = v.vcel_alarm_threshold()
+    t.reserve     = o.Reserve
+    t.callout_int = o.CalloutInt
+    t.rq_warn     = o.RQlyWarn
+    t.rq_crit     = o.RQlyCrit
+    t.rss_warn    = o.RssWarn
+    t.rss_crit    = o.RssCrit
+    t.rss_hold    = o.RssHold
+    t.pwr_warn_v  = (o.PwrWarnV or 90) / 10
+    t.skp_limit   = o.SkpLimit
+    t.tpwr_max    = o.TxPwrMax
+
+    a.mute    = (o.Mute == 2)
+    a.haptic  = (o.Haptic == 1)
+    a.cellchk = (o.SndCellChk == 1)
+    a.fuel    = (o.SndFuel == 1)
+    a.volt    = (o.SndVolt == 1)
+    a.arm     = (o.SndArm == 1)
+    a.telem   = (o.SndTelem == 1)
+    a.link    = (o.SndLink == 1)
+    a.rssi    = (o.SndRssi == 1)
+    a.pwr     = (o.PwrWarn == 1)
+    a.skp     = (o.SkpWarn == 1)
+
+    Shared.ready = true
+end
+
 local function play_audio(file)
     if master_muted then return end
-    playFile(AUDIO_PATH .. file .. ".wav")
+    if audio_volume then
+        playFile(AUDIO_PATH .. file .. ".wav", audio_volume)
+    else
+        playFile(AUDIO_PATH .. file .. ".wav")
+    end
+end
+
+-- Spoken numbers go through here too, so they follow the widget volume AND the
+-- master mute (previously a muted callout could still speak its bare number).
+local function play_number(value, unit, attr)
+    if master_muted then return end
+    if audio_volume then
+        playNumber(value, unit, attr or 0, audio_volume)
+    else
+        playNumber(value, unit, attr or 0)
+    end
 end
 
 local function play_vibe(wgt)
@@ -158,6 +280,20 @@ local function is_rf_connected(wgt)
     return wgt.values.rf_connection_state ~= "disconnected"
 end
 
+-- resolve the effective callout volume from the settings (see audio_volume above)
+local function refresh_audio_volume(wgt)
+    local v = wgt.options and wgt.options.Volume or 0
+    if v ~= nil and v > 0 then
+        if (wgt.options.VolWhen or 1) == 2 and not is_rf_connected(wgt) then
+            audio_volume = nil   -- "Only connected" and telemetry is down -> system volume
+        else
+            audio_volume = v
+        end
+    else
+        audio_volume = nil
+    end
+end
+
 -- Armed detection. Prefer the ARM telemetry sensor (Rotorflight arming flags,
 -- bit 0 = armed) because it's always available and authoritative; the RFTool
 -- connection state ("armed") is only a fallback (it doesn't reliably report the
@@ -169,6 +305,12 @@ local function is_craft_armed(wgt)
         return (arm % 2) == 1 or arm == 1024
     end
     return wgt.values.rf_connection_state == "armed"
+end
+
+-- exported armed check (thin wrapper) for the UI layer (e.g. auto-closing the ELRS
+-- detail page when the craft arms)
+function ultidash_functions.is_armed(wgt)
+    return is_craft_armed(wgt)
 end
 
 local function should_track_governor_run_extrema(wgt)
@@ -215,6 +357,11 @@ local function update_tracked_extrema(wgt, value_key, min_key, max_key)
 end
 
 local function clear_live_telemetry_values(wgt)
+    -- also reset the voltage-latch pendings + collapse flag so each connection starts fresh
+    wgt.vbat_pending = nil
+    wgt.vcel_pending = nil
+    wgt.vbec_pending = nil
+    wgt.supply_collapsed = nil
     wgt.values.vbat = nil
     wgt.values.vbat_min = nil
     wgt.values.vbat_max = nil
@@ -234,6 +381,7 @@ local function clear_live_telemetry_values(wgt)
     wgt.values.headspeed = nil
     wgt.values.headspeed_min = nil
     wgt.values.headspeed_max = nil
+    wgt.hs_profile_stats = nil
     wgt.values.vbec = nil
     wgt.values.vbec_min = nil
     wgt.values.vbec_max = nil
@@ -290,6 +438,7 @@ local function reset_stat_sensors(wgt)
     v.esc_temp_min, v.esc_temp_max = nil, nil
     v.curr_min, v.curr_max = nil, nil
     v.headspeed_min, v.headspeed_max = nil, nil
+    wgt.hs_profile_stats = nil
     v.rqly_min = nil
     v.tpwr_max = nil
     v.mcu_temp_max = nil
@@ -525,6 +674,8 @@ function ultidash_functions.update_elrs(wgt)
         v.elrs_r2_dbm = math.floor(-70 - 20 * sim_wave(22, 0.9))
         v.elrs_snr   = math.floor(8 + 6 * sim_wave(30, 0))
         v.elrs_diversity = true
+        v.elrs_tpwr  = 100
+        v.elrs_ant   = 0
     else
         v.elrs_rfmd  = getSourceValue("RFMD")
         v.elrs_rq    = getSourceValue("RQly")
@@ -532,7 +683,11 @@ function ultidash_functions.update_elrs(wgt)
         v.elrs_r1_dbm = getSourceValue("1RSS")
         v.elrs_r2_dbm = getSourceValue("2RSS")
         v.elrs_snr   = getSourceValue("RSNR")
+        v.elrs_tpwr  = getSourceValue("TPWR")
+        -- cached here so the bottom-bar getters never do per-frame name lookups
+        v.skp_raw    = getSourceValue("*Skp") or getSourceValue("Skp")
         local ant = getSourceValue("ANT")
+        v.elrs_ant   = ant and math.floor(ant) or nil
         v.elrs_diversity = (v.elrs_r2_dbm ~= nil and v.elrs_r2_dbm ~= 0) or (ant ~= nil)
     end
 
@@ -548,14 +703,58 @@ end
 -- ============================================================================
 -- AIRCRAFT TELEMETRY: VOLTAGE & TEMPERATURE
 -- ============================================================================
+
+-- Latched voltage update (see the MIN_PLAUSIBLE_CELL_V / VOLT_* notes at the top):
+-- ≤ 1 V never overwrites the held value; while disarmed a drop > drop_delta below
+-- the held value is only accepted once it stayed stable for VOLT_ACCEPT_CS.
+-- Returns true when `raw` was accepted into wgt.values[key].
+local function latch_voltage(wgt, key, raw, drop_delta)
+    local pend_key = key .. "_pending"
+    if raw == nil or raw <= MIN_PLAUSIBLE_CELL_V then
+        wgt[pend_key] = nil                       -- collapse tail / no data
+        return false
+    end
+    local held = wgt.values[key]
+    if held == nil or is_craft_armed(wgt) or raw >= held - drop_delta then
+        wgt.values[key] = raw
+        wgt[pend_key] = nil
+        return true
+    end
+    -- disarmed + suspicious drop: a decay keeps falling (pending resets every frame
+    -- because consecutive readings differ), a real lower pack reads steady and gets
+    -- accepted after the window
+    local now = getTime()
+    local pending = wgt[pend_key]
+    if pending == nil or math.abs(raw - pending.v) > drop_delta then
+        wgt[pend_key] = { v = raw, t = now }
+        return false
+    end
+    if (now - pending.t) >= VOLT_ACCEPT_CS then
+        wgt.values[key] = raw
+        wgt[pend_key] = nil
+        return true
+    end
+    return false
+end
+
 function ultidash_functions.update_cell(wgt)
-    wgt.values.vbat = getSourceValue("Vbat")
+    -- Latched (see latch_voltage): the buffer-bridged unplug decay never overwrites
+    -- the last good value, so the stats "Latest" column freezes at the real last
+    -- battery state instead of 0.00 / a mid-decay value. The collapse itself is still
+    -- detected by update_power_warning, which reads the sensor directly.
+    local raw = getSourceValue("Vbat")
+    local accepted = latch_voltage(wgt, "vbat", raw, VOLT_DROP_CELL * (wgt.values.cel_count or 6))
+    -- Main-supply-collapse flag: a real Vbat reading that the latch rejected while we
+    -- already hold a good value means the main supply is collapsing/collapsed (unplug
+    -- on a buffer). Fires on the FIRST decay frame — other channels (BEC) use it to
+    -- hold their last NORMAL value, because once the buffer feeds the rail their
+    -- reading shows the buffer, not their own state. False at session start (no held
+    -- value yet) and cleared as soon as a reading is accepted again.
+    wgt.supply_collapsed = (raw ~= nil and not accepted and wgt.values.vbat ~= nil)
     -- Widget-tracked min/max, recorded ONLY while ARMED (operating) — like the RPM
-    -- extrema gate on the governor run-state. This excludes the post-landing unplug
-    -- decay: when the buffer bridges, Vbat collapses 4.x -> 0 V through plausible-looking
-    -- values (e.g. 2.89 V) that the >1 V floor can't catch but that would pollute the
-    -- minimum. The floor stays as a second guard against any armed-time 0 V glitch.
-    if is_craft_armed(wgt) and wgt.values.vbat ~= nil and wgt.values.vbat > MIN_PLAUSIBLE_CELL_V then
+    -- extrema gate on the governor run-state. The disarmed unplug decay is excluded
+    -- twice over (armed gate + latch).
+    if is_craft_armed(wgt) and wgt.values.vbat ~= nil then
         update_tracked_extrema(wgt, "vbat", "vbat_min", "vbat_max")
     end
 
@@ -567,13 +766,19 @@ function ultidash_functions.update_cell(wgt)
 end
 
 function ultidash_functions.update_vcel(wgt)
-    wgt.values.vcel = getSourceValue("Vcel")
-    -- widget-tracked, ARMED-only (see update_cell): excludes the buffer decay on unplug,
-    -- whose plausible-looking mid values (e.g. 2.89 V) the >1 V floor can't catch.
-    if is_craft_armed(wgt) and wgt.values.vcel ~= nil and wgt.values.vcel > MIN_PLAUSIBLE_CELL_V then
+    -- latched like update_cell (fixes "Latest 0.00" after a buffer-bridged unplug)
+    local accepted = latch_voltage(wgt, "vcel", getSourceValue("Vcel"), VOLT_DROP_CELL)
+    -- widget-tracked, ARMED-only (see update_cell)
+    if is_craft_armed(wgt) and wgt.values.vcel ~= nil then
         update_tracked_extrema(wgt, "vcel", "vcel_min", "vcel_max")
     end
-    wgt.values.cel_count = getSourceValue("Cel#")
+    -- Cell count follows the voltage latch: the FC derives Cel# from Vbat, so during a
+    -- collapse it reports 0 (or transient counts like 1S mid-decay) — only accept it on
+    -- frames whose voltage was accepted too (fixes the "(0S)" header on the stats page).
+    local cells = getSourceValue("Cel#")
+    if (accepted or wgt.values.vcel == nil) and cells ~= nil and cells > 0 then
+        wgt.values.cel_count = cells
+    end
 
     if ultidash_functions.simu_mode then
         wgt.values.vcel = sim_vcel()
@@ -584,9 +789,16 @@ function ultidash_functions.update_vcel(wgt)
 end
 
 function ultidash_functions.update_vbec(wgt)
-    wgt.values.vbec = getSourceValue("Vbec")
-    -- widget-tracked, ARMED-only (see update_cell): excludes the BEC decay on unplug.
-    if is_craft_armed(wgt) and wgt.values.vbec ~= nil and wgt.values.vbec > MIN_PLAUSIBLE_CELL_V then
+    -- During a main-supply collapse (flag from update_cell) the rail is fed by the
+    -- buffer, so the Vbec reading shows the BUFFER's voltage, not the BEC's normal
+    -- state (seen as stats "Latest" 8.21 below a Min of 8.30) -> hold the last normal
+    -- value for the whole event. The latch's own 0.5 V disarmed-drop guard would NOT
+    -- catch this (buffer voltage is typically only ~0.1 V below the BEC).
+    if not wgt.supply_collapsed then
+        latch_voltage(wgt, "vbec", getSourceValue("Vbec"), 0.5)
+    end
+    -- widget-tracked, ARMED-only (see update_cell)
+    if is_craft_armed(wgt) and wgt.values.vbec ~= nil then
         update_tracked_extrema(wgt, "vbec", "vbec_min", "vbec_max")
     end
 
@@ -707,7 +919,7 @@ function ultidash_functions.update_battery_gauge(wgt)
                 wgt.batt_warn = true
                 if wgt.options.SndCellChk == 1 then
                     play_audio("batlow")
-                    if vbat then playNumber(vbat * 10, 1, PREC1) end
+                    if vbat then play_number(vbat * 10, 1, PREC1) end
                 end
             end
         else
@@ -729,9 +941,25 @@ function ultidash_functions.update_headspeed(wgt)
         wgt.values.headspeed = 2350 + 150 * sim_wave(25, 0.5)   -- ~2200..2500 rpm
     end
 
+    -- Min/max are tracked PER PID PROFILE: the governor headspeed differs per
+    -- profile, so a single pair would mix unrelated rpm bands into meaningless
+    -- extremes. The displayed headspeed_min/max always mirror the CURRENTLY
+    -- selected profile's pair — flip the profile switch after landing to inspect
+    -- each profile's stats. Cost: one table lookup per 5 Hz tick.
+    local prof = wgt.values.profile_id or 0
+    local stats = wgt.hs_profile_stats
+    if stats == nil then stats = {}; wgt.hs_profile_stats = stats end
+    local s = stats[prof]
+    if s == nil then s = {}; stats[prof] = s end
     if should_track_governor_run_extrema(wgt) then
-        update_tracked_extrema(wgt, "headspeed", "headspeed_min", "headspeed_max")
+        local v = wgt.values.headspeed
+        if v ~= nil then
+            if s.min == nil or v < s.min then s.min = v end
+            if s.max == nil or v > s.max then s.max = v end
+        end
     end
+    wgt.values.headspeed_min = s.min
+    wgt.values.headspeed_max = s.max
 end
 
 function ultidash_functions.update_gov_state(wgt)
@@ -767,6 +995,101 @@ local function build_arm_disable_text(flags)
     return "* " .. table.concat(parts, " ")
 end
 
+-- ============================================================================
+-- SWITCH VOICE ANNOUNCEMENTS
+-- ============================================================================
+-- Speak configured TX-switch positions (motor/rescue/governor on-off + profile
+-- 1..3). READ-ONLY getValue on the physical switch — fully independent of the
+-- model's mixer/logical-switch safety chain (which stays in the model) and of
+-- telemetry. Each function is selectable in the settings incl. an inverted
+-- variant (choice list: Off, SA, SA inv, SB, ... SH inv).
+
+local SWITCH_SRC = { "sa", "sb", "sc", "sd", "se", "sf", "sg", "sh" }
+
+local function switch_voice_pos(idx)
+    if idx == nil or idx <= 1 then return nil end          -- 1 = Off
+    if idx >= 100 then
+        -- logical switch (code = 100 + 2*ls_index, +1 = inverted): boolean on/off
+        local lsi = math.floor((idx - 100) / 2)
+        local ok, v = pcall(getLogicalSwitchValue, lsi)
+        if not ok or v == nil then return nil end
+        local p = v and 3 or 1
+        if idx % 2 == 1 then p = 4 - p end
+        return p
+    end
+    local si = math.floor((idx - 2) / 2) + 1
+    local src = SWITCH_SRC[si]
+    if src == nil then return nil end
+    local ok, v = pcall(getValue, src)
+    if not ok or v == nil then return nil end
+    local p
+    if v > 200 then p = 3 elseif v < -200 then p = 1 else p = 2 end
+    if idx % 2 == 1 then p = 4 - p end                     -- odd indices = inverted
+    return p
+end
+
+local SWITCH_VOICES = {
+    { key = "MotorSw",   on = "motor_on",  off = "motor_off" },
+    { key = "RescueSw",  on = "rescue_on", off = "rescue_off" },
+    { key = "GovSw",     on = "gov_on",    off = "gov_off" },
+    { key = "ProfileSw", profile = true },
+}
+
+function ultidash_functions.update_switch_voices(wgt)
+    if wgt.options == nil then return end
+    local st = wgt.swv
+    if st == nil then st = {}; wgt.swv = st end
+    local now = getTime() or 0
+    for i = 1, #SWITCH_VOICES do
+        local f = SWITCH_VOICES[i]
+        local p = switch_voice_pos(wgt.options[f.key])
+        local s = st[f.key]
+        if s == nil then
+            s = { last = p, pend = p, t = now }             -- no announce on boot
+            st[f.key] = s
+        end
+        if p ~= s.pend then
+            s.pend = p
+            s.t = now
+        elseif p ~= nil and p ~= s.last and (now - s.t) >= 30 then
+            -- stable for 0.3 s (a 3-pos switch passes through mid on its way)
+            local first = (s.last == nil)   -- switch just got configured: baseline silently
+            s.last = p
+            if first then
+                -- baseline only, no announcement
+            elseif f.profile then
+                play_audio("profile")
+                play_number(p, 0)
+            elseif p == 3 then
+                play_audio(f.on)
+            elseif p == 1 then
+                play_audio(f.off)
+            end
+            -- the mid position of on/off functions stays silent on purpose
+        end
+    end
+end
+
+-- ESC/status event LOG (modeled after eStatus' app-mode view): every status
+-- change is recorded with a wall-clock timestamp for the status detail page.
+local ESC_LOG_MAX = 30
+
+local function estatus_log(wgt, text, level)
+    if text == nil or text == "" then return end
+    local log = wgt.esc_log
+    if log == nil then log = {}; wgt.esc_log = log end
+    local last = log[#log]
+    if last ~= nil and last.text == text then return end   -- dedup repeats
+    local dt = getDateTime()
+    local ts = dt and string.format("%02d:%02d:%02d", dt.hour or 0, dt.min or 0, dt.sec or 0) or ""
+    log[#log + 1] = { time = ts, text = text, level = level or 1 }
+    if #log > ESC_LOG_MAX then table.remove(log, 1) end
+end
+
+function ultidash_functions.get_esc_log(wgt)
+    return wgt.esc_log
+end
+
 -- eStatus integration: throttle %, multi-vendor ESC status/fault line,
 -- arming-disable reasons when disarmed, and armed/disarm voice callouts.
 function ultidash_functions.update_estatus(wgt)
@@ -798,9 +1121,12 @@ function ultidash_functions.update_estatus(wgt)
         status_text = "RESTART ESC"
         status_color = BAR_COLOR_CRITICAL
         wgt.esc_status_level = esc.LEVEL_ERROR
+        estatus_log(wgt, "RESTART ESC", esc.LEVEL_ERROR)
     elseif connected then
         local st = esc.get_status(sig, flags, changed)
         if st then
+            -- every status CHANGE goes into the event log (detail page)
+            if changed then estatus_log(wgt, st.text, st.level) end
             -- latch the worst level seen since (re)connect, like eStatus
             if wgt.esc_status_level == nil or st.level >= wgt.esc_status_level then
                 wgt.esc_status_text = st.text
@@ -842,6 +1168,7 @@ function ultidash_functions.update_estatus(wgt)
             if wgt.options.SndArm == 1 then
                 play_audio(armed and "armed" or "disarm")
             end
+            estatus_log(wgt, armed and "Armed" or "Disarmed", esc.LEVEL_INFO)
         end
         wgt.estatus_armed = armed
     else
@@ -851,6 +1178,7 @@ end
 
 function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_state)
     master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
+    refresh_audio_volume(wgt)
     local telem_snd = wgt.options and wgt.options.SndTelem == 1
 
     if previous_state == "disconnected" and new_state ~= "disconnected" then
@@ -924,7 +1252,7 @@ local function crank_fuel_calls(wgt)
                 play_vibe(wgt)
             end
             if capa >= 0 then
-                playNumber(capa, UNIT_PERCENT)
+                play_number(capa, UNIT_PERCENT)
             end
         end
         wgt.callout_last_capa = capa
@@ -970,7 +1298,7 @@ local function crank_voltage_alerts(wgt)
             end
             -- report total voltage (ePowerbar workaround for per-cell announce)
             local vbat = wgt.values.vbat
-            if vbat then playNumber(vbat * 10, UNIT_VOLTS, PREC1) end
+            if vbat then play_number(vbat * 10, UNIT_VOLTS, PREC1) end
             if haptic then play_vibe(wgt) end
 
             wgt.alert_next = now + math.max(1, wgt.options.CalloutInt or 6) * 100
@@ -1062,7 +1390,7 @@ function ultidash_functions.update_link_warning(wgt)
             play_audio("link_warn")
         end
         -- announce the actual link quality value
-        playNumber(rqly, UNIT_PERCENT)
+        play_number(rqly, UNIT_PERCENT)
         wgt.link_announced = wgt.link_level
         wgt.link_pending = 0
     end
@@ -1270,6 +1598,8 @@ end
 -- widget was on screen.
 function ultidash_functions.background_refresh(wgt)
     master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
+    refresh_audio_volume(wgt)
+    ultidash_functions.update_switch_voices(wgt)
     maybe_reset_stats(wgt)
     ultidash_functions.update_battery_callout(wgt)
     ultidash_functions.update_link_warning(wgt)
@@ -1289,6 +1619,8 @@ end
 -- Main refresh: full telemetry updates (handles both connected and disconnected states)
 function ultidash_functions.refresh(wgt)
     master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
+    refresh_audio_volume(wgt)
+    ultidash_functions.update_switch_voices(wgt)
     if ultidash_functions.simu_mode then
         wgt.telemetry_alive = true
         ultidash_functions.refresh_ui(wgt)

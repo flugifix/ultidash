@@ -1,7 +1,7 @@
 --[[
 #########################################################################
 #                                                                       #
-#  UltiDash v0.1 - Rotorflight LVGL dashboard widget for EdgeTX         #
+#  UltiDash v0.2 - Rotorflight LVGL dashboard widget for EdgeTX         #
 #  Tested on RadioMaster TX15 and TX16S MK3 (EdgeTX 2.12).              #
 #                                                                       #
 #  License: GPLv3 or later (http://www.gnu.org/licenses/gpl-3.0.html).  #
@@ -48,21 +48,17 @@
       (not a verbatim copy of BattAnalog code).
 
   License summary:
-    * The etx-widgets portions (ePowerbar/eBitmap/eStatus) are GPLv3 - those parts
-      and any new UltiDash code are intended to be GPLv3.
-    * The HeliDash base (gismo2004) has NO license. "No license" means all rights
-      reserved by default - it does NOT mean free to relicense. Only gismo2004 can
-      license that code; it cannot be unilaterally placed under GPLv3 here.
+    * The HeliDash base (gismo2004) is now licensed GPL-3.0 (or later).
+    * The etx-widgets portions (ePowerbar/eBitmap/eStatus) are GPLv3.
     * BattAnalog (Offer Shmuely) is GPLv2 by file header; only its visual concept
-      was reused, not its code.
-  => The whole work is therefore NOT cleanly GPLv3 yet. GPLv3 is the intended target,
-     but a formal public release first requires gismo2004 to license the HeliDash
-     base (ideally GPLv3 or "GPLv2 or later"). Private use is unaffected.
+      was reused here, not its code.
+  => All reused components are GPL-compatible, so UltiDash as a whole is distributed
+     under GPLv3 with the attributions above preserved.
      (This is a plain-language summary, not legal advice.)
 ]]
 
 local app_name = "UltiDash"
-local app_ver = "0.1"
+local app_ver = "0.2"
 local widg_dir = "/WIDGETS/UltiDash/"
 
 local ultidash = nil
