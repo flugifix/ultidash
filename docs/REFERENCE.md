@@ -52,13 +52,16 @@ Everything else is configured **inside the widget**, not in the EdgeTX option li
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **☰ menu glyph** (top-left, before the clock) — **disarmed only** (no config
    in flight). The tap target is the whole top-left corner.
-3. Menu entries: **Settings**, **Status**, **Reset settings to defaults** (with a
-   confirmation dialog).
+3. Menu entries (laid out as a button grid): **Settings**, **Status**,
+   **Reset settings to defaults** (with a confirmation dialog).
 
-On the **Settings** page the ‹ › arrows in the header switch between five groups. Bools
-are real toggle switches, multi-value options are dropdown pickers, numbers use −/+
-buttons (long-press = bigger step). Edits are **saved automatically** when the page is
-left (back arrow or **RTN**); arming or leaving full-screen also saves.
+**Settings** opens a **submenu** of the seven configuration groups (also a grid) — pick
+one to open its page; its back arrow returns to the submenu. Groups: **Display**,
+**Tele Main**, **Tele Details** (§2.3a), **Battery**, **Thresholds**, **Alerts**,
+**Switch voice**. Bools are real toggle switches, multi-value options are dropdown
+pickers, numbers use −/+ buttons (long-press = bigger step). Edits are **saved
+automatically** when a page is left (back arrow or **RTN**); arming or leaving full-screen
+also saves.
 
 ### 2.3 Settings — Display
 
@@ -80,6 +83,30 @@ left (back arrow or **RTN**); arming or leaving full-screen also saves.
 | **Tap zones for detail pages** | bool | on | enable tapping the bars / status line / gauge to open detail pages (the menu glyph stays active either way) |
 | **Quiet link bars (color only on warn)** | bool | off | bars stay neutral while fine; color only on warn/crit |
 | **Config file per craft** | bool | off | see §2.8 |
+
+> **Color scheme — feedback-dependent.** UltiDash is developed and tested against the
+> built-in **UltiDash** palette (the primary path). The **EdgeTX theme** option
+> (theme-aware colors) is **not the maintainer's personal focus**, is less tested, and
+> relies on community feedback — please report theme glitches with a screenshot.
+
+### 2.3a Settings — Tele Main / Tele Details (configurable value slots)
+
+The right-hand dashboard panel and the Telemetry detail page (§3.4) show **freely chosen
+sensors**. Two groups configure them; each row is a **sensor picker**.
+
+| Group | Slots | Default sensors |
+|-------|-------|-----------------|
+| **Tele Main** | `Panel 1..5` (the 5 right-hand dashboard rows) | Voltage (auto), Headspeed, Current, ESC Temp, BEC |
+| **Tele Details** | `Detail 1..12` (the Telemetry detail grid) | Battery, Cell, Current, Energy Used, Fuel, ESC Temp, BEC, Headspeed, then 4× **Off** |
+
+- Each picker lists **— Off —**, **Voltage (auto)** and every sensor present on the model
+  (plus any already-chosen sensor, so a selection survives offline). The selection is
+  stored as the EdgeTX **sensor name** (string) so it stays identified before EdgeTX
+  re-discovers it.
+- **Voltage (auto)** is the smart cell/battery voltage with the warn color (the dashboard's
+  original slot-1 behaviour) — it follows *Display → Voltage shown as*.
+- Known Rotorflight sensors get a friendly label, decimals and a **unit** (V, A, °C, mAh,
+  %, rpm, …); unknown sensors show their raw EdgeTX name and the precision EdgeTX reports.
 
 ### 2.4 Settings — Battery
 
@@ -174,8 +201,9 @@ SD card and overlay the (effectively empty) EdgeTX option list at runtime.
 
 ## 3. Display / views & navigation
 
-The Dashboard instance has two automatic views (**flight** / **stats**) plus three
-tap-to-open **detail pages** and the **settings menu** (all full-screen only).
+The Dashboard instance has two automatic views (**flight** / **stats**) plus four
+tap-to-open **detail pages**, the **battery-profile picker** and the **settings menu**
+(all full-screen only).
 
 ### 3.1 Stats-view switching (`Stats page`)
 - **armed** → always **flight view**
@@ -209,11 +237,13 @@ each group toggleable; quiet mode optional) · radio (TX) battery icon with % an
 
 **Left – status panel:** model image (or timer) · flights + total flight time · governor
 + throttle · ESC/arming status line (colored; tap to open the status detail) ·
-profile/rate/battery-profile.
+profile/rate/**battery-profile** (tap the battery-profile field — disarmed — to open the
+profile picker, §3.5).
 
 **Center – battery gauge** (see §4). Tap to open the battery detail.
 
-**Right – values panel:** voltage · headspeed · current · ESC temp · BEC.
+**Right – values panel:** five configurable sensor slots (default: voltage · headspeed ·
+current · ESC temp · BEC). Tap to open the **Telemetry** detail (§3.4).
 
 **Bottom status bar:** `Model` · arm state · `TPWR` (toggleable) · `Skp`. With
 arming-disable flags it shows "Arming Disabled: …" instead.
@@ -260,6 +290,13 @@ Tap-zones are gated by *Display → Tap zones for detail pages*. Close with a ta
 **RTN**, or (optionally) by arming. The whole telemetry/alert engine keeps running while
 a detail page is open — you can watch the ELRS detail in flight without losing callouts.
 
+- **Telemetry** (tap the right value panel): a **3-column grid of up to 12** freely chosen
+  sensors (§2.3a — *Tele Details*). Off slots are skipped. Each tile shows the label, the
+  big value **+ its unit**, and a dim **`min .. max` chip** — the EdgeTX session low/high
+  read from the sensor's **`-`/`+` variants** (so every sensor gets a low/high, not just the
+  few the stats page tracks). The tile lays the label left of the value on the wide TX16S,
+  above it on the narrow TX15. *(Reading the per-sensor min/max is gated to while this page
+  is open, to keep the dashboard's sensor-lookup budget light.)*
 - **ELRS link** (tap the top-bar bars): six labelled bars — **RQ, TQ, 1RSS, 2RSS, SNR,
   TPWR** — with reactive threshold ticks and values; the rate/mode header; footer with
   SNR, active antenna and session RQ-min. SNR is mapped −10…+10 dB; TPWR is inverted (high
@@ -273,6 +310,21 @@ a detail page is open — you can watch the ELRS detail in flight without losing
   thresholds marked (and whether they come from FC or manual), then the battery in the
   dashboard segment look with % and used mAh inside it, and a Batt / Cell-min / Reserve
   line.
+
+### 3.5 Battery-profile picker (tap the B-Profile field — **disarmed only**)
+
+Tapping the **B-Profile** field in the status panel opens a picker of the **6 Rotorflight
+battery profiles**, each shown with its capacity (`1800 mAh`, or `undefined` when the
+profile has none); the active one is marked. Selecting one **switches the active battery
+profile on the FC**.
+
+> ⚠️ **This is the only place UltiDash *writes* to the flight controller.** It is therefore
+> gated to **disarmed** (the picker won't open armed, and the FC also rejects config writes
+> while armed). The switch goes through the RFTool MSP API — `mspBatteryProfile.write`
+> (MSP 176, the same call the RFTool's own battery page uses) — and persists **without an
+> FC reboot** (`settingsSaved(true, false)`). The picker re-reads the FC's current profile
+> fresh on open, so it reflects external profile switches too. Everything else in UltiDash
+> stays **read/announce-only**.
 
 ---
 
@@ -437,8 +489,9 @@ to the Status detail's event log.
 
 - **No external libraries** – UltiDash loads only its own files (no `eLib`/`lib_common`).
 - **RFTool widget** must be present (`rf2` global) → connection state and MSP data. If
-  absent, the state stays "disconnected". **MSP is only read on connect/disarm — never
-  during armed flight.**
+  absent, the state stays "disconnected". **MSP is only read on connect/disarm, and the
+  only MSP *write* is the battery-profile switch (§3.5), disarmed — never during armed
+  flight.**
 - **Performance:** the telemetry/alert/publish pass is throttled to 5 Hz; touch is handled
   every cycle. The Status detail footer shows the live UI loop rate as a load indicator.
 - **Sounds** in `/SOUNDS/en/ultidash/` (own subfolder, `AUDIO_PATH`). All shipped:
@@ -457,7 +510,8 @@ to the Status detail's event log.
 
 ## 9. Known limitations
 
-- Sensor sources are fixed (no select options).
+- The right value panel and the Telemetry detail are configurable (§2.3a); the left status
+  panel, the central gauge and the stats table still use fixed Rotorflight sensors.
 - The startup cell-check and armed/disarm callout only run on the **active screen**;
   the ESC event log and switch announcements likewise need the widget visible.
 - Stats "mAh Used (%)" shows the raw, not reserve-adjusted, percentage.

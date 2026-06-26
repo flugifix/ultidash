@@ -201,7 +201,8 @@ function M.createValues(wgt)
         label_profile = "Profile",
         label_rate = "Rate",
         label_battery_profile = "Batt Profile",
-        label_battery_profile_short = "B. Profile",
+        label_battery_profile_short = "B-Profile",
+        label_battery_profile_shorter = "B-Prof",
         label_battery_profile_tiny = "Batt",
         label_arm_state = "Arm State",
         label_governor = "Governor State",
@@ -635,6 +636,7 @@ function M.createValues(wgt)
         end,
 
         rf_battery_profile = nil,
+        rf_battery_profile_active = nil,
         rf_cell_warning_voltage = nil,
         rf_cell_alarm_voltage = nil,
         rf_cell_full_voltage = nil,

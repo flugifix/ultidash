@@ -2,18 +2,23 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.2 — experimental, under testing`
+`Status: v0.3 — experimental, under testing`
 
 UltiDash brings flight telemetry, battery state, ESC status, the ELRS link and radio
 info together on a single self-contained screen — designed so you can drop the EdgeTX
 top bar and run it full-screen. Everything is configured **inside the widget** (a
 fullscreen menu), and tapping a panel opens a detailed view of it.
 
-![UltiDash flight view](images/ultidash.jpg)
+![UltiDash in action](images/ultidash_showcase.gif)
 
-*Flight view (above) and the statistics page shown when disarmed/disconnected (below).*
+*Flight view, the tap-to-open detail pages (telemetry, battery, ELRS, status), the
+battery-profile picker, the stats page and the settings menu.*
 
-![UltiDash statistics page](images/ultidash02.jpg)
+### The dashboard at a glance
+
+The flight view packs a lot in; tapping a panel (in full-screen) drills into it:
+
+![UltiDash dashboard — interactive zones](images/ultidash_dashboard_annotated.png)
 
 > ⚠️ **Work in progress / under testing.** UltiDash is an experimental project and is
 > still being tested in the field. Expect rough edges and changes.
@@ -44,16 +49,25 @@ here, I will of course respect that.
   ESC temp, BEC).
 - **Statistics view** — auto-shown when disarmed/disconnected: per-value Latest/Min/Max
   table (headspeed **per PID profile**), total flights & flight time, capacity used.
+- **Configurable values** — the 5 right-hand panel slots and the Telemetry detail page are
+  freely assignable to any model sensor (a smart **Voltage (auto)** slot keeps the
+  warn-colored cell/battery voltage).
 - **Tap-to-open detail pages** (full-screen) — tap a panel to drill in:
+  - **Telemetry** (tap the value panel): a 3-column grid of up to 12 chosen sensors, each
+    with its **unit** and the EdgeTX session **low/high** (`min .. max`).
   - **ELRS link** (tap the top-bar bars): RQ, TQ, 1RSS, 2RSS, SNR and TPWR as labelled
     bars with thresholds, plus SNR / active antenna / session RQ-min.
   - **Status & events** (tap the status line): arm/governor/throttle summary, the live
     status line and a timestamped ESC event log.
   - **Battery** (tap the gauge): a cell-voltage scale with the active thresholds marked
     plus the battery in the dashboard look.
+- **Battery-profile picker** (tap the **B-Profile** field, **disarmed**) — switch the
+  active Rotorflight battery profile (shown with their capacities) right from the
+  dashboard, via the RFTool MSP API and without rebooting the FC. *(This is the only place
+  UltiDash writes to the FC — disarmed only; everything else is read/announce-only.)*
 - **In-widget settings menu** — no EdgeTX option list to fight: open the full-screen menu
-  and edit everything with real toggle switches, dropdowns and +/− steppers. Settings are
-  **saved per model** on the SD card.
+  and edit everything with real toggle switches, dropdowns and +/− steppers, grouped into
+  named pages. Settings are **saved per model** on the SD card.
 - **Voice & vibration callouts** — fuel %, cell voltage, armed/disarm, ELRS link-quality,
   RSSI/signal, telemetry-lost, main-power-loss and skipped-packet warnings, plus optional
   **switch announcements** (motor / rescue / governor / profile). Each individually
@@ -104,17 +118,27 @@ lives in an **in-widget settings menu**:
 
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **menu symbol** (the ☰ glyph, top-left, next to the clock) — *disarmed only*.
-3. The menu offers **Settings**, **Status** and **Reset settings to defaults**.
+3. The menu offers **Settings** (a submenu of the configuration groups), **Status** and
+   **Reset settings to defaults**. The menu and the Settings submenu are laid out as a
+   button grid; each group opens its own page.
 
-The **Settings** page has five groups (use the ‹ › arrows in the header to switch):
+The **Settings** submenu has seven groups:
 
 | Group | Covers |
 |-------|--------|
 | **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, detail-page behaviour, quiet bars, per-craft config |
+| **Tele Main** | the 5 right-hand dashboard value slots (pick any sensor, or *Voltage (auto)*) |
+| **Tele Details** | the 12 sensor slots of the Telemetry detail page |
 | **Battery** | reserve %, cell-threshold source (FC config / manual cell voltages), startup cell-check delay |
 | **Thresholds** | callout interval, link (RQly) warn/crit, RSSI warn/crit/hold, power-warn voltage, skipped-packet limit, TPWR bar max |
 | **Alerts** | callout volume + when it applies, master mute, vibration, and a per-event on/off for every announcement |
 | **Switch voice** | announce motor / rescue / governor / profile from a chosen TX switch (physical **or** logical) |
+
+> 🎨 **About the color scheme (Display → Color scheme).** UltiDash is developed and tested
+> against its built-in **UltiDash** palette — that's the path I actually fly. The
+> **EdgeTX theme** option (theme-aware colors) is **not my personal focus**, so it's less
+> tested and I'm dependent on **feedback**: if something looks off under your theme, please
+> open an issue with a screenshot and I'll take a look.
 
 Edits are **saved automatically** when you leave the page (back arrow or RTN) and stored
 **per model** in `/WIDGETS/UltiDash/cfg_m_<model-slot>.cfg`. The slot keying survives
@@ -129,9 +153,11 @@ breakdown, the callout matrix, the detail pages and the "what is shown when" tab
 | Tap | Opens |
 |-----|-------|
 | ☰ menu glyph (top-left) | the settings menu (disarmed only) |
+| the right value panel | the **Telemetry** detail page |
 | the link bars | the **ELRS** detail page |
 | the ESC/status line | the **Status & events** page |
 | the battery gauge | the **Battery** detail page |
+| the **B-Profile** field | the **battery-profile picker** (disarmed only) |
 | anywhere on a detail page / RTN | back to the dashboard |
 | anywhere on the stats page | dismiss it (returns next flight) |
 

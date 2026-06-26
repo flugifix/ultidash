@@ -37,11 +37,28 @@ local CLEAN_PALETTE = {
 -- theme it follows SECONDARY3 as before.
 local PANEL_BG = COLOR_THEME_SECONDARY3
 
+-- Neutral UI chrome (bar/track backgrounds, tick marks, dim labels). Kept as fixed
+-- greys in the UltiDash/Clean look, but DERIVED FROM THE THEME in EdgeTX-theme mode
+-- so theme awareness is consistent there too. Semantic colours (battery/warn
+-- green-yellow-red) and the battery graphic's own black overlay text stay fixed.
+local COLOR_TRACK = lcd.RGB(0xC8, 0xC8, 0xC8)   -- empty bar / track background
+local COLOR_TICK  = lcd.RGB(0x20, 0x20, 0x20)   -- strong threshold tick marks
+local COLOR_DIM   = lcd.RGB(0x90, 0x90, 0x90)   -- dim secondary text / light ticks
+
 local function set_palette(use_clean)
     local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
     PANEL_BG = use_clean and lcd.RGB(0xFF, 0xFF, 0xFF) or THEME_PALETTE[5]
+    if use_clean then
+        COLOR_TRACK = lcd.RGB(0xC8, 0xC8, 0xC8)
+        COLOR_TICK  = lcd.RGB(0x20, 0x20, 0x20)
+        COLOR_DIM   = lcd.RGB(0x90, 0x90, 0x90)
+    else
+        COLOR_TRACK = COLOR_THEME_SECONDARY2   -- subtle fill against the theme bg
+        COLOR_TICK  = COLOR_THEME_SECONDARY1   -- strong line/mark colour
+        COLOR_DIM   = COLOR_THEME_DISABLED     -- greyed/dim text
+    end
 end
 -- Header font - set dynamically in the active UI builder based on available space
 local header_font = MIDSIZE
@@ -329,6 +346,222 @@ local function add_stacked_field(children, x, y, c_w, row_padding, label_text, v
     }
 end
 
+-- ── Configurable telemetry value slots ───────────────────────────────────────
+-- The right-hand value panel (5 slots) and the "Telemetry" detail page (8 slots)
+-- show sensors the user picks in Settings ▸ Values. A selection is stored as the
+-- EdgeTX sensor NAME (a string in the cfg file) so the chosen sensor stays
+-- identified even offline / before EdgeTX has (re)discovered it. Two sentinels are
+-- not real sensors: SENSOR_OFF (empty slot) and VOLT_AUTO (the smart cell/battery
+-- voltage with warn colour — the dashboard's original slot-1 behaviour).
+local SENSOR_OFF = "~off"
+local VOLT_AUTO  = "~volt"
+
+-- Friendly label + default decimals for known Rotorflight / ELRS sensor names
+-- (EdgeTX only stores the terse 4-char name). Unknown sensors fall back to their
+-- raw name and the precision reported live by model.getSensor.
+local SENSOR_INFO = {
+    Vbat     = { lbl = "Battery",      dec = 2, unit = "V" },
+    Vcel     = { lbl = "Cell",         dec = 2, unit = "V" },
+    ["Cel#"] = { lbl = "Cells",        dec = 0, unit = "" },
+    Cels     = { lbl = "Cell V",       dec = 2, unit = "V" },
+    Curr     = { lbl = "Current",      dec = 1, unit = "A" },
+    Capa     = { lbl = "Energy Used",  dec = 0, unit = "mAh" },
+    ["Bat%"] = { lbl = "Fuel",         dec = 0, unit = "%" },
+    Vbec     = { lbl = "BEC Voltage",  dec = 2, unit = "V" },
+    Cbec     = { lbl = "BEC Current",  dec = 1, unit = "A" },
+    Vbus     = { lbl = "Bus Voltage",  dec = 2, unit = "V" },
+    Cbus     = { lbl = "Bus Current",  dec = 1, unit = "A" },
+    Vmcu     = { lbl = "MCU Voltage",  dec = 2, unit = "V" },
+    Cmcu     = { lbl = "MCU Current",  dec = 1, unit = "A" },
+    Tesc     = { lbl = "ESC Temp",     dec = 0, unit = "°C" },
+    Tbec     = { lbl = "BEC Temp",     dec = 0, unit = "°C" },
+    Tmcu     = { lbl = "MCU Temp",     dec = 0, unit = "°C" },
+    Tair     = { lbl = "Air Temp",     dec = 0, unit = "°C" },
+    Tmtr     = { lbl = "Motor Temp",   dec = 0, unit = "°C" },
+    Tbat     = { lbl = "Batt Temp",    dec = 0, unit = "°C" },
+    Hspd     = { lbl = "Headspeed",    dec = 0, unit = "rpm" },
+    Tspd     = { lbl = "Tailspeed",    dec = 0, unit = "rpm" },
+    Thr      = { lbl = "Throttle",     dec = 0, unit = "%" },
+    EscV     = { lbl = "ESC Voltage",  dec = 2, unit = "V" },
+    EscI     = { lbl = "ESC Current",  dec = 1, unit = "A" },
+    EscT     = { lbl = "ESC Temp",     dec = 0, unit = "°C" },
+    RQly     = { lbl = "Link Qual",    dec = 0, unit = "%" },
+    TQly     = { lbl = "Uplink Qual",  dec = 0, unit = "%" },
+    RSNR     = { lbl = "SNR",          dec = 0, unit = "dB" },
+    TPWR     = { lbl = "TX Power",     dec = 0, unit = "mW" },
+}
+
+-- precision learned live from model.getSensor (used only for unknown sensors)
+local sensor_prec_cache = {}
+
+-- Sensors the dashboard already computes into wgt.values.* (with latching /
+-- plausibility filtering AND simulator demo data). Prefer those fields over a raw
+-- getSourceValue read: correct on hardware and populated in the simulator, where
+-- getSourceValue has no real sensors. Other sensors fall back to the 5 Hz cache.
+local SENSOR_VALUE_FIELD = {
+    Vbat = "vbat", Vcel = "vcel", ["Cel#"] = "cel_count",
+    Curr = "curr", Capa = "capa", ["Bat%"] = "capa_percent",
+    Tesc = "esc_temp", Vbec = "vbec", Hspd = "headspeed",
+}
+
+-- keys of all configurable value slots (5 panel + 8 detail)
+local PANEL_SLOT_KEYS  = { "PanelV1", "PanelV2", "PanelV3", "PanelV4", "PanelV5" }
+local DETAIL_SLOT_KEYS = { "DetV1", "DetV2", "DetV3", "DetV4", "DetV5", "DetV6",
+                          "DetV7", "DetV8", "DetV9", "DetV10", "DetV11", "DetV12" }
+
+local function is_off_sensor(name)
+    return name == nil or name == SENSOR_OFF or name == ""
+end
+
+local function sensor_dec(name)
+    local info = SENSOR_INFO[name]
+    if info then return info.dec end
+    local p = sensor_prec_cache[name]
+    if type(p) == "number" then return p end
+    return 1
+end
+
+-- short label for the panel / detail cell (no parenthetical raw name)
+local function sensor_short_label(name)
+    if is_off_sensor(name) then return "" end
+    if name == VOLT_AUTO then return "Voltage" end
+    local info = SENSOR_INFO[name]
+    if info then return info.lbl end
+    return name
+end
+
+-- unit suffix for the value (telemetry detail page). Known sensors carry it in
+-- SENSOR_INFO; VOLT_AUTO is the smart voltage → "V"; unknowns have no unit string
+-- (EdgeTX only exposes a numeric unit id, too version-fragile to map reliably).
+local function sensor_unit(name)
+    if name == VOLT_AUTO then return "V" end
+    local info = SENSOR_INFO[name]
+    return (info and info.unit) or ""
+end
+
+-- label shown in the settings dropdown (friendly + raw for disambiguation)
+local function sensor_pick_label(name)
+    if is_off_sensor(name) then return "— Off —" end
+    if name == VOLT_AUTO then return "Voltage (auto)" end
+    local info = SENSOR_INFO[name]
+    if info then return info.lbl .. " (" .. name .. ")" end
+    return name
+end
+
+-- Build the sensor pick list for the settings dropdown: Off + smart-voltage +
+-- every sensor present on the model (model.getSensor) + any sensor already chosen
+-- (so a stored selection stays selectable even offline / not yet discovered).
+-- Codes are the NAME strings stored in the cfg.
+local function build_sensor_list(wgt)
+    local labels = { sensor_pick_label(SENSOR_OFF), sensor_pick_label(VOLT_AUTO) }
+    local codes  = { SENSOR_OFF, VOLT_AUTO }
+    local seen   = { [SENSOR_OFF] = true, [VOLT_AUTO] = true }
+    local function add(name)
+        if name == nil or name == "" or seen[name] then return end
+        seen[name] = true
+        labels[#labels + 1] = sensor_pick_label(name)
+        codes[#codes + 1]   = name
+    end
+    if model ~= nil and type(model.getSensor) == "function" then
+        for i = 0, 59 do
+            local ok, s = pcall(model.getSensor, i)
+            if ok and type(s) == "table" and type(s.name) == "string" and s.name ~= "" then
+                if type(s.prec) == "number" then sensor_prec_cache[s.name] = s.prec end
+                add(s.name)
+            end
+        end
+    end
+    local src = wgt.settings_working or wgt.options or {}
+    for i = 1, #PANEL_SLOT_KEYS  do add(src[PANEL_SLOT_KEYS[i]])  end
+    for i = 1, #DETAIL_SLOT_KEYS do add(src[DETAIL_SLOT_KEYS[i]]) end
+    return labels, codes
+end
+
+-- Cheap reactive text getter for a configured sensor slot: reads the 5 Hz cache,
+-- never does a sensor name-lookup itself (see update_user_sensors).
+local function sensor_value_text(wgt, name)
+    local fmt = "%." .. sensor_dec(name) .. "f"
+    local field = SENSOR_VALUE_FIELD[name]
+    return function()
+        local v
+        if field then v = wgt.values[field] end
+        if v == nil then
+            local cache = wgt.values.user_sensors
+            v = cache and cache[name]
+        end
+        if v == nil then return "-" end
+        return string.format(fmt, v)
+    end
+end
+
+-- Reactive low/high text for a sensor slot: EdgeTX keeps a per-sensor session
+-- min/max, addressable by appending "-" / "+" to the name (e.g. Tesc-, Tesc+) — we
+-- cache both at 5 Hz (update_user_sensors) and format them as "min .. max" here.
+-- VOLT_AUTO is synthetic (smart cell/battery voltage) → reuse its own min/max getters.
+local function sensor_minmax_text(wgt, name)
+    if name == VOLT_AUTO then
+        local lo = wgt.values.display_voltage_min_formatted
+        local hi = wgt.values.display_voltage_max_formatted
+        return function() return (lo and lo() or "-") .. " .. " .. (hi and hi() or "-") end
+    end
+    local fmt = "%." .. sensor_dec(name) .. "f"
+    return function()
+        local mn = wgt.values.user_sensors_min
+        local mx = wgt.values.user_sensors_max
+        local lo = mn and mn[name]
+        local hi = mx and mx[name]
+        return (lo and string.format(fmt, lo) or "-") .. " .. " .. (hi and string.format(fmt, hi) or "-")
+    end
+end
+
+-- a wide sample string for font sizing, by decimals
+local function sensor_test_text(name)
+    local d = sensor_dec(name)
+    if d <= 0 then return "9999" end
+    if d == 1 then return "999.9" end
+    return "99.99"
+end
+
+-- 5 Hz pass: refresh the cache of user-selected sensor values. A nil reading (no
+-- telemetry) KEEPS the last value, so the panel/detail stay populated while
+-- configuring with no craft connected.
+--
+-- COST DISCIPLINE: every getSourceValue is a sensor-name lookup, and piling them on
+-- the 5 Hz pass starves the Lua scheduler enough to make fullscreen taps laggy (same
+-- lesson as the 5 Hz throttle itself). So the EdgeTX session min/max ("-"/"+" reads)
+-- are fetched ONLY while the telemetry detail page is actually open — on the
+-- dashboard this stays as cheap as before (just the non-mapped panel/detail values).
+local function update_user_sensors(wgt)
+    local o = wgt.options
+    if o == nil then return end
+    local v = wgt.values
+    local cache = v.user_sensors; if cache == nil then cache = {}; v.user_sensors = cache end
+    -- main values: mapped sensors already live in wgt.values.* (latched /
+    -- plausibility-filtered / simulator demo); others read the raw EdgeTX source
+    local function pull_val(name)
+        if is_off_sensor(name) or name == VOLT_AUTO or SENSOR_VALUE_FIELD[name] then return end
+        local ok, val = pcall(getSourceValue, name)
+        if ok and val ~= nil then cache[name] = val end
+    end
+    for i = 1, #PANEL_SLOT_KEYS  do pull_val(o[PANEL_SLOT_KEYS[i]])  end
+    for i = 1, #DETAIL_SLOT_KEYS do pull_val(o[DETAIL_SLOT_KEYS[i]]) end
+
+    -- low/high: only needed by the open telemetry detail page, and only for its slots
+    if wgt.detail_view == "telem" then
+        local cmin = v.user_sensors_min; if cmin == nil then cmin = {}; v.user_sensors_min = cmin end
+        local cmax = v.user_sensors_max; if cmax == nil then cmax = {}; v.user_sensors_max = cmax end
+        for i = 1, #DETAIL_SLOT_KEYS do
+            local name = o[DETAIL_SLOT_KEYS[i]]
+            if not is_off_sensor(name) and name ~= VOLT_AUTO then
+                local okn, vmin = pcall(getSourceValue, name .. "-")
+                if okn and vmin ~= nil then cmin[name] = vmin end
+                local okx, vmax = pcall(getSourceValue, name .. "+")
+                if okx and vmax ~= nil then cmax[name] = vmax end
+            end
+        end
+    end
+end
+
 --- Build the left flight panel with live telemetry values.
 local function build_flight_values_panel(container, wgt, x, y, c_w, c_h)
     local padding = compact_card_padding
@@ -339,18 +572,31 @@ local function build_flight_values_panel(container, wgt, x, y, c_w, c_h)
     local label_w = math.floor(c_w * 0.55)
     local value_x = padding + label_w
     local value_w = c_w - value_x - padding
-    local rows = {
-        {
-            title = wgt.values.display_voltage_label_short,
-            value = wgt.values.display_voltage_formatted,
-            test = wgt.values.display_voltage_test(),
-            color = wgt.values.display_voltage_color
-        },
-        { title = wgt.values.label_headspeed,       value = wgt.values.headspeed_formatted, test = "2999",  color = COLOR_THEME_PRIMARY1 },
-        { title = wgt.values.label_current,         value = wgt.values.curr_formatted,      test = "999.9", color = COLOR_THEME_PRIMARY1 },
-        { title = wgt.values.label_esc_temp,        value = wgt.values.esc_temp_formatted,  test = "120.0", color = COLOR_THEME_PRIMARY1 },
-        { title = wgt.values.label_bec_voltage,     value = wgt.values.vbec_formatted,      test = "99.99", color = COLOR_THEME_PRIMARY1 }
-    }
+    -- 5 configurable slots (Settings ▸ Values). Defaults reproduce the original
+    -- panel: smart voltage, headspeed, current, ESC temp, BEC. VOLT_AUTO keeps the
+    -- cell/battery toggle + warn colour; a plain sensor uses the cheap cache getter;
+    -- an Off slot renders blank.
+    local rows = {}
+    for i = 1, 5 do
+        local name = wgt.options[PANEL_SLOT_KEYS[i]] or SENSOR_OFF
+        if name == VOLT_AUTO then
+            rows[i] = {
+                title = wgt.values.display_voltage_label_short,
+                value = wgt.values.display_voltage_formatted,
+                test  = wgt.values.display_voltage_test(),
+                color = wgt.values.display_voltage_color
+            }
+        elseif is_off_sensor(name) then
+            rows[i] = { title = "", value = "", test = "9999", color = COLOR_THEME_PRIMARY1 }
+        else
+            rows[i] = {
+                title = sensor_short_label(name),
+                value = sensor_value_text(wgt, name),
+                test  = sensor_test_text(name),
+                color = COLOR_THEME_PRIMARY1
+            }
+        end
+    end
     local value_font = pick_smallest_font(
         select_font(row_h - 2, value_w, rows[1].test),
         select_font(row_h - 2, value_w, rows[2].test),
@@ -604,6 +850,12 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
     local rate_font_h = measure_font(rate_font)
     local battp_font = select_font(h_grid - header_h, third_last_w, "9999")
     local battp_font_h = measure_font(battp_font)
+    -- battery-profile column header: prefer "B-Profile"; on the narrow TX15 third
+    -- column it would clip, so fall back to the shorter "B-Prof" when it doesn't fit
+    local battp_label = wgt.values.label_battery_profile_short
+    if lcd.sizeText(battp_label, header_font) > third_last_w then
+        battp_label = wgt.values.label_battery_profile_shorter
+    end
     local grid_value_h = math.max(profile_font_h, rate_font_h, battp_font_h)
     local grid_pad = math.max(0, math.floor((h_grid - header_h - grid_value_h) / 2))
 
@@ -674,7 +926,10 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
     add_stacked_field(status_children, pad + third_w, y_grid, third_w, grid_pad,
         wgt.values.label_rate, wgt.values.rate_id_formatted, rate_font, rate_font_h)
     add_stacked_field(status_children, pad + 2 * third_w, y_grid, third_last_w, grid_pad,
-        wgt.values.label_battery_profile_short, wgt.values.rf_battery_profile_compact_formatted, battp_font, battp_font_h)
+        battp_label, wgt.values.rf_battery_profile_compact_formatted, battp_font, battp_font_h)
+    -- the battery-profile field is a tap target (DISARMED only): opens the profile
+    -- picker, which switches the active profile via the RFTool MSP API
+    wgt.battprofile_rect = { x = x + pad + 2 * third_w, y = y + y_grid, w = third_last_w, h = h_grid }
 
     build_card_element(container, x, y, c_w, c_h, status_children)
 
@@ -1221,12 +1476,12 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         local bar_w = math.max(8, math.min(2 * half, math.floor(c_w * 0.40)))
         local center_x = mid - math.floor(bar_w / 2)
 
-        local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
+        local TRACK   = COLOR_TRACK
         local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
         local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
         local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
         local C_NEUT  = lcd.RGB(0x4A, 0x4A, 0x4A)   -- quiet-mode "all fine" fill
-        local TICK    = lcd.RGB(0x90, 0x90, 0x90)
+        local TICK    = COLOR_DIM
         local quiet   = wgt.options.BarsQuiet == 1
         local rq_warn = wgt.options.RQlyWarn or 50
         local rq_crit = wgt.options.RQlyCrit or 30
@@ -1413,11 +1668,11 @@ local function build_elrs_view(wgt, zone, as_detail)
     local w = zone.w
     local h = zone.h
 
-    local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
+    local TRACK   = COLOR_TRACK
     local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
     local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
     local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
-    local TICK    = lcd.RGB(0x20, 0x20, 0x20)
+    local TICK    = COLOR_TICK
 
     local shared = ultidash_functions.get_shared()
     local shared_th = shared.thresholds
@@ -1592,7 +1847,7 @@ local function build_estatus_view(wgt, zone)
     -- neutral grey for hints/trace/timestamps — deliberately NOT the theme's
     -- DISABLED color (the Clean palette maps that to orange-red, which made the
     -- "no events yet" hint look like an error)
-    local C_DIM = lcd.RGB(0x90, 0x90, 0x90)
+    local C_DIM = COLOR_DIM
 
     -- summary: arm state / governor / throttle — governor gets the widest column
     -- ("Throttle off" wrapped into the status line below with equal thirds)
@@ -1680,12 +1935,12 @@ end
 local function build_battery_view(wgt, zone)
     local w = zone.w
     local h = zone.h
-    local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)
+    local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)   -- battery graphic empty segs (fixed identity)
     local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
     local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
     local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
-    local C_DIM   = lcd.RGB(0x90, 0x90, 0x90)
-    local TICK    = lcd.RGB(0x20, 0x20, 0x20)
+    local C_DIM   = COLOR_DIM
+    local TICK    = COLOR_TICK
 
     local title_font = h >= 170 and DBLSIZE or MIDSIZE
     local row_font   = h >= 170 and MIDSIZE or 0
@@ -1728,11 +1983,11 @@ local function build_battery_view(wgt, zone)
     panel:label({ x = rx, y = sy, w = rw, h = sml_h + 2, text = "Cell voltage", font = SMLSIZE, color = C_DIM, align = LEFT })
     local by = sy + sml_h + 4
     panel:build({
-        { type = "rectangle", x = rx, y = by, w = bar_w, h = bar_h, filled = true, rounded = 3, color = TRACK },
+        { type = "rectangle", x = rx, y = by, w = bar_w, h = bar_h, filled = true, rounded = 3, color = COLOR_TRACK },
         { type = "rectangle", x = rx + 1, y = by + 1, w = 1, h = bar_h - 2, filled = true, rounded = 2,
           color = function()
               local v = wgt.values.vcel
-              if v == nil then return TRACK end
+              if v == nil then return COLOR_TRACK end
               if v <= th_crit() then return C_RED end
               if v <= th_low() then return C_YELL end
               return C_GREEN
@@ -1847,6 +2102,116 @@ local function build_battery_view(wgt, zone)
         font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
 end
 
+--- Build the "Telemetry" detail page (opened by tapping the right value panel):
+--- a 3-column grid of up to 12 freely chosen sensors (Settings ▸ Values). Off
+--- slots are skipped; each cell shows the value plus the EdgeTX session low/high
+--- ("min .. max", read from the sensor's "-"/"+" variants). Same look / tap-to-close
+--- behaviour as the other detail pages.
+local function build_telem_view(wgt, zone)
+    local w = zone.w
+    local h = zone.h
+    local title_font = h >= 170 and DBLSIZE or MIDSIZE
+    local _, title_h = lcd.sizeText("Telemetry", title_font)
+
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
+        filled = (ultidash_functions.get_shared().bg_filled == true) })
+    panel:label({ x = 10, y = 4, text = "Telemetry", font = title_font, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE,
+        color = COLOR_THEME_DISABLED, align = RIGHT })
+    local top = 4 + title_h + 4
+    panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+
+    -- collect active (non-off) slots in order
+    local slots = {}
+    for i = 1, #DETAIL_SLOT_KEYS do
+        local name = wgt.options[DETAIL_SLOT_KEYS[i]]
+        if not is_off_sensor(name) then slots[#slots + 1] = name end
+    end
+    if #slots == 0 then
+        panel:label({ x = 0, y = math.floor(h / 2) - 12, w = w, h = 24,
+            text = "No values selected  (Settings > Values)", font = MIDSIZE,
+            color = COLOR_THEME_DISABLED, align = CENTER })
+        return
+    end
+
+    -- 3-column grid on both radios. Each tile shows the value (right-aligned) + unit
+    -- and the EdgeTX session low/high as a soft "min .. max" chip beneath it. The
+    -- label placement adapts to the tile width: wide tiles (TX16S) put the label to
+    -- the LEFT of the value; narrow tiles (TX15) put it on TOP (Value2 widget style),
+    -- so the value still gets the full width and stays large.
+    local cols   = 3
+    local rows_n = math.ceil(#slots / cols)
+    local pad    = 12
+    local grid_y = top + 6
+    local grid_h = h - grid_y - 6
+    local cell_w = math.floor((w - pad * (cols + 1)) / cols)
+    local cell_h = math.floor(grid_h / rows_n)
+    local _, lbl_h = lcd.sizeText("Ag", SMLSIZE)
+    local mm_h = lbl_h
+
+    local wide     = cell_w >= 190          -- room for a label column beside the value
+    local lbl_w    = wide and math.floor(cell_w * 0.40) or 0
+    local va_x_off = lbl_w                  -- value area starts after the side label
+    local va_w     = cell_w - lbl_w
+    local lbl_top_h = wide and 0 or (lbl_h + 1)   -- height the top label consumes
+    -- value font sized once (uniform), leaving headroom for the widest unit
+    local val_font = select_font(cell_h - mm_h - lbl_top_h - 8, va_w - 30, "99.99")
+    local val_h    = measure_font(val_font)
+    local block_h  = lbl_top_h + val_h + 2 + mm_h
+    -- low/high chip: a soft rounded pill sized to a worst-case range string
+    local chip_w   = math.min(va_w, lcd.sizeText("999.9 .. 999.9", SMLSIZE) + 12)
+    local chip_r   = math.floor((mm_h + 2) / 2)
+
+    for idx = 1, #slots do
+        local name = slots[idx]
+        local c = (idx - 1) % cols
+        local r = math.floor((idx - 1) / cols)
+        local cx = pad + c * (cell_w + pad)
+        local cy = grid_y + r * cell_h + math.max(0, math.floor((cell_h - block_h) / 2))
+
+        local unit = sensor_unit(name)
+        local unit_w = (unit ~= "") and (lcd.sizeText(unit, SMLSIZE) + 3) or 0
+        local va_x = cx + va_x_off
+        local unit_x = va_x + va_w - unit_w           -- unit at the value area's right edge
+        local val_x = va_x
+        local val_w = (unit ~= "") and (unit_x - 2 - val_x) or va_w
+        local val_top = cy + lbl_top_h                -- value sits below the top label (if any)
+
+        -- label: left of the value (wide) or on top spanning the tile (narrow)
+        if wide then
+            panel:label({ x = cx, y = val_top + math.floor((val_h - lbl_h) / 2), w = lbl_w - 4, h = lbl_h + 2,
+                text = sensor_short_label(name), font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = LEFT })
+        else
+            panel:label({ x = cx, y = cy, w = cell_w, h = lbl_h + 2,
+                text = sensor_short_label(name), font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = LEFT })
+        end
+        -- value: big, right-aligned (leaves room for the unit to its right)
+        if name == VOLT_AUTO then
+            panel:label({ x = val_x, y = val_top, w = val_w, h = val_h + 2,
+                text = wgt.values.display_voltage_formatted, font = val_font,
+                color = wgt.values.display_voltage_color, align = RIGHT })
+        else
+            panel:label({ x = val_x, y = val_top, w = val_w, h = val_h + 2,
+                text = sensor_value_text(wgt, name), font = val_font,
+                color = COLOR_THEME_PRIMARY1, align = RIGHT })
+        end
+        -- unit: small, sitting on the big value's baseline at the value area's right edge
+        if unit ~= "" then
+            panel:label({ x = unit_x, y = val_top + (val_h - lbl_h), w = unit_w, h = lbl_h + 2,
+                text = unit, font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = LEFT })
+        end
+        -- low/high chip under the value, right-aligned within the value area
+        local chip_x = va_x + va_w - chip_w
+        local chip_y = val_top + val_h + 2
+        panel:build({
+            { type = "rectangle", x = chip_x, y = chip_y, w = chip_w, h = mm_h + 2,
+              filled = true, rounded = chip_r, color = COLOR_TRACK },
+            { type = "label", x = chip_x, y = chip_y, w = chip_w, h = mm_h + 2,
+              text = sensor_minmax_text(wgt, name), font = SMLSIZE, color = COLOR_TICK, align = CENTER },
+        })
+    end
+end
+
 --- Build the status/config view (ViewMode = "Status info", passive instance).
 --- Shows the ACTIVE configuration of the Dashboard instance — read exclusively from
 --- the Shared snapshot it publishes (resolved cell thresholds incl. the MSP-fetched
@@ -1936,7 +2301,7 @@ local function build_status_view(wgt, zone, as_page)
                 return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB     UI " .. (wgt.dbg_hz or "-")
                     .. " Hz     pass " .. ((wgt.dbg_pass_cs or 0) * 10) .. " ms"
             end,
-            font = SMLSIZE, color = lcd.RGB(0x90, 0x90, 0x90), align = LEFT })
+            font = SMLSIZE, color = COLOR_DIM, align = LEFT })
         return
     end
 
@@ -2075,8 +2440,39 @@ local function build_switch_list()
     return labels, codes
 end
 
+-- Configurable telemetry value slots, split into two settings groups:
+--   "Tele Main"    = the 5 rows of the dashboard's right-hand value panel
+--   "Tele Details" = the 12 cells of the tap-to-open Telemetry detail page
+-- kind="sensor" stores the EdgeTX sensor NAME (string). Defaults reproduce the
+-- original panel; the detail page defaults to a sensible battery/ESC set.
+-- VOLT_AUTO = the smart cell/battery voltage (warn colour).
+local SETTINGS_TELE_MAIN = {
+    { key = "PanelV1", lbl = "Panel 1 (top)", kind = "sensor", def = VOLT_AUTO },
+    { key = "PanelV2", lbl = "Panel 2",       kind = "sensor", def = "Hspd" },
+    { key = "PanelV3", lbl = "Panel 3",       kind = "sensor", def = "Curr" },
+    { key = "PanelV4", lbl = "Panel 4",       kind = "sensor", def = "Tesc" },
+    { key = "PanelV5", lbl = "Panel 5 (btm)", kind = "sensor", def = "Vbec" },
+}
+
+local SETTINGS_TELE_DETAIL = {
+    { key = "DetV1",   lbl = "Detail 1",      kind = "sensor", def = "Vbat" },
+    { key = "DetV2",   lbl = "Detail 2",      kind = "sensor", def = "Vcel" },
+    { key = "DetV3",   lbl = "Detail 3",      kind = "sensor", def = "Curr" },
+    { key = "DetV4",   lbl = "Detail 4",      kind = "sensor", def = "Capa" },
+    { key = "DetV5",   lbl = "Detail 5",      kind = "sensor", def = "Bat%" },
+    { key = "DetV6",   lbl = "Detail 6",      kind = "sensor", def = "Tesc" },
+    { key = "DetV7",   lbl = "Detail 7",      kind = "sensor", def = "Vbec" },
+    { key = "DetV8",   lbl = "Detail 8",      kind = "sensor", def = "Hspd" },
+    { key = "DetV9",   lbl = "Detail 9",      kind = "sensor", def = SENSOR_OFF },
+    { key = "DetV10",  lbl = "Detail 10",     kind = "sensor", def = SENSOR_OFF },
+    { key = "DetV11",  lbl = "Detail 11",     kind = "sensor", def = SENSOR_OFF },
+    { key = "DetV12",  lbl = "Detail 12",     kind = "sensor", def = SENSOR_OFF },
+}
+
 local SETTINGS_GROUPS = {
     { name = "Display",      items = SETTINGS_DISPLAY },
+    { name = "Tele Main",    items = SETTINGS_TELE_MAIN },
+    { name = "Tele Details", items = SETTINGS_TELE_DETAIL },
     { name = "Battery",      items = SETTINGS_BATTERY },
     { name = "Thresholds",   items = SETTINGS_THRESHOLDS },
     { name = "Alerts",       items = SETTINGS_ALERTS },
@@ -2111,16 +2507,16 @@ local function save_pending_settings(wgt)
     wgt.settings_working = nil
 end
 
---- Close the settings page back to the menu (autosaves).
+--- Close the settings page back to the settings submenu (autosaves).
 local function close_settings(wgt)
     save_pending_settings(wgt)
-    wgt.menu_view = "menu"
+    wgt.menu_view = "settings_menu"
     init_view_state(wgt).dirty = true
 end
 
 --- Build the settings page (lvgl.page scrolls; its back arrow catches RTN, the
---- unfocused-RTN case is handled in refresh). One page per group, navigated with
---- the page's prev/next arrows. Rows = name label + REACTIVE value label + plain
+--- unfocused-RTN case is handled in refresh). One group per page, opened by name
+--- from the menu's group list (back returns there). Rows = name label + REACTIVE value label + plain
 --- buttons (no toggle/slider — documented one-time-script-only): bools/choices
 --- cycle with [>], numbers use [-]/[+] (long press = big step). Presses only
 --- mutate the working copy — the reactive labels update by themselves, so the
@@ -2140,24 +2536,21 @@ local function build_settings_view(wgt, zone)
     local working = wgt.settings_working
 
     wgt.settings_group = wgt.settings_group or 1
-    local gi = wgt.settings_group
-    local grp = SETTINGS_GROUPS[gi]
+    local grp = SETTINGS_GROUPS[wgt.settings_group]
 
-    local function switch_group(delta)
-        wgt.settings_group = ((wgt.settings_group - 1 + delta) % #SETTINGS_GROUPS) + 1
-        init_view_state(wgt).dirty = true   -- rebuild with the new group (edits persist in working)
-    end
-
+    -- one group per page, opened by name from the menu's group list (no blind ‹ ›
+    -- tab cycling); the back arrow / RTN returns to that list and autosaves.
     local pg = lvgl.page({
-        title = "UltiDash settings",
-        subtitle = grp.name .. "  (" .. gi .. "/" .. #SETTINGS_GROUPS .. ")",
+        title = grp.name,
+        subtitle = "UltiDash settings",
         back = function() close_settings(wgt) end,
-        prevButton = { press = function() switch_group(-1) end },
-        nextButton = { press = function() switch_group(1) end },
     })
 
     local w = zone.w
     local sw_labels, sw_codes = build_switch_list()
+    -- sensor pick list (Off + smart-voltage + model sensors + chosen) built once
+    -- per page build and shared by every kind="sensor" row
+    local se_labels, se_codes = build_sensor_list(wgt)
     -- row height adapts to the screen: EdgeTX toggle switches are ~40 px tall on
     -- the 800x480 TX16S and overlapped each other in 38 px rows
     local row_h = (zone.h >= 300) and 50 or 38
@@ -2165,6 +2558,13 @@ local function build_settings_view(wgt, zone)
     local btn_w = 40
     local val_w = 120
     local right = w - 20            -- keep clear of the scrollbar
+    -- picker boxes (choice / sensor / switch) only need to fit one text line; at
+    -- full row height they looked oversized/chunky. Size to the ACTUAL font height
+    -- (device-correct — this radio reports 480x320, so a height-based "big" guess
+    -- was wrong) plus a little padding, and center them vertically in the row.
+    local _, dd_txt_h = lcd.sizeText("Ag", 0)
+    local field_h = math.min(row_h - 4, dd_txt_h + 8)
+    local function field_y(ry) return ry + math.floor((row_h - field_h) / 2) end
     local elems = {}
 
     for i = 1, #grp.items do
@@ -2177,6 +2577,7 @@ local function build_settings_view(wgt, zone)
             local v = working[it.key]
             if it.kind == "bool" then return (v == 1) and "On" or "Off" end
             if it.kind == "choice" then return it.vals[v or 1] or "?" end
+            if it.kind == "sensor" then return sensor_pick_label(v) end
             if it.kind == "switch" then
                 for ci = 1, #sw_codes do
                     if sw_codes[ci] == (v or 1) then return sw_labels[ci] end
@@ -2238,17 +2639,48 @@ local function build_settings_view(wgt, zone)
             elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
                                   text = it.lbl, color = COLOR_THEME_PRIMARY1 }
             local oks = pcall(function()
-                pg:choice({ x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                pg:choice({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
                     title = it.lbl, values = sw_labels,
                     get = cur_index,
                     set = function(ci) working[it.key] = sw_codes[ci] or 1 end })
             end)
             if not oks then
-                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
                                       text = value_text,
                                       press = function()
                                           local ci = cur_index() % #sw_codes + 1
                                           working[it.key] = sw_codes[ci]
+                                      end }
+            end
+        elseif it.kind == "sensor" then
+            -- sensor picker: dropdown of Off + smart-voltage + the model's real
+            -- sensors; selection stored as the sensor NAME (string code). Wider on the
+            -- TX15 — the value names ("Headspeed (Hspd)") need room, and at 150 px the
+            -- box looked cramped against the long label
+            local cyc_w = (w < 600) and math.floor(w * 0.44) or 170
+            local cap = math.floor(w * 0.5)
+            if cyc_w > cap then cyc_w = cap end
+            local function cur_index()
+                local v = working[it.key] or SENSOR_OFF
+                for ci = 1, #se_codes do
+                    if se_codes[ci] == v then return ci end
+                end
+                return 1
+            end
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
+                                  text = it.lbl, color = COLOR_THEME_PRIMARY1 }
+            local oks = pcall(function()
+                pg:choice({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
+                    title = it.lbl, values = se_labels,
+                    get = cur_index,
+                    set = function(ci) working[it.key] = se_codes[ci] or SENSOR_OFF end })
+            end)
+            if not oks then
+                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
+                                      text = value_text,
+                                      press = function()
+                                          local ci = cur_index() % #se_codes + 1
+                                          working[it.key] = se_codes[ci]
                                       end }
             end
         else
@@ -2264,13 +2696,13 @@ local function build_settings_view(wgt, zone)
             elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
                                   text = it.lbl, color = COLOR_THEME_PRIMARY1 }
             local okc = pcall(function()
-                pg:choice({ x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                pg:choice({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
                     title = it.lbl, values = it.vals,
                     get = function() return working[it.key] or 1 end,
                     set = function(i) working[it.key] = i end })
             end)
             if not okc then
-                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = ry, w = cyc_w, h = row_h - 6,
+                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
                                       text = value_text,
                                       press = function() working[it.key] = ((working[it.key] or 1) % #it.vals) + 1 end }
             end
@@ -2279,8 +2711,39 @@ local function build_settings_view(wgt, zone)
     pg:build(elems)
 end
 
+-- Lay out menu buttons as a centered multi-column grid (RF2-Lua look) instead of
+-- single full-width buttons, which looked "stretched" on the wide 800x480 TX16S.
+-- The block is horizontally centered; cols/optional max width keep the buttons a
+-- sensible size on both radios. Vertically centered within the page content area.
+local function build_menu_grid(pg, w, h, items, cols, max_btn_w)
+    local big = h >= 300
+    local gap = big and math.max(10, math.floor(h * 0.02)) or 6
+    local row_h = big and math.max(44, math.floor(h * 0.12)) or 36
+    local btn_font = big and MIDSIZE or 0   -- 0 = STDSIZE (default)
+    local side = math.max(16, math.floor(w * 0.05))
+    local btn_w = math.floor((w - 2 * side - (cols - 1) * gap) / cols)
+    if max_btn_w and btn_w > max_btn_w then btn_w = max_btn_w end
+    local grid_w = cols * btn_w + (cols - 1) * gap
+    local x0 = math.floor((w - grid_w) / 2)
+    local rows = math.ceil(#items / cols)
+    local grid_h = rows * row_h + (rows - 1) * gap
+    -- page header (title + subtitle) eats the top of the zone; center in what's left
+    local header_px = big and 56 or 40
+    local y0 = math.max(big and 10 or 6, math.floor((h - header_px - grid_h) / 2))
+    local elems = {}
+    for i = 1, #items do
+        local c = (i - 1) % cols
+        local r = math.floor((i - 1) / cols)
+        elems[#elems + 1] = { type = "button",
+            x = x0 + c * (btn_w + gap), y = y0 + r * (row_h + gap),
+            w = btn_w, h = row_h, text = items[i].txt, font = btn_font, press = items[i].act }
+    end
+    pg:build(elems)
+end
+
 --- Entry menu shown when tapping the fullscreen menu glyph — a general hub in
---- front of the settings (room for more entries later). Back/RTN = dashboard.
+--- front of the settings. The configuration groups live one level deeper, under
+--- "Settings" (build_settings_menu_view). Back/RTN = dashboard.
 local function build_menu_view(wgt, zone)
     local pg = lvgl.page({
         title = "UltiDash",
@@ -2290,11 +2753,41 @@ local function build_menu_view(wgt, zone)
             init_view_state(wgt).dirty = true
         end,
     })
-    local w = zone.w
 
     local function open(view)
         return function()
             wgt.menu_view = view
+            init_view_state(wgt).dirty = true
+        end
+    end
+
+    -- single column, capped width so the buttons aren't stretched across the 800 px
+    -- TX16S; the group list opens under "Settings"
+    build_menu_grid(pg, zone.w, zone.h, {
+        { txt = "Settings", act = open("settings_menu") },
+        { txt = "Status",   act = open("status") },
+    }, 1, (zone.h >= 300) and 460 or nil)
+end
+
+--- Settings submenu: the configuration groups (Display / Values / ... ) plus the
+--- reset action, laid out as a 2-column grid (RF2-Lua look). Opened from the main
+--- menu's "Settings" entry; back/RTN returns there.
+local function build_settings_menu_view(wgt, zone)
+    local pg = lvgl.page({
+        title = "UltiDash",
+        subtitle = "Settings",
+        back = function()
+            wgt.menu_view = "menu"
+            init_view_state(wgt).dirty = true
+        end,
+    })
+
+    -- one button per settings group: direct, named entry (opens that group's page;
+    -- its back arrow returns here)
+    local function open_group(gi)
+        return function()
+            wgt.settings_group = gi
+            wgt.menu_view = "settings"
             init_view_state(wgt).dirty = true
         end
     end
@@ -2317,15 +2810,63 @@ local function build_menu_view(wgt, zone)
         if not ok then do_reset() end
     end
 
-    local entries = {
-        { txt = "Settings",                   act = open("settings") },
-        { txt = "Status",                     act = open("status") },
-        { txt = "Reset settings to defaults", act = reset_defaults },
-    }
+    local items = {}
+    for gi = 1, #SETTINGS_GROUPS do
+        items[#items + 1] = { txt = SETTINGS_GROUPS[gi].name, act = open_group(gi) }
+    end
+    items[#items + 1] = { txt = "Reset to defaults", act = reset_defaults }
+    build_menu_grid(pg, zone.w, zone.h, items, 2)
+end
+
+--- Battery-profile picker — opened by tapping the B-Profile field (DISARMED only).
+--- Lists the 6 battery profiles with their per-profile capacity (when the FC reports
+--- it) and switches the active one through the RFTool MSP API (write MSP 176, persist
+--- without reboot, then re-read). Read-side stays as-is; this is the one place the
+--- widget WRITES to the FC, and only when disarmed. Back/RTN returns to the dashboard.
+local function build_battprofile_view(wgt, zone)
+    local pg = lvgl.page({
+        title = "Battery profile",
+        subtitle = "select active profile",
+        back = function()
+            wgt.menu_view = nil
+            init_view_state(wgt).dirty = true
+        end,
+    })
+    local w, h = zone.w, zone.h
+    -- always-fresh active index (0-based; -1 / nil = unknown) — refreshed by the
+    -- on-open MSP read so it reflects the FC's real current profile
+    local active = wgt.values.rf_battery_profile_active
+
+    -- 2-column grid of 6 tall buttons; each button is TWO lines — "Profile N" on top
+    -- and its capacity below ("1800 mAh", or "undefined" when the profile has none).
+    -- Two lines keep the capacity from clipping (single line overflowed the button).
+    local cols, gap = 2, 10
+    local _, fh = lcd.sizeText("Ag", 0)            -- STDSIZE line height (device-correct)
+    local row_h = 2 * fh + 18                       -- room for two lines + padding
+    local side = math.max(16, math.floor(w * 0.05))
+    local btn_w = math.floor((w - 2 * side - (cols - 1) * gap) / cols)
+    local grid_w = cols * btn_w + (cols - 1) * gap
+    local x0 = math.floor((w - grid_w) / 2)
+    local rows = 3
+    local grid_h = rows * row_h + (rows - 1) * gap
+    local header_px = (h >= 300) and 56 or 40       -- page header eats the top
+    local y0 = math.max((h >= 300) and 10 or 6, math.floor((h - header_px - grid_h) / 2))
+
     local elems = {}
-    for i = 1, #entries do
-        elems[#elems + 1] = { type = "button", x = 20, y = (i - 1) * 50 + 8, w = w - 56, h = 42,
-                              text = entries[i].txt, press = entries[i].act }
+    for i = 0, 5 do
+        local c = i % cols
+        local r = math.floor(i / cols)
+        local cap = rf_service.get_profile_capacity(wgt, i)
+        local line1 = (active == i and "> " or "") .. "Profile " .. (i + 1)
+        local line2 = (cap and cap > 0) and (cap .. " mAh") or "undefined"
+        elems[#elems + 1] = { type = "button",
+            x = x0 + c * (btn_w + gap), y = y0 + r * (row_h + gap),
+            w = btn_w, h = row_h, font = 0, text = line1 .. "\n" .. line2,
+            press = function()
+                rf_service.set_battery_profile(wgt, i)
+                wgt.menu_view = nil
+                init_view_state(wgt).dirty = true
+            end }
     end
     pg:build(elems)
 end
@@ -2371,6 +2912,8 @@ local function build_flight_ui(wgt, zone)
     -- tapping the gauge (fullscreen) opens the battery detail page
     wgt.battery_rect = { x = x_fuel, y = y_content, w = w_fuel, h = content_h }
     build_flight_values_panel(main_panel, wgt, x_right, y_content, w_right, content_h)
+    -- tapping the values panel (fullscreen) opens the Telemetry detail page
+    wgt.values_rect = { x = x_right, y = y_content, w = w_right, h = content_h }
 
     main_panel:hline({ y = y_status - 1, w = w - 3, h = 1, color = COLOR_THEME_SECONDARY1 })
 
@@ -2516,6 +3059,8 @@ local function update(wgt, options)
     wgt.elrs_bar_rect = nil
     wgt.settings_icon_rect = nil
     wgt.battery_rect = nil
+    wgt.values_rect = nil
+    wgt.battprofile_rect = nil
 
     -- dispatch by ViewMode: Dashboard keeps the flight/stats switching; the passive
     -- modes render their dedicated single view (no stats page, no status bar).
@@ -2525,6 +3070,12 @@ local function update(wgt, options)
         build_status_view(wgt, wgt.zone)
     elseif wgt.menu_view == "settings" then
         build_settings_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "settings_menu" then
+        -- settings submenu: the configuration groups (one level under the hub)
+        build_settings_menu_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "battprofile" then
+        -- battery-profile picker (opened by tapping the B-Profile field, disarmed)
+        build_battprofile_view(wgt, wgt.zone)
     elseif wgt.menu_view == "status" then
         build_status_view(wgt, wgt.zone, true)
     elseif wgt.menu_view == "menu" then
@@ -2539,6 +3090,9 @@ local function update(wgt, options)
     elseif wgt.detail_view == "battery" and init_view_state(wgt).current == "flight" then
         -- battery detail page (opened by tapping the center fuel gauge)
         build_battery_view(wgt, wgt.zone)
+    elseif wgt.detail_view == "telem" and init_view_state(wgt).current == "flight" then
+        -- telemetry detail page (opened by tapping the right value panel)
+        build_telem_view(wgt, wgt.zone)
     elseif init_view_state(wgt).current == "flight" then
         build_flight_ui(wgt, wgt.zone)
     else
@@ -2641,12 +3195,12 @@ local function refresh(wgt, event, touch_state)
     end
     if fs and wgt.menu_view ~= nil and EVT_VIRTUAL_EXIT ~= nil and event == EVT_VIRTUAL_EXIT then
         if wgt.menu_view == "settings" then
-            close_settings(wgt)                   -- autosave, back to the menu
-        elseif wgt.menu_view == "status" then
-            wgt.menu_view = "menu"
+            close_settings(wgt)                   -- autosave, back to the settings submenu
+        elseif wgt.menu_view == "settings_menu" or wgt.menu_view == "status" then
+            wgt.menu_view = "menu"                -- submenu -> hub
             init_view_state(wgt).dirty = true
         else
-            wgt.menu_view = nil                   -- menu -> dashboard
+            wgt.menu_view = nil                   -- hub -> dashboard
             init_view_state(wgt).dirty = true
         end
     end
@@ -2689,6 +3243,17 @@ local function refresh(wgt, event, touch_state)
                 wgt.elrs_tap_block = now + 100
                 wgt.stats_dismissed = true
                 init_view_state(wgt).dirty = true
+            elseif rect_hit(touch_state, wgt.battprofile_rect, 6)
+                and not ultidash_functions.is_armed(wgt)
+                and wgt.rf and wgt.rf.msp_allowed then
+                -- battery-profile picker: switches the active profile via RFTool MSP
+                -- (a config WRITE → DISARMED ONLY; the FC also blocks writes while armed)
+                wgt.elrs_tap_block = now + 100
+                -- read the current profile/config fresh on open (disarmed, so MSP is
+                -- allowed) — otherwise the picker shows a value cached at connect time
+                rf_service.refresh_data(wgt)
+                wgt.menu_view = "battprofile"
+                init_view_state(wgt).dirty = true
             elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.elrs_bar_rect, 10) then
                 wgt.elrs_tap_block = now + 100   -- long: any tap closes, see above
                 wgt.detail_view = "elrs"
@@ -2700,6 +3265,10 @@ local function refresh(wgt, event, touch_state)
             elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.battery_rect, 6) then
                 wgt.elrs_tap_block = now + 100
                 wgt.detail_view = "battery"
+                init_view_state(wgt).dirty = true
+            elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.values_rect, 6) then
+                wgt.elrs_tap_block = now + 100
+                wgt.detail_view = "telem"
                 init_view_state(wgt).dirty = true
             end
         end
@@ -2739,6 +3308,7 @@ local function refresh(wgt, event, touch_state)
         -- the interaction snappy regardless.
         local pass_t0 = getTime() or 0
         ultidash_functions.refresh(wgt)
+        update_user_sensors(wgt)
         ultidash_functions.publish_shared(wgt)
         wgt.dbg_pass_cs = (getTime() or 0) - pass_t0
         -- cache the armed state for reactive closures (they run per LVGL frame;
@@ -2762,6 +3332,13 @@ local function refresh(wgt, event, touch_state)
                 init_view_state(wgt).dirty = true
             end
         end
+    end
+    -- a completed MSP read updates wgt.values.* (e.g. the battery-profile picker's
+    -- on-open refresh); rebuild an open menu page so it reflects the fresh data. The
+    -- dashboard itself is reactive and needs no rebuild.
+    if wgt.rf_data_dirty then
+        wgt.rf_data_dirty = false
+        if wgt.menu_view ~= nil then init_view_state(wgt).dirty = true end
     end
     sync_view_for_telemetry(wgt)
     if init_view_state(wgt).dirty == true then

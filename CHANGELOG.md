@@ -2,6 +2,56 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.3 — 2026-06-26
+
+Feature release on top of v0.2. **Experimental — still under testing in the field.**
+
+### Added
+- **Configurable value slots.** The 5 right-hand dashboard values **and** the Telemetry
+  detail page are now freely assignable to any model sensor, configured in
+  **Settings ▸ Tele Main** (the panel) and **Tele Details** (the detail page). A smart
+  **Voltage (auto)** slot keeps the warn-colored cell/battery voltage.
+- **Telemetry detail page** (tap the right value panel): a **3-column grid of up to 12**
+  freely chosen sensors, each with its **unit** and the EdgeTX session **low/high
+  (`min .. max`)** read from the sensor's `-`/`+` variants — uniform for *every* sensor
+  (the per-flight/per-profile statistics on the stats page are unchanged). Tap-to-close
+  like the other detail pages.
+- **Battery-profile picker** (tap the **B-Profile** field, **disarmed only**): pick from
+  the 6 Rotorflight battery profiles with their per-profile capacity ("1800 mAh" /
+  "undefined") and switch the **active** profile through the RFTool MSP API, persisting
+  **without an FC reboot**. This is the **first place the widget writes to the FC** —
+  disarmed only (the FC also blocks config writes while armed); everything else stays
+  read/announce-only.
+- **Per-sensor units** on the Telemetry detail (V, A, °C, mAh, %, rpm, dB, mW).
+
+### Changed
+- **Settings menu restructured:** the configuration groups moved one level down under a
+  **Settings** submenu; the hub and submenu now use a centered button **grid** (named
+  entries instead of ‹ › tab-cycling — and no more stretched full-width buttons on the
+  800×480 TX16S).
+- The **"Values" group is split** into **Tele Main** (5 panel slots) and **Tele Details**
+  (now **12** detail slots).
+- **Settings dropdowns flattened** (sized to the font height, not the full row); the
+  sensor picker is **wider** on the TX15.
+- **Battery-profile field label** `B. Profile` → `B-Profile` (falls back to `B-Prof` when
+  the column is too narrow).
+- Neutral UI chrome made **theme-aware** for consistent colors across the UltiDash and
+  EdgeTX-theme palettes; the menu hub scales to the display size.
+
+### Fixed
+- **Battery-profile capacity off by one:** the dashboard B-Profile field showed the
+  *previous* profile's mAh for profiles 2–6 (`sync_active_battery_capacity` applied a
+  spurious −1 while the picker was already correct). It now indexes the 0-based capacity
+  table directly and follows the FC's current profile.
+- **Active-profile detection** is re-read fresh when the picker opens (disarmed) instead
+  of a value cached at connect — it now tracks external profile switches.
+- **Divide-by-zero guard** in the TX-battery percentage when the radio's General-Settings
+  battery limits (`battMin`/`battMax`) are equal.
+
+### Notes
+- The **EdgeTX-theme color scheme is not the maintainer's personal focus** and relies on
+  community feedback — the built-in **UltiDash** palette is the primary, best-tested path.
+
 ## v0.2 — 2026-06-11
 
 A large feature release. **Experimental — still under testing in the field.**

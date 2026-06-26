@@ -15,7 +15,8 @@
 --
 -- Files: /WIDGETS/UltiDash/cfg_m_<slot>.cfg (per model slot, default)
 --        /WIDGETS/UltiDash/cfg_<model name>.cfg (per craft, optional / legacy)
--- Plain "key=value" lines (all values are integers). Kept in the widget folder on
+-- Plain "key=value" lines (values are integers, or strings e.g. sensor names).
+-- Kept in the widget folder on
 -- purpose: EdgeTX Lua has no mkdir.
 --
 -- HARDENING (learned on hardware): ONLY function-style string calls — method style
@@ -93,8 +94,16 @@ local function read_table(path)
     io.close(f)
     if not data or data == "" then return nil end
     local t = {}
-    for k, v in string.gmatch(data, "([%w_]+)%s*=%s*(%-?%d+)") do
-        t[k] = tonumber(v)
+    -- values may be integers (legacy) OR strings (e.g. telemetry sensor names like
+    -- "Hspd", "Bat%", "~volt"). Capture the rest of the line, trim trailing space,
+    -- and keep it numeric only when it looks like a plain integer.
+    for k, v in string.gmatch(data, "([%w_]+)%s*=%s*([^\r\n]+)") do
+        v = string.gsub(v, "%s+$", "")
+        if string.match(v, "^%-?%d+$") then
+            t[k] = tonumber(v)
+        else
+            t[k] = v
+        end
     end
     return t
 end
@@ -164,7 +173,7 @@ end
 function M.save(values)
     local t = M.load() or {}
     for k, v in pairs(values) do
-        if k ~= "ViewMode" and type(v) == "number" then t[k] = v end
+        if k ~= "ViewMode" and (type(v) == "number" or type(v) == "string") then t[k] = v end
     end
     per_craft = t.CfgPerCraft == 1
     local ok, written = pcall(function()

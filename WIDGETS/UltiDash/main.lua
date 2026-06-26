@@ -1,7 +1,7 @@
 --[[
 #########################################################################
 #                                                                       #
-#  UltiDash v0.2 - Rotorflight LVGL dashboard widget for EdgeTX         #
+#  UltiDash v0.3 - Rotorflight LVGL dashboard widget for EdgeTX         #
 #  Tested on RadioMaster TX15 and TX16S MK3 (EdgeTX 2.12).              #
 #                                                                       #
 #  License: GPLv3 or later (http://www.gnu.org/licenses/gpl-3.0.html).  #
@@ -58,7 +58,7 @@
 ]]
 
 local app_name = "UltiDash"
-local app_ver = "0.2"
+local app_ver = "0.3"
 local widg_dir = "/WIDGETS/UltiDash/"
 
 local ultidash = nil

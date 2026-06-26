@@ -24,16 +24,18 @@ end
 
 local function sync_active_battery_capacity(wgt)
     local config = ensure_rf_state(wgt).battery_config
-    local profile_value = wgt.values.rf_battery_profile
+    -- prefer the always-fresh active index (follows external profile switches);
+    -- fall back to the seeded one. `x or y` keeps a legit 0 (0 is truthy in Lua).
+    local profile_value = wgt.values.rf_battery_profile_active or wgt.values.rf_battery_profile
     local capacity_value = nil
 
     if config and config.batteryCapacity then
         if type(config.batteryCapacity) == "table" and profile_value ~= nil and profile_value >= 0 then
-            if profile_value > 0 and config.batteryCapacity[profile_value - 1] then
-                capacity_value = config.batteryCapacity[profile_value - 1].value
-            elseif config.batteryCapacity[profile_value] then
-                capacity_value = config.batteryCapacity[profile_value].value
-            end
+            -- batteryCapacity is a 0-based [0..5] table indexed DIRECTLY by the
+            -- 0-based profile value (value 0 = profile 1) — NO -1 offset (matches
+            -- mspBatteryConfig and get_profile_capacity; the old -1 was off by one).
+            local entry = config.batteryCapacity[profile_value]
+            if entry then capacity_value = entry.value end
         elseif config.batteryCapacity.value ~= nil then
             capacity_value = config.batteryCapacity.value
         end
@@ -47,6 +49,10 @@ local function on_battery_profile_received(wgt, config)
     if wgt.values.rf_battery_profile == nil or wgt.values.rf_battery_profile < 0 then
         wgt.values.rf_battery_profile = config and config.batteryProfile and config.batteryProfile.value or -1
     end
+    -- ALWAYS-fresh active profile index (0-based), no freeze — the battery-profile
+    -- picker reads this so it reflects the FC's real current profile every time it is
+    -- (re)read, e.g. on the picker's on-open refresh.
+    wgt.values.rf_battery_profile_active = config and config.batteryProfile and config.batteryProfile.value
     sync_active_battery_capacity(wgt)
 
     wgt.rf_data_dirty = true
@@ -165,6 +171,63 @@ function M.background(wgt, on_telemetry_state_changed)
     end
 end
 
+--- Switch the ACTIVE battery profile via the RFTool MSP API.
+--- Writes MSP 176 (MSP_SET_BATTERY_PROFILE, the same call the RFTool's own
+--- batSwitcher uses), then persists WITHOUT an FC reboot via
+--- rf2.settingsSaved(true, false) — the no-reboot path (cf. rotorflight-lua-scripts
+--- commit 4fbe4b9, which flipped the battery page's reboot flag true→false). Finally
+--- re-reads so the dashboard reflects the new profile's capacity/thresholds.
+--- DISARMED ONLY (msp_allowed gate); the FC also rejects config writes while armed.
+--- index is 0-based (0..5 = profile 1..6). Returns true if the write was queued.
+local function set_battery_profile(wgt, index)
+    if not rf2 or not rf2.useApi then return false end
+    if type(index) ~= "number" or index < 0 or index > 5 then return false end
+    local state = ensure_rf_state(wgt)
+    if not state.msp_allowed then return false end
+
+    local ok = pcall(function()
+        rf2.useApi("mspBatteryProfile").write({ batteryProfile = { value = index } })
+    end)
+    if not ok then return false end
+
+    -- persist to eeprom, NO reboot (second arg = reboot flag). pcall'd: a failure
+    -- here still leaves the profile switched live, just not saved across a power cycle.
+    pcall(function()
+        if type(rf2.settingsSaved) == "function" then rf2.settingsSaved(true, false) end
+    end)
+
+    wgt.values.rf_battery_profile = index
+    wgt.values.rf_battery_profile_active = index
+    read_rf_data(wgt)     -- queued AFTER the write/save → returns the new profile state
+    wgt.rf_data_dirty = true
+    return true
+end
+
+--- Request a fresh MSP read of the battery profile/config/stats (DISARMED ONLY).
+--- Used to refresh the battery-profile picker when it opens, so it shows the FC's
+--- real current profile instead of a value cached at connect time.
+local function refresh_data(wgt)
+    local state = ensure_rf_state(wgt)
+    if not state.msp_allowed then return false end
+    read_rf_data(wgt)
+    return true
+end
+
+--- Capacity (mAh) of a battery profile (0-based index) if the FC reports per-profile
+--- capacities (MSP API >= 12.09: battery_config.batteryCapacity is a [0..5] table);
+--- nil otherwise (older API exposes only the active profile's single value).
+local function get_profile_capacity(wgt, index)
+    local cfg = ensure_rf_state(wgt).battery_config
+    local bc = cfg and cfg.batteryCapacity
+    if type(bc) ~= "table" then return nil end
+    local entry = bc[index]
+    if type(entry) == "table" and entry.value then return entry.value end
+    return nil
+end
+
 M.sync_active_battery_capacity = sync_active_battery_capacity
+M.set_battery_profile = set_battery_profile
+M.get_profile_capacity = get_profile_capacity
+M.refresh_data = refresh_data
 
 return M

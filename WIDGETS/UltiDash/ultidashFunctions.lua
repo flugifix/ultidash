@@ -597,15 +597,24 @@ function ultidash_functions.update_tx_bat_voltage(wgt)
         return
     end
 
+    -- guard the integer floor-division: if the radio's General-Settings battery
+    -- limits are equal/invalid (battMax <= battMin), the span is 0 and `//` would
+    -- raise "attempt to perform 'n//0'" and crash the refresh pass.
+    local vtx_span = wgt.values.vtx_volts_max - wgt.values.vtx_volts_min
+    if vtx_span <= 0 then
+        wgt.values.vtx_volts_percent = 100
+        wgt.values.vtx_volts_color = COLOR_THEME_PRIMARY1
+        wgt.values.vtx_low = false
+        return
+    end
+
     wgt.values.vtx_volts_percent = math.floor(100 -
-        (100 * (wgt.values.vtx_volts_max - wgt.values.vtx_volts) //
-            (wgt.values.vtx_volts_max - wgt.values.vtx_volts_min)))
+        (100 * (wgt.values.vtx_volts_max - wgt.values.vtx_volts) // vtx_span))
 
     if wgt.values.vtx_volts_percent > 100 then wgt.values.vtx_volts_percent = 100 end
 
     local warn_percent = math.ceil(100 -
-        (100 * (wgt.values.vtx_volts_max - wgt.values.vtx_volts_warn) //
-            (wgt.values.vtx_volts_max - wgt.values.vtx_volts_min)))
+        (100 * (wgt.values.vtx_volts_max - wgt.values.vtx_volts_warn) // vtx_span))
 
     wgt.values.vtx_low = wgt.values.vtx_volts_percent < warn_percent
     if wgt.values.vtx_low then
