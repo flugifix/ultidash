@@ -122,28 +122,32 @@ lives in an **in-widget settings menu**:
    **Reset settings to defaults**. The menu and the Settings submenu are laid out as a
    button grid; each group opens its own page.
 
-The **Settings** submenu has seven groups:
+The **Settings** submenu has eight groups:
 
 | Group | Covers |
 |-------|--------|
-| **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, detail-page behaviour, quiet bars, per-craft config |
+| **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, detail-page behaviour, quiet bars |
 | **Tele Main** | the 5 right-hand dashboard value slots (pick any sensor, or *Voltage (auto)*) |
 | **Tele Details** | the 12 sensor slots of the Telemetry detail page |
 | **Battery** | reserve %, cell-threshold source (FC config / manual cell voltages), startup cell-check delay |
 | **Thresholds** | callout interval, link (RQly) warn/crit, RSSI warn/crit/hold, power-warn voltage, skipped-packet limit, TPWR bar max |
-| **Alerts** | callout volume + when it applies, master mute, vibration, and a per-event on/off for every announcement |
+| **Alerts** | callout volume + when it applies, **voice language (English / Deutsch)**, master mute, vibration, and a per-event on/off for every announcement |
 | **Switch voice** | announce motor / rescue / governor / profile from a chosen TX switch (physical **or** logical) |
+| **General** | per-craft config, and the **debug log** (off by default) + how many log sessions to keep |
 
-> 🎨 **About the color scheme (Display → Color scheme).** UltiDash is developed and tested
-> against its built-in **UltiDash** palette — that's the path I actually fly. The
-> **EdgeTX theme** option (theme-aware colors) is **not my personal focus**, so it's less
-> tested and I'm dependent on **feedback**: if something looks off under your theme, please
-> open an issue with a screenshot and I'll take a look.
+Each group page also has a **Reset … to defaults** button that resets only that page; the
+menu's *Reset to defaults* resets the whole model.
+
+> 🎨 **About the color scheme (Display → Color scheme).** Three palettes: the built-in
+> **UltiDash** look (the path I actually fly and test), an **EdgeTX theme** option
+> (theme-aware — **not my personal focus**, less tested, feedback welcome), and **UltiDash
+> dark** (high-contrast white-on-black with neon accents). If something looks off under the
+> theme palette, please open an issue with a screenshot.
 
 Edits are **saved automatically** when you leave the page (back arrow or RTN) and stored
 **per model** in `/WIDGETS/UltiDash/cfg_m_<model-slot>.cfg`. The slot keying survives
-Rotorflight's "set model name on TX" renaming. Enable *Config file per craft* to keep a
-separate file per craft flown from the same model slot.
+Rotorflight's "set model name on TX" renaming. Enable *General → Config file per craft* to
+keep a separate file per craft flown from the same model slot.
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full settings list, the layout
 breakdown, the callout matrix, the detail pages and the "what is shown when" tables.

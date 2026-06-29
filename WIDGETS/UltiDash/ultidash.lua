@@ -31,11 +31,27 @@ local CLEAN_PALETTE = {
     lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
     lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
 }
+-- static "UltiDash dark" high-contrast palette (bright text + NEON accents on black).
+-- Slots map the same way as CLEAN/THEME: 1 PRIMARY1, 2 PRIMARY2, 3 SECONDARY1,
+-- 4 SECONDARY2, 5 SECONDARY3, 6 FOCUS, 7 WARNING, 8 DISABLED. Text roles (PRIMARY1,
+-- SECONDARY1) stay near-white for readability; the accents (SECONDARY2 neon green,
+-- FOCUS neon cyan, WARNING neon red, DISABLED neon amber) glow against the black panel.
+local DARK_PALETTE = {
+    lcd.RGB(0xFF, 0xFF, 0xFF), lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0xF0, 0xF4, 0xF8), lcd.RGB(0x39, 0xFF, 0x14),
+    lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0x00, 0xE5, 0xFF), lcd.RGB(0xFF, 0x1A, 0x40), lcd.RGB(0xFF, 0xC4, 0x00),
+}
 
 -- panel background used when BGFilled is on. For the Clean palette this is WHITE to match
 -- the Clean theme's actual wallpaper (which is solid white, not SECONDARY3); for the EdgeTX
--- theme it follows SECONDARY3 as before.
+-- theme it follows SECONDARY3 as before; the dark scheme paints solid black.
 local PANEL_BG = COLOR_THEME_SECONDARY3
+-- The dark scheme needs a solid dark panel to read white text, so it FORCES the
+-- background fill on regardless of the BGFilled option (set by set_palette).
+local force_bg_fill = false
+-- True while the dark scheme is the ACTIVE palette — lets a few call sites pick a
+-- brighter variant (e.g. the link-bar "quiet" fill, which would otherwise sit too
+-- close to the dark track and become invisible).
+local dark_scheme = false
 
 -- Neutral UI chrome (bar/track backgrounds, tick marks, dim labels). Kept as fixed
 -- greys in the UltiDash/Clean look, but DERIVED FROM THE THEME in EdgeTX-theme mode
@@ -45,16 +61,27 @@ local COLOR_TRACK = lcd.RGB(0xC8, 0xC8, 0xC8)   -- empty bar / track background
 local COLOR_TICK  = lcd.RGB(0x20, 0x20, 0x20)   -- strong threshold tick marks
 local COLOR_DIM   = lcd.RGB(0x90, 0x90, 0x90)   -- dim secondary text / light ticks
 
-local function set_palette(use_clean)
-    local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
+-- scheme: 1 = UltiDash (clean/white), 2 = EdgeTX theme, 3 = UltiDash dark (high contrast)
+local function set_palette(scheme)
+    local clean = (scheme == 1)
+    local dark  = (scheme == 3)
+    local p = dark and DARK_PALETTE or (clean and CLEAN_PALETTE or THEME_PALETTE)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
-    PANEL_BG = use_clean and lcd.RGB(0xFF, 0xFF, 0xFF) or THEME_PALETTE[5]
-    if use_clean then
+    force_bg_fill = dark
+    dark_scheme   = dark
+    if dark then
+        PANEL_BG    = lcd.RGB(0x00, 0x00, 0x00)
+        COLOR_TRACK = lcd.RGB(0x28, 0x30, 0x38)   -- dark empty bar/track (lets neon fills pop)
+        COLOR_TICK  = lcd.RGB(0xFF, 0xFF, 0xFF)   -- pure-white tick marks on black
+        COLOR_DIM   = lcd.RGB(0xC0, 0xC8, 0xD0)   -- bright dim text on black
+    elseif clean then
+        PANEL_BG    = lcd.RGB(0xFF, 0xFF, 0xFF)
         COLOR_TRACK = lcd.RGB(0xC8, 0xC8, 0xC8)
         COLOR_TICK  = lcd.RGB(0x20, 0x20, 0x20)
         COLOR_DIM   = lcd.RGB(0x90, 0x90, 0x90)
     else
+        PANEL_BG    = THEME_PALETTE[5]
         COLOR_TRACK = COLOR_THEME_SECONDARY2   -- subtle fill against the theme bg
         COLOR_TICK  = COLOR_THEME_SECONDARY1   -- strong line/mark colour
         COLOR_DIM   = COLOR_THEME_DISABLED     -- greyed/dim text
@@ -199,6 +226,12 @@ end
 
 --- Propagate telemetry state changes to services and update the selected view.
 local function handle_telemetry_state_change(widget, previous_state, new_state)
+    -- diagnostics: log every state transition + flush promptly (no-op unless DebugLog on).
+    -- The disarm/disconnect transition is also where the in-flight buffer reaches the SD.
+    if ultidash_functions.dbg then
+        ultidash_functions.dbg.logf("STATE", "%s -> %s", tostring(previous_state), tostring(new_state))
+        ultidash_functions.dbg.flush(true)
+    end
     ultidash_functions.on_telemetry_state_changed(widget, previous_state, new_state)
     -- Scope ever_armed to THIS connection: on every fresh connect (disconnected -> any
     -- connected state) start a new "session". So the stats page (On disarmed / On
@@ -482,6 +515,10 @@ end
 local function sensor_value_text(wgt, name)
     local fmt = "%." .. sensor_dec(name) .. "f"
     local field = SENSOR_VALUE_FIELD[name]
+    -- memo via closure upvalues: this reactive text runs every render frame but the
+    -- value only changes on the 5 Hz pass, so re-run string.format (allocate) only on
+    -- change. Each panel gets its own closure -> its own private cache, no shared table.
+    local last_v, last_s, primed = nil, "-", false
     return function()
         local v
         if field then v = wgt.values[field] end
@@ -489,8 +526,11 @@ local function sensor_value_text(wgt, name)
             local cache = wgt.values.user_sensors
             v = cache and cache[name]
         end
-        if v == nil then return "-" end
-        return string.format(fmt, v)
+        if primed and v == last_v then return last_s end
+        last_v = v
+        last_s = (v == nil) and "-" or string.format(fmt, v)
+        primed = true
+        return last_s
     end
 end
 
@@ -1477,10 +1517,13 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         local center_x = mid - math.floor(bar_w / 2)
 
         local TRACK   = COLOR_TRACK
-        local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
-        local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
-        local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
-        local C_NEUT  = lcd.RGB(0x4A, 0x4A, 0x4A)   -- quiet-mode "all fine" fill
+        -- dark scheme gets vivid neon green/yellow/red so the bars pop on black
+        local C_GREEN = dark_scheme and lcd.RGB(0x39, 0xFF, 0x14) or lcd.RGB(0x20, 0xB0, 0x20)
+        local C_YELL  = dark_scheme and lcd.RGB(0xFF, 0xE0, 0x00) or lcd.RGB(0xF0, 0xC0, 0x00)
+        local C_RED   = dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
+        -- quiet-mode "all fine" fill. On the dark scheme a 0x4A grey is barely
+        -- brighter than the dark track -> invisible; use a clearly lighter grey there.
+        local C_NEUT  = dark_scheme and lcd.RGB(0xA8, 0xB0, 0xB8) or lcd.RGB(0x4A, 0x4A, 0x4A)
         local TICK    = COLOR_DIM
         local quiet   = wgt.options.BarsQuiet == 1
         local rq_warn = wgt.options.RQlyWarn or 50
@@ -1669,9 +1712,10 @@ local function build_elrs_view(wgt, zone, as_detail)
     local h = zone.h
 
     local TRACK   = COLOR_TRACK
-    local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
-    local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
-    local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
+    -- dark scheme gets vivid neon green/yellow/red so the bars pop on black
+    local C_GREEN = dark_scheme and lcd.RGB(0x39, 0xFF, 0x14) or lcd.RGB(0x20, 0xB0, 0x20)
+    local C_YELL  = dark_scheme and lcd.RGB(0xFF, 0xE0, 0x00) or lcd.RGB(0xF0, 0xC0, 0x00)
+    local C_RED   = dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
     local TICK    = COLOR_TICK
 
     local shared = ultidash_functions.get_shared()
@@ -1693,7 +1737,7 @@ local function build_elrs_view(wgt, zone, as_detail)
     local val_w            = lcd.sizeText("-108dBm", row_font) + 8
     local foot_tw, foot_th = lcd.sizeText("Ag", row_font)
 
-    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (shared.bg_filled == true) })
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = force_bg_fill or (shared.bg_filled == true) })
 
     -- header: title + rate/mode, separated by a line
     panel:label({ x = 10, y = 4, text = "ELRS", font = title_font, color = COLOR_THEME_PRIMARY1 })
@@ -1824,7 +1868,7 @@ end
 local function build_estatus_view(wgt, zone)
     local w = zone.w
     local h = zone.h
-    local C_RED = lcd.RGB(0xE0, 0x30, 0x30)
+    local C_RED = dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
 
     local title_font = h >= 170 and DBLSIZE or MIDSIZE
     local row_font   = h >= 170 and MIDSIZE or 0
@@ -1832,7 +1876,7 @@ local function build_estatus_view(wgt, zone)
     local _, row_th = lcd.sizeText("Ag", row_font)
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
-        filled = (ultidash_functions.get_shared().bg_filled == true) })
+        filled = force_bg_fill or (ultidash_functions.get_shared().bg_filled == true) })
 
     -- header: title + craft name + close hint
     panel:label({ x = 10, y = 4, text = "Status", font = title_font, color = COLOR_THEME_PRIMARY1 })
@@ -1936,9 +1980,10 @@ local function build_battery_view(wgt, zone)
     local w = zone.w
     local h = zone.h
     local TRACK   = lcd.RGB(0xC8, 0xC8, 0xC8)   -- battery graphic empty segs (fixed identity)
-    local C_GREEN = lcd.RGB(0x20, 0xB0, 0x20)
-    local C_YELL  = lcd.RGB(0xF0, 0xC0, 0x00)
-    local C_RED   = lcd.RGB(0xE0, 0x30, 0x30)
+    -- dark scheme gets vivid neon green/yellow/red so the gauge pops on black
+    local C_GREEN = dark_scheme and lcd.RGB(0x39, 0xFF, 0x14) or lcd.RGB(0x20, 0xB0, 0x20)
+    local C_YELL  = dark_scheme and lcd.RGB(0xFF, 0xE0, 0x00) or lcd.RGB(0xF0, 0xC0, 0x00)
+    local C_RED   = dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
     local C_DIM   = COLOR_DIM
     local TICK    = COLOR_TICK
 
@@ -1948,7 +1993,7 @@ local function build_battery_view(wgt, zone)
     local _, row_th = lcd.sizeText("Ag", row_font)
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
-        filled = (ultidash_functions.get_shared().bg_filled == true) })
+        filled = force_bg_fill or (ultidash_functions.get_shared().bg_filled == true) })
 
     panel:label({ x = 10, y = 4, text = "Battery", font = title_font, color = COLOR_THEME_PRIMARY1 })
     panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
@@ -2072,19 +2117,42 @@ local function build_battery_view(wgt, zone)
     -- overlays INSIDE the graphic: cells (left), big percent (center), used/capacity (right)
     local pct_font = select_font(math.floor(bh * 0.50), 220, "100%")
     local pct_h = measure_font(pct_font)
-    panel:label({ x = ix + 8, y = by2 + math.floor((bh - row_th) / 2), w = math.floor(iw * 0.20), h = row_th + 2,
+    -- Translucent rounded "pills" behind the two SMALL in-graphic values (cells + mAh)
+    -- so they stay readable on any segment colour (esp. the dark scheme's neon fills).
+    -- The big percent is large enough to read as plain black text, so it gets NO pill.
+    -- Each pill hugs its CURRENT text (measured at build), capsule-shaped; white text on
+    -- top. Drawn AFTER the segments and BEFORE the labels so the z-order is bg -> text.
+    -- (LVGL geometry is not reactive, so a pill can lag a little if its value grows a lot
+    -- while the page stays open.)
+    local cells_y = by2 + math.floor((bh - row_th) / 2)
+    local pct_y   = by2 + math.floor((bh - pct_h) / 2)
+    local pill_px = math.max(4, math.floor(row_th * 0.35))
+    local pill_py = math.max(2, math.floor(row_th * 0.16))
+    local pill_text = lcd.RGB(0xF8, 0xF8, 0xF8)
+    local cells_tw = lcd.sizeText(wgt.values.gauge_cells_formatted(), row_font)
+    local mah_tw   = lcd.sizeText(wgt.values.gauge_mah_value_formatted() .. " mAh", row_font)
+    local pill_h   = row_th + 2 + 2 * pill_py
+    local function pill_rect(rx, rw)
+        return { type = "rectangle", x = rx, y = cells_y - pill_py, w = rw, h = pill_h, filled = true,
+                 color = BLACK, opacity = 140, rounded = math.floor(pill_h / 2) }
+    end
+    panel:build({
+        pill_rect(ix + 8 - pill_px, cells_tw + 2 * pill_px),
+        pill_rect((ix + iw - 8) - mah_tw - pill_px, mah_tw + 2 * pill_px),
+    })
+    panel:label({ x = ix + 8, y = cells_y, w = math.floor(iw * 0.20), h = row_th + 2,
         text = function() return wgt.values.gauge_cells_formatted() end,
-        font = row_font, color = BLACK, align = LEFT })
-    panel:label({ x = bx, y = by2 + math.floor((bh - pct_h) / 2), w = bw, h = pct_h,
+        font = row_font, color = pill_text, align = LEFT })
+    panel:label({ x = bx, y = pct_y, w = bw, h = pct_h,
         text = function() return wgt.values.gauge_percent_formatted() end,
         font = pct_font, color = BLACK, align = CENTER })
     -- used mAh only, like the dashboard gauge — the profile's TOTAL capacity is
     -- merely informational and "x / total" misreads as usable-until-total (the
     -- reserve model ends earlier)
-    panel:label({ x = ix + iw - math.floor(iw * 0.30) - 8, y = by2 + math.floor((bh - row_th) / 2),
+    panel:label({ x = ix + iw - math.floor(iw * 0.30) - 8, y = cells_y,
         w = math.floor(iw * 0.30), h = row_th + 2,
         text = function() return wgt.values.gauge_mah_value_formatted() .. " mAh" end,
-        font = row_font, color = BLACK, align = RIGHT })
+        font = row_font, color = pill_text, align = RIGHT })
 
     -- bottom line: the remaining numbers in one row
     local byl = h - bottom_h + 2
@@ -2114,7 +2182,7 @@ local function build_telem_view(wgt, zone)
     local _, title_h = lcd.sizeText("Telemetry", title_font)
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
-        filled = (ultidash_functions.get_shared().bg_filled == true) })
+        filled = force_bg_fill or (ultidash_functions.get_shared().bg_filled == true) })
     panel:label({ x = 10, y = 4, text = "Telemetry", font = title_font, color = COLOR_THEME_PRIMARY1 })
     panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE,
         color = COLOR_THEME_DISABLED, align = RIGHT })
@@ -2179,8 +2247,16 @@ local function build_telem_view(wgt, zone)
 
         -- label: left of the value (wide) or on top spanning the tile (narrow)
         if wide then
-            panel:label({ x = cx, y = val_top + math.floor((val_h - lbl_h) / 2), w = lbl_w - 4, h = lbl_h + 2,
-                text = sensor_short_label(name), font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = LEFT })
+            -- long labels ("Energy Used", "BEC Voltage") don't fit the 40% side
+            -- column on one SMLSIZE line → LVGL wraps them. Reserve two lines when
+            -- needed (else the 2nd line clips) and vertically centre against the value.
+            local lbl_text = sensor_short_label(name)
+            local lbl_box_w = lbl_w - 4
+            local lbl_lines = (lcd.sizeText(lbl_text, SMLSIZE) > lbl_box_w) and 2 or 1
+            local lbl_box_h = lbl_lines * lbl_h + 2
+            panel:label({ x = cx, y = val_top + math.floor((val_h - lbl_box_h) / 2),
+                w = lbl_box_w, h = lbl_box_h,
+                text = lbl_text, font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = LEFT })
         else
             panel:label({ x = cx, y = cy, w = cell_w, h = lbl_h + 2,
                 text = sensor_short_label(name), font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = LEFT })
@@ -2307,7 +2383,7 @@ local function build_status_view(wgt, zone, as_page)
 
     local big = h >= 170
     local title_font = big and MIDSIZE or 0
-    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (shared.bg_filled == true) })
+    local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = force_bg_fill or (shared.bg_filled == true) })
 
     local top = big and 30 or 22
     local foot = big and 22 or 16
@@ -2340,22 +2416,21 @@ local function fmt_decivolt(v) return string.format("%.1f V", v / 10) end
 
 local SETTINGS_DISPLAY = {
     { key = "TopLeft",       lbl = "Top-left shows",        kind = "choice", def = 1, vals = { "Model image", "Timer" } },
-    { key = "ClockMode",     lbl = "Top bar clock",         kind = "choice", def = 1, vals = { "Date + time", "Time only" } },
+    { key = "ClockMode",     lbl = "Top bar clock",         kind = "choice", def = 2, vals = { "Date + time", "Time only" } },
     { key = "Timer",         lbl = "Timer (for top-left)",  kind = "num", def = 0, min = 0, max = 2, step = 1, big = 1,
                              fmt = function(v) return "Timer " .. (v + 1) end },
-    { key = "ColorScheme",   lbl = "Color scheme",          kind = "choice", def = 1, vals = { "UltiDash", "EdgeTX theme" } },
-    { key = "BGFilled",      lbl = "Fill background",       kind = "bool", def = 0 },
-    { key = "StatsViewMode", lbl = "Stats page",            kind = "choice", def = 2, vals = { "Never", "On disarmed", "On disconnected" } },
+    { key = "ColorScheme",   lbl = "Color scheme",          kind = "choice", def = 1, vals = { "UltiDash", "EdgeTX theme", "UltiDash dark" } },
+    { key = "BGFilled",      lbl = "Fill background",       kind = "bool", def = 1 },
+    { key = "StatsViewMode", lbl = "Stats page",            kind = "choice", def = 3, vals = { "Never", "On disarmed", "On disconnected" } },
     { key = "VoltageDisplay",lbl = "Voltage shown as",      kind = "choice", def = 1, vals = { "Cell voltage", "Battery voltage" } },
     { key = "ShowRQly",      lbl = "Top bar: RQ bar",       kind = "bool", def = 1 },
     { key = "ShowTQly",      lbl = "Top bar: TQ bar",       kind = "bool", def = 1 },
     { key = "ShowRSSI",      lbl = "Top bar: RSSI bars",    kind = "bool", def = 1 },
-    { key = "ShowTxV",       lbl = "Top bar: TX voltage",   kind = "bool", def = 1 },
+    { key = "ShowTxV",       lbl = "Top bar: TX voltage",   kind = "bool", def = 0 },
     { key = "ShowTPWR",      lbl = "Bottom bar: TPWR",      kind = "bool", def = 1 },
     { key = "ArmClose",      lbl = "Close detail pages on arm", kind = "bool", def = 0 },
     { key = "TapDetails",    lbl = "Tap zones for detail pages", kind = "bool", def = 1 },
-    { key = "BarsQuiet",     lbl = "Quiet link bars (color only on warn)", kind = "bool", def = 0 },
-    { key = "CfgPerCraft",   lbl = "Config file per craft", kind = "bool", def = 0 },
+    { key = "BarsQuiet",     lbl = "Link bars: color only on warning", kind = "bool", def = 1 },
 }
 
 local SETTINGS_BATTERY = {
@@ -2389,6 +2464,7 @@ local SETTINGS_ALERTS = {
                               return tostring(v) .. " / 5"
                           end },
     { key = "VolWhen",    lbl = "Widget volume applies",     kind = "choice", def = 1, vals = { "Always", "Only connected" } },
+    { key = "VoiceLang",  lbl = "Voice language",            kind = "choice", def = 1, vals = { "English", "Deutsch" } },
     { key = "Mute",       lbl = "Mute (master)",             kind = "choice", def = 1, vals = { "None", "All" } },
     { key = "Haptic",     lbl = "Vibrate on critical",       kind = "bool", def = 1 },
     { key = "SndCellChk", lbl = "Sound: startup cell-check", kind = "bool", def = 1 },
@@ -2399,7 +2475,7 @@ local SETTINGS_ALERTS = {
     { key = "SndLink",    lbl = "Sound: link quality",       kind = "bool", def = 1 },
     { key = "SndRssi",    lbl = "Sound: RSSI / signal",      kind = "bool", def = 1 },
     { key = "PwrWarn",    lbl = "Sound: main power lost",    kind = "bool", def = 1 },
-    { key = "SkpWarn",    lbl = "Sound: skipped packets",    kind = "bool", def = 0 },
+    { key = "SkpWarn",    lbl = "Sound: skipped packets",    kind = "bool", def = 1 },
 }
 
 -- Switch voice announcements: pick the physical TX switch per function; "inv"
@@ -2460,13 +2536,20 @@ local SETTINGS_TELE_DETAIL = {
     { key = "DetV3",   lbl = "Detail 3",      kind = "sensor", def = "Curr" },
     { key = "DetV4",   lbl = "Detail 4",      kind = "sensor", def = "Capa" },
     { key = "DetV5",   lbl = "Detail 5",      kind = "sensor", def = "Bat%" },
-    { key = "DetV6",   lbl = "Detail 6",      kind = "sensor", def = "Tesc" },
-    { key = "DetV7",   lbl = "Detail 7",      kind = "sensor", def = "Vbec" },
-    { key = "DetV8",   lbl = "Detail 8",      kind = "sensor", def = "Hspd" },
+    { key = "DetV6",   lbl = "Detail 6",      kind = "sensor", def = SENSOR_OFF },
+    { key = "DetV7",   lbl = "Detail 7",      kind = "sensor", def = SENSOR_OFF },
+    { key = "DetV8",   lbl = "Detail 8",      kind = "sensor", def = SENSOR_OFF },
     { key = "DetV9",   lbl = "Detail 9",      kind = "sensor", def = SENSOR_OFF },
     { key = "DetV10",  lbl = "Detail 10",     kind = "sensor", def = SENSOR_OFF },
     { key = "DetV11",  lbl = "Detail 11",     kind = "sensor", def = SENSOR_OFF },
     { key = "DetV12",  lbl = "Detail 12",     kind = "sensor", def = SENSOR_OFF },
+}
+
+-- General / meta settings (config-file behaviour, diagnostics)
+local SETTINGS_GENERAL = {
+    { key = "CfgPerCraft", lbl = "Config file per craft", kind = "bool", def = 0 },
+    { key = "DebugLog",    lbl = "Debug log to SD card",  kind = "bool", def = 0 },
+    { key = "DebugKeep",   lbl = "Debug log: sessions kept", kind = "num", def = 20, min = 1, max = 50, step = 1, big = 5 },
 }
 
 local SETTINGS_GROUPS = {
@@ -2477,6 +2560,7 @@ local SETTINGS_GROUPS = {
     { name = "Thresholds",   items = SETTINGS_THRESHOLDS },
     { name = "Alerts",       items = SETTINGS_ALERTS },
     { name = "Switch voice", items = SETTINGS_SWITCHES },
+    { name = "General",      items = SETTINGS_GENERAL },
 }
 
 -- defaults derived from the group tables (single source of truth now that the
@@ -2708,6 +2792,27 @@ local function build_settings_view(wgt, zone)
             end
         end
     end
+
+    -- Per-page reset: restores ONLY this group's keys to their defaults (the settings
+    -- menu's "Reset to defaults" wipes the whole model instead). Mutates the working
+    -- copy; the reactive rows/toggles/pickers reflect it at once and the autosave on
+    -- exit persists it. Confirmed via lvgl.confirm when available (plain reset otherwise).
+    local function reset_group()
+        for i = 1, #grp.items do
+            working[grp.items[i].key] = grp.items[i].def
+        end
+    end
+    local reset_y = #grp.items * row_h + 8
+    elems[#elems + 1] = { type = "button", x = 10, y = reset_y, w = math.min(260, w - 20), h = row_h - 6,
+        text = "Reset " .. grp.name .. " to defaults",
+        press = function()
+            local ok = pcall(function()
+                lvgl.confirm({ title = "Reset " .. grp.name,
+                               message = "Reset this page to defaults?",
+                               confirm = reset_group })
+            end)
+            if not ok then reset_group() end
+        end }
     pg:build(elems)
 end
 
@@ -2900,7 +3005,7 @@ local function build_flight_ui(wgt, zone)
     wgt.status_bar_elements = nil
     wgt.status_bar_state = nil
 
-    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (wgt.options.BGFilled == 1) })
+    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = force_bg_fill or (wgt.options.BGFilled == 1) })
 
     -- top bar (date/time + radio battery)
     local top_bar_box = main_panel:box({ x = 0, y = outer_pad, w = w - 4, h = top_box_h })
@@ -2981,7 +3086,7 @@ local function build_stats_ui(wgt, zone)
     wgt.status_bar_elements = nil
     wgt.status_bar_state = nil
 
-    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = (wgt.options.BGFilled == 1) })
+    local main_panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = force_bg_fill or (wgt.options.BGFilled == 1) })
 
     -- top bar (date/time + radio battery); no RQ/TQ on the stats page
     local top_bar_box = main_panel:box({ x = 0, y = 1, w = w - 4, h = top_box_h })
@@ -3017,6 +3122,11 @@ local function update(wgt, options)
     -- overlay the per-model settings file onto the EdgeTX options (file wins for
     -- saved keys; no file = pure EdgeTX behavior). ViewMode is never overridden.
     ultidash_settings.apply(wgt)
+    -- diagnostics: drive the optional file logger from the per-model DebugLog option.
+    -- Publisher only (it owns telemetry/state logging); no-op without ultidashDebug.lua.
+    if is_publisher(wgt) and ultidash_functions.dbg then
+        ultidash_functions.dbg.set_enabled(wgt.options.DebugLog == 1, wgt.options.DebugKeep)
+    end
     -- One-time migration: when no per-model file exists yet, snapshot the current
     -- effective option values into it. Only the Dashboard placement does this (its
     -- options carry the user's tuning; passive instances may sit at defaults).
@@ -3038,14 +3148,20 @@ local function update(wgt, options)
     -- apply the chosen color palette to all modules before (re)building the UI.
     -- Passive views inherit the DASHBOARD's published scheme ("the main widget is
     -- the boss"); their own ColorScheme option only matters while no Dashboard runs.
-    local scheme = options.ColorScheme or 1   -- 1 = Clean (default), 2 = EdgeTX theme
+    local scheme = options.ColorScheme or 1   -- 1 = UltiDash, 2 = EdgeTX theme, 3 = dark
     if mode ~= VIEW_MODE_DASHBOARD and ultidash_functions.shared_alive() then
         scheme = ultidash_functions.get_shared().color_scheme or scheme
     end
-    local use_clean = scheme == 1
-    set_palette(use_clean)
-    ultidash_functions.set_palette(use_clean)
-    ultidash_values.set_palette(use_clean)
+    -- The in-widget menu / settings pages are native lvgl.page objects: their chrome
+    -- (background, scrollbar) follows the EdgeTX theme, which we cannot repaint. On the
+    -- dark scheme our white label text would sit on that light page and be unreadable,
+    -- so render those native-page views with the EdgeTX-theme palette instead. The
+    -- dashboard and the detail pages (our own dark panels) keep the dark scheme.
+    local render_scheme = scheme
+    if scheme == 3 and wgt.menu_view ~= nil then render_scheme = 2 end
+    set_palette(render_scheme)
+    ultidash_functions.set_palette(render_scheme)
+    ultidash_values.set_palette(render_scheme)
 
     lvgl.clear()
     -- everything lvgl is gone now — drop the cached element references so nothing
@@ -3314,6 +3430,8 @@ local function refresh(wgt, event, touch_state)
         -- cache the armed state for reactive closures (they run per LVGL frame;
         -- calling is_armed there would be a sensor name-lookup at ~20 Hz)
         wgt.armed_now = ultidash_functions.is_armed(wgt)
+        -- diagnostics: perf snapshot + buffered SD flush (no-op unless DebugLog is on)
+        if ultidash_functions.dbg then ultidash_functions.dbg.tick(wgt) end
         if wgt.armed_now then
             -- arming starts a fresh stats episode (manual dismiss forgotten)
             wgt.stats_dismissed = false

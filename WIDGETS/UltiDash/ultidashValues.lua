@@ -17,9 +17,14 @@ local CLEAN_PALETTE = {
     lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
     lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
 }
+local DARK_PALETTE = {
+    lcd.RGB(0xFF, 0xFF, 0xFF), lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0xF0, 0xF4, 0xF8), lcd.RGB(0x39, 0xFF, 0x14),
+    lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0x00, 0xE5, 0xFF), lcd.RGB(0xFF, 0x1A, 0x40), lcd.RGB(0xFF, 0xC4, 0x00),
+}
 
-function M.set_palette(use_clean)
-    local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
+-- scheme: 1 = UltiDash (clean), 2 = EdgeTX theme, 3 = UltiDash dark (high contrast)
+function M.set_palette(scheme)
+    local p = (scheme == 3) and DARK_PALETTE or ((scheme == 1) and CLEAN_PALETTE or THEME_PALETTE)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
 end
@@ -114,43 +119,47 @@ local function get_display_voltage_color_for_value(wgt, voltage)
     return COLOR_THEME_PRIMARY1
 end
 
+-- Built ONCE at module load: this is read on the status-bar hot path (every frame
+-- while arming is disabled), and rebuilding the whole table per call churned the GC.
+local ARM_DISABLE_FLAG_NAMES = {
+    [0] = "No Gyro",
+    [1] = "Fail Safe",
+    [2] = "RX Fail Safe",
+    [3] = "Bad RX Recovery",
+    [4] = "Box Fail Safe",
+    [5] = "Governor",
+    [6] = "RPM Signal",
+    [7] = "Throttle",
+    [8] = "Angle",
+    [9] = "Boot Grace Time",
+    [10] = "No Pre Arm",
+    [11] = "Load",
+    [12] = "Calibrating",
+    [13] = "CLI",
+    [14] = "CMS Menu",
+    [15] = "BST",
+    [16] = "MSP",
+    [17] = "Paralyze",
+    [18] = "GPS",
+    [19] = "Resc",
+    [20] = "RPM Filter",
+    [21] = "Reboot Required",
+    [22] = "DSHOT Bitbang",
+    [23] = "Acc Calibration",
+    [24] = "Motor Protocol"
+}
+
 local function get_arming_disable_flag_names()
-    local flag_names = {
-        [0] = "No Gyro",
-        [1] = "Fail Safe",
-        [2] = "RX Fail Safe",
-        [3] = "Bad RX Recovery",
-        [4] = "Box Fail Safe",
-        [5] = "Governor",
-        [6] = "RPM Signal",
-        [7] = "Throttle",
-        [8] = "Angle",
-        [9] = "Boot Grace Time",
-        [10] = "No Pre Arm",
-        [11] = "Load",
-        [12] = "Calibrating",
-        [13] = "CLI",
-        [14] = "CMS Menu",
-        [15] = "BST",
-        [16] = "MSP",
-        [17] = "Paralyze",
-        [18] = "GPS",
-        [19] = "Resc",
-        [20] = "RPM Filter",
-        [21] = "Reboot Required",
-        [22] = "DSHOT Bitbang",
-        [23] = "Acc Calibration",
-        [24] = "Motor Protocol"
-    }
-
+    -- the last two indices depend on the FC API version; set them on the cached table
+    -- (cheap, no allocation) instead of rebuilding the whole 27-entry table each call
     if rf2 and rf2.apiVersion and rf2.apiVersion >= 12.09 then
-        flag_names[25] = "Override"
-        flag_names[26] = "Arm Switch"
+        ARM_DISABLE_FLAG_NAMES[25] = "Override"
+        ARM_DISABLE_FLAG_NAMES[26] = "Arm Switch"
     else
-        flag_names[25] = "Arm Switch"
+        ARM_DISABLE_FLAG_NAMES[25] = "Arm Switch"
+        ARM_DISABLE_FLAG_NAMES[26] = nil
     end
-
-    return flag_names
+    return ARM_DISABLE_FLAG_NAMES
 end
 
 local function get_arming_disable_flags_list(flags)
@@ -169,8 +178,20 @@ local function get_arming_disable_flags_list(flags)
     return result
 end
 
+-- Cache the resolved list per raw flags value: BOTH the status-bar visibility check
+-- AND the cycling text getter ask for it every frame, but arm_disable_flags only
+-- changes on the 5 Hz telemetry pass — so recompute (and allocate) only on change.
+local function arm_disable_flags_list_cached(wgt)
+    local flags = wgt.values.arm_disable_flags
+    local c = wgt.arm_flags_cache
+    if c and c.flags == flags then return c.list end
+    local list = get_arming_disable_flags_list(flags)
+    wgt.arm_flags_cache = { flags = flags, list = list }
+    return list
+end
+
 local function get_current_arm_disable_flag(wgt)
-    local flags = get_arming_disable_flags_list(wgt.values.arm_disable_flags)
+    local flags = arm_disable_flags_list_cached(wgt)
     if not flags then
         wgt.flag_cycle_time = nil
         wgt.flag_cycle_index = 0
@@ -187,6 +208,27 @@ local function get_current_arm_disable_flag(wgt)
     end
 
     return flags[wgt.flag_cycle_index + 1]
+end
+
+-- ---------------------------------------------------------------------------
+-- Reactive-getter memoisation. The *_formatted getters below are bound as LVGL
+-- label texts and run EVERY render frame, but the underlying telemetry only changes
+-- on the 5 Hz pass. sfmt() re-runs string.format (the allocation) ONLY when the
+-- value actually changed, else it returns the cached string — so a steady display
+-- produces ~zero per-frame garbage. `pattern`/`nilstr` MUST be string literals
+-- (interned, not allocated per call); never pass a freshly built string or a
+-- per-call closure here, that would defeat the purpose. Cache lives on wgt (per
+-- instance), keyed by value, so it is always correct across rebuilds.
+-- ---------------------------------------------------------------------------
+local function sfmt(wgt, slot, v, pattern, nilstr)
+    local cache = wgt.fmt_cache
+    if cache == nil then cache = {}; wgt.fmt_cache = cache end
+    local e = cache[slot]
+    if e ~= nil and e.v == v then return e.s end
+    local s
+    if v == nil then s = nilstr or "-" else s = string.format(pattern, v) end
+    if e ~= nil then e.v = v; e.s = s else cache[slot] = { v = v, s = s } end
+    return s
 end
 
 function M.createValues(wgt)
@@ -240,24 +282,11 @@ function M.createValues(wgt)
         -- by update_elrs in the 5 Hz pass (skp_raw, elrs_rq/tq/tpwr).
         skp_formatted = function()
             local v = wgt.values.skp_raw
-            if v == nil then return "-" end
-            return string.format("%d", math.floor(v))
+            return sfmt(wgt, "skp", v ~= nil and math.floor(v) or nil, "%d")
         end,
-        rqly_cur_formatted = function()
-            local v = wgt.values.elrs_rq
-            if v == nil then return "-" end
-            return string.format("%d%%", v)
-        end,
-        tqly_cur_formatted = function()
-            local v = wgt.values.elrs_tq
-            if v == nil then return "-" end
-            return string.format("%d%%", v)
-        end,
-        tpwr_cur_formatted = function()
-            local v = wgt.values.elrs_tpwr
-            if v == nil then return "-" end
-            return string.format("%dmW", v)
-        end,
+        rqly_cur_formatted = function() return sfmt(wgt, "rqly_cur", wgt.values.elrs_rq, "%d%%") end,
+        tqly_cur_formatted = function() return sfmt(wgt, "tqly_cur", wgt.values.elrs_tq, "%d%%") end,
+        tpwr_cur_formatted = function() return sfmt(wgt, "tpwr_cur", wgt.values.elrs_tpwr, "%dmW") end,
 
         -- ELRS link info (filled by ultidash_functions.update_elrs; slice 1)
         elrs_rfmd = nil,
@@ -274,74 +303,34 @@ function M.createValues(wgt)
         elrs_rate_formatted = function()
             return wgt.values.elrs_rate_str or "-"
         end,
-        elrs_rq_formatted = function()
-            return wgt.values.elrs_rq and string.format("%d%%", wgt.values.elrs_rq) or "-"
-        end,
-        elrs_tq_formatted = function()
-            return wgt.values.elrs_tq and string.format("%d%%", wgt.values.elrs_tq) or "-"
-        end,
-        elrs_rssi1_formatted = function()
-            return wgt.values.elrs_r1_dbm and string.format("%ddBm", wgt.values.elrs_r1_dbm) or "-"
-        end,
-        elrs_rssi2_formatted = function()
-            return wgt.values.elrs_r2_dbm and string.format("%ddBm", wgt.values.elrs_r2_dbm) or "-"
-        end,
-        elrs_snr_formatted = function()
-            return wgt.values.elrs_snr and string.format("%ddB", wgt.values.elrs_snr) or "-"
-        end,
+        elrs_rq_formatted = function() return sfmt(wgt, "elrs_rq", wgt.values.elrs_rq, "%d%%") end,
+        elrs_tq_formatted = function() return sfmt(wgt, "elrs_tq", wgt.values.elrs_tq, "%d%%") end,
+        elrs_rssi1_formatted = function() return sfmt(wgt, "elrs_r1", wgt.values.elrs_r1_dbm, "%ddBm") end,
+        elrs_rssi2_formatted = function() return sfmt(wgt, "elrs_r2", wgt.values.elrs_r2_dbm, "%ddBm") end,
+        elrs_snr_formatted = function() return sfmt(wgt, "elrs_snr", wgt.values.elrs_snr, "%ddB") end,
 
         headspeed = nil,
         headspeed_min = nil,
         headspeed_max = nil,
-        headspeed_formatted = function()
-            if wgt.values.headspeed == nil then return "-" end
-            return string.format("%.0f", wgt.values.headspeed)
-        end,
-        headspeed_min_formatted = function()
-            if wgt.values.headspeed_min == nil then return "-" end
-            return string.format("%.0f", wgt.values.headspeed_min)
-        end,
-        headspeed_max_formatted = function()
-            if wgt.values.headspeed_max == nil then return "-" end
-            return string.format("%.0f", wgt.values.headspeed_max)
-        end,
+        headspeed_formatted = function() return sfmt(wgt, "headspeed", wgt.values.headspeed, "%.0f") end,
+        headspeed_min_formatted = function() return sfmt(wgt, "headspeed_min", wgt.values.headspeed_min, "%.0f") end,
+        headspeed_max_formatted = function() return sfmt(wgt, "headspeed_max", wgt.values.headspeed_max, "%.0f") end,
 
         vbat = nil,
         vbat_min = nil,
         vbat_max = nil,
-        vbat_formatted = function()
-            if wgt.values.vbat == nil then return "-" end
-            return string.format("%.02f", wgt.values.vbat)
-        end,
-        vbat_min_formatted = function()
-            if wgt.values.vbat_min == nil then return "-" end
-            return string.format("%.02f", wgt.values.vbat_min)
-        end,
-        vbat_max_formatted = function()
-            if wgt.values.vbat_max == nil then return "-" end
-            return string.format("%.02f", wgt.values.vbat_max)
-        end,
+        vbat_formatted = function() return sfmt(wgt, "vbat", wgt.values.vbat, "%.02f") end,
+        vbat_min_formatted = function() return sfmt(wgt, "vbat_min", wgt.values.vbat_min, "%.02f") end,
+        vbat_max_formatted = function() return sfmt(wgt, "vbat_max", wgt.values.vbat_max, "%.02f") end,
 
         vcel = nil,
         vcel_min = nil,
         vcel_max = nil,
         cel_count = nil,
-        vcel_formatted = function()
-            if wgt.values.vcel == nil then return "-" end
-            return string.format("%.02f", wgt.values.vcel)
-        end,
-        vcel_min_formatted = function()
-            if wgt.values.vcel_min == nil then return "-" end
-            return string.format("%.02f", wgt.values.vcel_min)
-        end,
-        vcel_max_formatted = function()
-            if wgt.values.vcel_max == nil then return "-" end
-            return string.format("%.02f", wgt.values.vcel_max)
-        end,
-        cel_count_formatted = function()
-            if wgt.values.cel_count == nil then return "" end
-            return string.format("(%dS)", wgt.values.cel_count)
-        end,
+        vcel_formatted = function() return sfmt(wgt, "vcel", wgt.values.vcel, "%.02f") end,
+        vcel_min_formatted = function() return sfmt(wgt, "vcel_min", wgt.values.vcel_min, "%.02f") end,
+        vcel_max_formatted = function() return sfmt(wgt, "vcel_max", wgt.values.vcel_max, "%.02f") end,
+        cel_count_formatted = function() return sfmt(wgt, "cel_count", wgt.values.cel_count, "(%dS)", "") end,
         vcel_warning_threshold = function()
             return get_cell_warning_threshold(wgt)
         end,
@@ -417,18 +406,9 @@ function M.createValues(wgt)
         curr = nil,
         curr_min = nil,
         curr_max = nil,
-        curr_min_formatted = function()
-            if wgt.values.curr_min == nil then return "-" end
-            return string.format("%.01f", wgt.values.curr_min)
-        end,
-        curr_formatted = function()
-            if wgt.values.curr == nil then return "-" end
-            return string.format("%.01f", wgt.values.curr)
-        end,
-        curr_max_formatted = function()
-            if wgt.values.curr_max == nil then return "-" end
-            return string.format("%.01f", wgt.values.curr_max)
-        end,
+        curr_min_formatted = function() return sfmt(wgt, "curr_min", wgt.values.curr_min, "%.01f") end,
+        curr_formatted = function() return sfmt(wgt, "curr", wgt.values.curr, "%.01f") end,
+        curr_max_formatted = function() return sfmt(wgt, "curr_max", wgt.values.curr_max, "%.01f") end,
 
         capa = nil,
         capa_percent = nil,
@@ -436,14 +416,8 @@ function M.createValues(wgt)
         capa_bar_color = COLOR_THEME_PRIMARY1,
         batt_checking = false,
         batt_check_progress = 0,
-        capa_formatted = function()
-            if wgt.values.capa == nil then return "-" end
-            return string.format("%.0f", wgt.values.capa)
-        end,
-        capa_percent_formatted = function()
-            if wgt.values.capa_percent == nil then return "-" end
-            return string.format("%.0f%%", wgt.values.capa_percent)
-        end,
+        capa_formatted = function() return sfmt(wgt, "capa", wgt.values.capa, "%.0f") end,
+        capa_percent_formatted = function() return sfmt(wgt, "capa_percent", wgt.values.capa_percent, "%.0f%%") end,
         -- effective fill level for the gauge: startup-check progress while checking,
         -- else the reserve-adjusted fuel %, clamped to 0..100 (ePowerbar)
         gauge_fill_percent = function()
@@ -454,36 +428,26 @@ function M.createValues(wgt)
         -- centered percent label: dashes during the startup cell-check, else fuel %
         gauge_percent_formatted = function()
             if wgt.values.batt_checking then return "--" end
-            if wgt.values.fuel == nil then return "-" end
-            return string.format("%.0f%%", math.max(0, wgt.values.fuel))
+            local f = wgt.values.fuel
+            if f ~= nil and f < 0 then f = 0 end
+            return sfmt(wgt, "gauge_pct", f, "%.0f%%")
         end,
         -- cell count shown at the top of the battery gauge, e.g. "6S"
         gauge_cells_formatted = function()
             local c = wgt.values.cel_count or wgt.values.rf_battery_cell_count
             if c == nil or c <= 0 then return "" end
-            return string.format("%dS", c)
+            return sfmt(wgt, "gauge_cells", c, "%dS")
         end,
         -- mAh shown as a stacked number over its unit so the number reads larger
-        gauge_mah_value_formatted = function()
-            if wgt.values.capa == nil then return "-" end
-            return string.format("%.0f", wgt.values.capa)
-        end,
+        -- (same value/format as capa_formatted -> shares the "capa" memo slot)
+        gauge_mah_value_formatted = function() return sfmt(wgt, "capa", wgt.values.capa, "%.0f") end,
 
         esc_temp = nil,
         esc_temp_min = nil,
         esc_temp_max = nil,
-        esc_temp_formatted = function()
-            if wgt.values.esc_temp == nil then return "-" end
-            return string.format("%.01f", wgt.values.esc_temp)
-        end,
-        esc_temp_min_formatted = function()
-            if wgt.values.esc_temp_min == nil then return "-" end
-            return string.format("%.01f", wgt.values.esc_temp_min)
-        end,
-        esc_temp_max_formatted = function()
-            if wgt.values.esc_temp_max == nil then return "-" end
-            return string.format("%.01f", wgt.values.esc_temp_max)
-        end,
+        esc_temp_formatted = function() return sfmt(wgt, "esc_temp", wgt.values.esc_temp, "%.01f") end,
+        esc_temp_min_formatted = function() return sfmt(wgt, "esc_temp_min", wgt.values.esc_temp_min, "%.01f") end,
+        esc_temp_max_formatted = function() return sfmt(wgt, "esc_temp_max", wgt.values.esc_temp_max, "%.01f") end,
 
         craft_name = "-",
         craft_name_formatted = function()
@@ -516,7 +480,7 @@ function M.createValues(wgt)
 
         arm_disable_flags = nil,
         arm_disable_flags_list = function()
-            return get_arming_disable_flags_list(wgt.values.arm_disable_flags)
+            return arm_disable_flags_list_cached(wgt)
         end,
         arm_flags_visible = function()
             if not (wgt.rf and wgt.rf.available) then return true end
@@ -556,18 +520,9 @@ function M.createValues(wgt)
         vbec = nil,
         vbec_min = nil,
         vbec_max = nil,
-        vbec_formatted = function()
-            if wgt.values.vbec == nil then return "-" end
-            return string.format("%.02f", wgt.values.vbec)
-        end,
-        vbec_min_formatted = function()
-            if wgt.values.vbec_min == nil then return "-" end
-            return string.format("%.02f", wgt.values.vbec_min)
-        end,
-        vbec_max_formatted = function()
-            if wgt.values.vbec_max == nil then return "-" end
-            return string.format("%.02f", wgt.values.vbec_max)
-        end,
+        vbec_formatted = function() return sfmt(wgt, "vbec", wgt.values.vbec, "%.02f") end,
+        vbec_min_formatted = function() return sfmt(wgt, "vbec_min", wgt.values.vbec_min, "%.02f") end,
+        vbec_max_formatted = function() return sfmt(wgt, "vbec_max", wgt.values.vbec_max, "%.02f") end,
 
         vtx_volts = nil,
         vtx_volts_max = -1,
@@ -576,15 +531,9 @@ function M.createValues(wgt)
         vtx_volts_percent = nil,
         vtx_volts_color = COLOR_THEME_PRIMARY1,
         vtx_low = false,
-        vtx_volts_formatted = function()
-            if wgt.values.vtx_volts_percent == nil then return "-" end
-            return string.format("%s%%", wgt.values.vtx_volts_percent)
-        end,
+        vtx_volts_formatted = function() return sfmt(wgt, "vtx_volts_pct", wgt.values.vtx_volts_percent, "%s%%") end,
         -- radio (TX) battery voltage value for the top-bar battery icon
-        vtx_voltage_formatted = function()
-            if wgt.values.vtx_volts == nil then return "-" end
-            return string.format("%.1fV", wgt.values.vtx_volts)
-        end,
+        vtx_voltage_formatted = function() return sfmt(wgt, "vtx_voltage", wgt.values.vtx_volts, "%.1fV") end,
         -- fill level (0..1) and fill color for the top-bar battery icon
         vtx_fill_ratio = function()
             local p = wgt.values.vtx_volts_percent
@@ -596,16 +545,28 @@ function M.createValues(wgt)
         end,
 
         -- date / time for the top bar (getDateTime is always available)
+        -- getDateTime() allocates a fresh table on every call; on the top bar that is a
+        -- table per frame. Re-read it only ~twice a second and memo the string.
         clock_time_formatted = function()
+            local now = getTime() or 0
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            local e = c.clock_t
+            if e ~= nil and (now - e.t) < 50 then return e.s end
             local t = getDateTime()
-            if not t then return "--:--" end
-            return string.format("%02d:%02d", t.hour, t.min)
+            local s = t and string.format("%02d:%02d", t.hour, t.min) or "--:--"
+            if e ~= nil then e.t = now; e.s = s else c.clock_t = { t = now, s = s } end
+            return s
         end,
         clock_date_formatted = function()
+            local now = getTime() or 0
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            local e = c.clock_d
+            if e ~= nil and (now - e.t) < 200 then return e.s end
             local t = getDateTime()
-            if not t then return "--.--." end
             -- 2-digit year (26 instead of 2026) to save top-bar width
-            return string.format("%02d.%02d.%02d", t.day, t.mon, t.year % 100)
+            local s = t and string.format("%02d.%02d.%02d", t.day, t.mon, t.year % 100) or "--.--."
+            if e ~= nil then e.t = now; e.s = s else c.clock_d = { t = now, s = s } end
+            return s
         end,
 
         timer_str = "00:00",
@@ -618,22 +579,13 @@ function M.createValues(wgt)
         flight_time_str_formatted = function() return wgt.values.flight_time_str end,
 
         rqly_min = nil,
-        rqly_formatted = function()
-            if wgt.values.rqly_min == nil then return "-" end
-            return string.format("%s%%", wgt.values.rqly_min)
-        end,
+        rqly_formatted = function() return sfmt(wgt, "rqly_min", wgt.values.rqly_min, "%s%%") end,
 
         tpwr_max = nil,
-        tpwr_formatted = function()
-            if wgt.values.tpwr_max == nil then return "-" end
-            return string.format("%smW", wgt.values.tpwr_max)
-        end,
+        tpwr_formatted = function() return sfmt(wgt, "tpwr_max", wgt.values.tpwr_max, "%smW") end,
 
         mcu_temp_max = nil,
-        mcu_temp_max_formatted = function()
-            if wgt.values.mcu_temp_max == nil then return "-" end
-            return string.format("%.0f°C", wgt.values.mcu_temp_max)
-        end,
+        mcu_temp_max_formatted = function() return sfmt(wgt, "mcu_temp_max", wgt.values.mcu_temp_max, "%.0f°C") end,
 
         rf_battery_profile = nil,
         rf_battery_profile_active = nil,

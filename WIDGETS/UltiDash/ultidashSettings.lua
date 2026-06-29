@@ -31,6 +31,7 @@ local M = {}
 local cache = nil
 local cache_loaded = false
 local per_craft = false        -- CfgPerCraft flag (from the slot file)
+local loaded_slot_path = nil   -- which slot file the cache came from (model-switch reload check)
 local loaded_craft_path = nil  -- which craft file the cache came from (reload check)
 local defaults = {}
 
@@ -155,15 +156,20 @@ end
 -- Load (once) and return the saved settings, or nil when nothing is stored.
 function M.load()
     if cache_loaded then
-        -- per-craft mode: the model NAME changes at runtime when a craft connects
-        -- (Rotorflight renames the TX model) -> reload when the target file moved
-        if per_craft and loaded_craft_path ~= craft_path() then
+        -- Reload when the ACTIVE MODEL changed: the slot file is keyed by the model slot
+        -- (model.getInfo().filename), so switching models must re-read the target model's
+        -- cfg (the cache is module-wide / shared across instances). In per-craft mode the
+        -- model NAME also changes at runtime when a craft connects (Rotorflight renames
+        -- the TX model) -> reload when that target file moved too.
+        if loaded_slot_path ~= slot_path()
+            or (per_craft and loaded_craft_path ~= craft_path()) then
             cache_loaded = false
         else
             return cache
         end
     end
     cache_loaded = true
+    loaded_slot_path = slot_path()
     local ok, t = pcall(do_load)
     if ok then cache = t end
     return cache
@@ -190,6 +196,7 @@ function M.save(values)
     if not ok or written ~= true then return false end
     cache = t
     cache_loaded = true
+    loaded_slot_path = slot_path()
     return true
 end
 
@@ -208,6 +215,7 @@ function M.reset()
     if not ok or written ~= true then return false end
     cache = t
     cache_loaded = true
+    loaded_slot_path = slot_path()
     return true
 end
 

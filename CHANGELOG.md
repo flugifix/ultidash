@@ -2,6 +2,52 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.4 — 2026-06-29
+
+Feature + polish + performance release on top of v0.3. **Experimental — still under
+testing in the field.**
+
+### Added
+- **Voice language option** (*Alerts ▸ Voice language*: English / Deutsch) with a full
+  **German voice pack** in `/SOUNDS/de/ultidash/`. Spoken numbers/units still come from the
+  EdgeTX voice pack (the radio's system language).
+- **"UltiDash dark" color scheme** — a third *Display ▸ Color scheme* option: high-contrast
+  **white text on black** with **vivid neon accents** (focus, warning, "tap to close") and
+  neon green/yellow/red bars (link bars, ELRS detail, battery gauge) for strong contrast on
+  the dark panel.
+- **Readable battery-gauge values:** the cell-count and used-mAh now sit on **translucent
+  rounded "pills"** so they stay legible over any segment color.
+- **Per-page settings reset:** every settings group page has a **Reset <page> to defaults**
+  button (with confirmation) that resets only that page — alongside the existing menu-level
+  *Reset to defaults* (whole model).
+- **New "General" settings group** holding *Config file per craft* (moved from Display) plus
+  the new **Debug log** options.
+- **Debug log to SD card** (*General ▸ Debug log*, default off): writes rotating session
+  files `/WIDGETS/UltiDash/debug_NN.log` for diagnosing runtime issues. **Sessions kept** is
+  configurable (1–50). RAM-buffered and throttled (no per-frame IO); not written while armed
+  (flushed on disarm/disconnect). ~zero cost when off.
+
+### Changed
+- **Connection-state default tuning** (new installs / models without a cfg): clock = *Time
+  only*, *Fill background* on, stats page *On disconnected*, *Top bar: TX voltage* off,
+  *Link bars: color only on warning* on, *Sound: skipped packets* on, default Telemetry
+  detail slots 6–8 now empty.
+- **Setting renamed for clarity:** *"Quiet link bars (color only on warn)"* →
+  **"Link bars: color only on warning"** (storage key `BarsQuiet` unchanged).
+
+### Fixed
+- **Per-model config not reloaded on model switch:** the module-wide settings cache was only
+  invalidated in per-craft mode, so switching between two models with UltiDash kept the first
+  model's configuration. The cache now also reloads when the model **slot** changes.
+- **Performance / GC churn:** the arming-disable-flags status-bar path rebuilt a 27-entry
+  name table up to twice per frame; the value formatters re-ran `string.format` every frame;
+  the clock re-read `getDateTime()` (a table alloc) every frame. All are now memoized so a
+  steady display produces ~zero per-frame garbage.
+- **Connect "burst":** the RFTool bounces through several states during the connect
+  handshake, which fired the 3-request MSP read **repeatedly**. The read is now **debounced**
+  (fired once the state has settled), collapsing the burst into a single read — still
+  read-only and only while disarmed/connected.
+
 ## v0.3 — 2026-06-26
 
 Feature release on top of v0.2. **Experimental — still under testing in the field.**

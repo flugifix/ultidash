@@ -10,10 +10,20 @@ local function ensure_rf_state(wgt)
         battery_profile = nil,
         battery_config = nil,
         flight_stats = nil,
-        callback_installed = false
+        callback_installed = false,
+        read_pending = nil          -- debounced MSP read request (see read_rf_data/background)
     }
     return wgt.rf
 end
+
+-- The RFTool bounces between initializing/disarmed/connected several times during the
+-- connect handshake; firing read_rf_data on every msp-allowed transition produced 2-3
+-- back-to-back 3-request MSP storms (the "connect burst"). We instead DEBOUNCE: each
+-- transition just timestamps a pending request, and background() fires ONE read once the
+-- state has been stable this long. A genuine post-flight disarm read still happens (just
+-- ~this much later); explicit reads (picker / after a profile write) call read_rf_data
+-- directly and are not debounced.
+local RF_READ_SETTLE_CS = 40        -- 0.4 s (EdgeTX centiseconds)
 
 local function format_seconds(seconds)
     if rf2 and rf2.executeScript then
@@ -114,8 +124,11 @@ function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
     end
 
     if new_state == "connected" or new_state == "disarmed" then
-        read_rf_data(wgt)
+        -- debounced: timestamp the request; background() fires it once the state settles,
+        -- so the connect-handshake bounce collapses into a single MSP read
+        wgt.rf.read_pending = getTime() or 0
     elseif new_state == "disconnected" then
+        wgt.rf.read_pending = nil
         wgt.rf_data_dirty = true
     end
 end
@@ -168,6 +181,16 @@ function M.background(wgt, on_telemetry_state_changed)
 
     if current_state == "armed" or current_state == "disarmed" or current_state == "connected" or current_state == "disconnected" then
         M.on_state_changed(wgt, current_state, on_telemetry_state_changed)
+    end
+
+    -- Debounced MSP read: fire ONE read once the connection state has been stable for
+    -- RF_READ_SETTLE_CS (collapses the connect-handshake bounce — see on_state_changed).
+    if state.read_pending and state.msp_allowed then
+        local now = getTime() or 0
+        if (now - state.read_pending) >= RF_READ_SETTLE_CS then
+            state.read_pending = nil
+            read_rf_data(wgt)
+        end
     end
 end
 

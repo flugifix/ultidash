@@ -23,6 +23,16 @@ local ultidash_functions = {}
 
 local esc = loadScript("/WIDGETS/UltiDash/ultidashEsc.lua")()
 
+-- Optional file logger (the "Debug log" diagnostics setting). pcall'd so a missing
+-- file is a harmless no-op; exposed as ultidash_functions.dbg for the other modules.
+-- Off by default — driven at runtime via dbg.set_enabled() from the DebugLog option.
+local dbg = nil
+do
+    local ok, m = pcall(function() return loadScript("/WIDGETS/UltiDash/ultidashDebug.lua")() end)
+    if ok then dbg = m end
+end
+ultidash_functions.dbg = dbg
+
 -- color palette shadows (see ultidash.lua); swapped via ultidash_functions.set_palette
 local COLOR_THEME_PRIMARY1   = COLOR_THEME_PRIMARY1
 local COLOR_THEME_PRIMARY2   = COLOR_THEME_PRIMARY2
@@ -40,9 +50,18 @@ local CLEAN_PALETTE = {
     lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
     lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
 }
+local DARK_PALETTE = {
+    lcd.RGB(0xFF, 0xFF, 0xFF), lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0xF0, 0xF4, 0xF8), lcd.RGB(0x39, 0xFF, 0x14),
+    lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0x00, 0xE5, 0xFF), lcd.RGB(0xFF, 0x1A, 0x40), lcd.RGB(0xFF, 0xC4, 0x00),
+}
 
 -- ePowerbar-style discrete bar colors (after Rob 'bob00' Gayle)
-local AUDIO_PATH = "/SOUNDS/en/ultidash/"
+-- Custom callout WAVs live in /SOUNDS/<lang>/ultidash/. The folder follows the
+-- VoiceLang setting (en/de), resolved into audio_lang at each sound entry point
+-- (see refresh_audio_volume). Spoken numbers/units still come from EdgeTX's own
+-- voice pack, i.e. the radio's system language.
+local audio_lang = "en"
+local function audio_path() return "/SOUNDS/" .. audio_lang .. "/ultidash/" end
 local BAR_COLOR_OK       = lcd.RGB(0x00, 0xff, 0x00)
 local BAR_COLOR_WARN     = lcd.RGB(0xf8, 0xc0, 0x00)
 local BAR_COLOR_LOW      = lcd.RGB(0xff, 0xff, 0x00)
@@ -58,8 +77,9 @@ local ESC_LEVEL_COLORS = {
 }
 
 -- swap the theme color shadows (called from ultidash.lua update())
-function ultidash_functions.set_palette(use_clean)
-    local p = use_clean and CLEAN_PALETTE or THEME_PALETTE
+-- scheme: 1 = UltiDash (clean), 2 = EdgeTX theme, 3 = UltiDash dark (high contrast)
+function ultidash_functions.set_palette(scheme)
+    local p = (scheme == 3) and DARK_PALETTE or ((scheme == 1) and CLEAN_PALETTE or THEME_PALETTE)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
     ESC_LEVEL_COLORS[esc.LEVEL_TRACE] = COLOR_THEME_DISABLED
@@ -206,9 +226,9 @@ end
 local function play_audio(file)
     if master_muted then return end
     if audio_volume then
-        playFile(AUDIO_PATH .. file .. ".wav", audio_volume)
+        playFile(audio_path() .. file .. ".wav", audio_volume)
     else
-        playFile(AUDIO_PATH .. file .. ".wav")
+        playFile(audio_path() .. file .. ".wav")
     end
 end
 
@@ -237,6 +257,7 @@ function ultidash_functions.log(text, ...)
     local formatted_text = text
     if select('#', ...) > 0 then formatted_text = string.format(tostring(text), ...) end
     print(string.format("[%dms][%s] %s", ms, tag, formatted_text))
+    if dbg then dbg.log(tag, formatted_text) end   -- mirror to the file log when enabled
 end
 
 -- Detect simulator mode for testing
@@ -280,8 +301,11 @@ local function is_rf_connected(wgt)
     return wgt.values.rf_connection_state ~= "disconnected"
 end
 
--- resolve the effective callout volume from the settings (see audio_volume above)
+-- resolve the effective callout volume from the settings (see audio_volume above).
+-- Also resolves the voice-language folder (audio_path) from the same options table,
+-- since this runs at every sound-capable entry point alongside the mute refresh.
 local function refresh_audio_volume(wgt)
+    audio_lang = (wgt.options and wgt.options.VoiceLang == 2) and "de" or "en"
     local v = wgt.options and wgt.options.Volume or 0
     if v ~= nil and v > 0 then
         if (wgt.options.VolWhen or 1) == 2 and not is_rf_connected(wgt) then

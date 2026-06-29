@@ -55,34 +55,35 @@ Everything else is configured **inside the widget**, not in the EdgeTX option li
 3. Menu entries (laid out as a button grid): **Settings**, **Status**,
    **Reset settings to defaults** (with a confirmation dialog).
 
-**Settings** opens a **submenu** of the seven configuration groups (also a grid) — pick
+**Settings** opens a **submenu** of the eight configuration groups (also a grid) — pick
 one to open its page; its back arrow returns to the submenu. Groups: **Display**,
 **Tele Main**, **Tele Details** (§2.3a), **Battery**, **Thresholds**, **Alerts**,
-**Switch voice**. Bools are real toggle switches, multi-value options are dropdown
-pickers, numbers use −/+ buttons (long-press = bigger step). Edits are **saved
+**Switch voice**, **General** (§2.7a). Bools are real toggle switches, multi-value options
+are dropdown pickers, numbers use −/+ buttons (long-press = bigger step). Edits are **saved
 automatically** when a page is left (back arrow or **RTN**); arming or leaving full-screen
-also saves.
+also saves. Each group page also has a **Reset <page> to defaults** button (with
+confirmation) that resets only that page's settings; the menu-level *Reset to defaults*
+resets the whole model.
 
 ### 2.3 Settings — Display
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
 | **Top-left shows** | choice | Model image | Model image / Timer |
-| **Top bar clock** | choice | Date + time | Date + time / Time only |
+| **Top bar clock** | choice | Time only | Date + time / Time only |
 | **Timer (for top-left)** | num | Timer 1 | which model timer when *Top-left = Timer* |
-| **Color scheme** | choice | UltiDash | UltiDash (fixed built-in palette) / EdgeTX theme |
-| **Fill background** | bool | off | fill the panel background color |
-| **Stats page** | choice | On disarmed | Never / On disarmed / On disconnected |
+| **Color scheme** | choice | UltiDash | UltiDash (fixed built-in palette) / EdgeTX theme / UltiDash dark (high-contrast white-on-black with neon accents) |
+| **Fill background** | bool | on | fill the panel background color |
+| **Stats page** | choice | On disconnected | Never / On disarmed / On disconnected |
 | **Voltage shown as** | choice | Cell voltage | Cell voltage / Battery voltage |
 | **Top bar: RQ bar** | bool | on | show the RQ (downlink link quality) bar |
 | **Top bar: TQ bar** | bool | on | show the TQ (uplink link quality) bar |
 | **Top bar: RSSI bars** | bool | on | show 1RSS (+ 2RSS with antenna diversity) |
-| **Top bar: TX voltage** | bool | on | show the radio battery voltage next to the icon |
+| **Top bar: TX voltage** | bool | off | show the radio battery voltage next to the icon |
 | **Bottom bar: TPWR** | bool | on | show TX power in the flight-view status bar |
 | **Close detail pages on arm** | bool | off | when on, arming closes an open detail page (off = keep ELRS detail open in flight) |
 | **Tap zones for detail pages** | bool | on | enable tapping the bars / status line / gauge to open detail pages (the menu glyph stays active either way) |
-| **Quiet link bars (color only on warn)** | bool | off | bars stay neutral while fine; color only on warn/crit |
-| **Config file per craft** | bool | off | see §2.8 |
+| **Link bars: color only on warning** | bool | on | bars stay neutral while fine; color only on warn/crit (key `BarsQuiet`) |
 
 > **Color scheme — feedback-dependent.** UltiDash is developed and tested against the
 > built-in **UltiDash** palette (the primary path). The **EdgeTX theme** option
@@ -149,6 +150,7 @@ connect/disarm and cached. Cell count and capacity always come from the FC.
 |---------|------|---------|-------|
 | **Callout volume** | num | System | System / 1 (min) … 5 (max) — see §5.4 |
 | **Widget volume applies** | choice | Always | Always / Only connected |
+| **Voice language** | choice | English | English / Deutsch — picks the `/SOUNDS/<lang>/ultidash/` voice pack (spoken numbers/units still follow the radio's system language) |
 | **Mute (master)** | choice | None | None / **All** silences every voice + vibration |
 | **Vibrate on critical** | bool | on | vibration master |
 | **Sound: startup cell-check** | bool | on | |
@@ -182,6 +184,16 @@ logical switch to follow real conditions — e.g. tie "motor on/off" to your arm
 logical switch instead of the raw switch. Announcements are debounced (0.3 s, so a 3-pos
 switch passing through the middle stays quiet) and silent on boot / on first assignment.
 Logical switches are on/off only; the 3-position profile needs a physical switch.
+
+### 2.7a Settings — General
+
+Meta settings: config-file behaviour and diagnostics.
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
+| **Config file per craft** | bool | off | keep a separate config per craft flown from the same model slot (see §2.8) |
+| **Debug log to SD card** | bool | off | write a diagnostics log to the SD card (see §11) |
+| **Debug log: sessions kept** | num | 20 | 1–50 — how many rotating log files to retain |
 
 ### 2.8 Where settings are stored
 
@@ -433,6 +445,24 @@ Hard-wired Rotorflight sensor names (no configurable sources):
 > Min/max are taken from the EdgeTX `-`/`+` variants where used; widget-tracked otherwise
 > (see §3.3). Sensor *IDs* differ per radio — sensors are referenced by name only.
 
+### 6.1 Duplicate / empty default sensors (important)
+
+EdgeTX auto-discovers telemetry sensors from the RX link. With Rotorflight this commonly
+creates **default sensors that duplicate Rotorflight's own names but carry no data** — on
+the radio's *Telemetry* page they show `—`. Because UltiDash (like EdgeTX itself) looks
+sensors up **by name**, and a name resolves to only **one** matching sensor, an empty
+duplicate can *shadow* the real Rotorflight sensor. The value then reads `-` in the
+widget — e.g. **Current** goes blank and the **fuel gauge** shows `-` / `-` instead of
+`%` / `mAh`.
+
+Typical empty duplicates seen on RadioMaster radios: `RxBt`, `Curr`, `Capa`, `Bat%`
+(other RX-default names possible).
+
+**Fix (one-time, per model):** open the model's *Telemetry* page and **delete every
+sensor that shows `—`/no value**, keeping the Rotorflight sensors that actually carry
+data. Turn **"Discover new sensors" off** afterwards so they aren't recreated. Once the
+empty duplicates are gone, UltiDash reads the live values correctly.
+
 ---
 
 ## 7. ESC status decoder (eStatus)
@@ -543,3 +573,22 @@ etx-widgets parts GPL-3.0), so UltiDash as a whole is distributed under **GPLv3*
 **No warranty:** the software is provided *as-is*; use is **at your own risk**.
 
 *(Plain-language summary, not legal advice.)* Full license header also in `main.lua`.
+
+## 11. Debug log (diagnostics)
+
+Optional troubleshooting log, enabled per model in **Settings ▸ General ▸ Debug log to SD
+card** (default **off**). When off the cost is ~zero (every entry point early-returns; no SD
+IO, no heap growth).
+
+- **Files:** rotating session files `/WIDGETS/UltiDash/debug_NN.log` (read them from the PC
+  at `E:\WIDGETS\UltiDash\debug_NN.log`). **Debug log: sessions kept** (1–50, default 20)
+  sets how many are retained; a tiny `debug_seq.txt` drives the round-robin slot.
+- **A new session** (= new file) starts every time logging is switched on and on every radio
+  restart while it is on. The first line is `INIT session #<n> <timestamp> (slot N/keep)` —
+  the highest `session #` is the newest.
+- **Contents:** every connection-`STATE` transition and a 1 Hz `PERF` snapshot
+  (`hz / heap kB / pass ms / state / armed / view / menu / detail`); messages logged
+  internally are mirrored in too.
+- **Low impact:** lines are buffered in a capped RAM ring and rewritten to SD only every few
+  seconds — **never while armed** (the buffer is flushed on disarm/disconnect), so there is
+  no in-flight SD hitch.
