@@ -2,7 +2,7 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.3 — experimental, under testing`
+`Status: v0.4 — experimental, under testing`
 
 UltiDash brings flight telemetry, battery state, ESC status, the ELRS link and radio
 info together on a single self-contained screen — designed so you can drop the EdgeTX
