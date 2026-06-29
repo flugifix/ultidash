@@ -111,6 +111,14 @@ only EdgeTX widget option is **`ViewMode`** (Dashboard / ELRS details / Status i
 leave it on **Dashboard** for the main instance. Everything else is configured inside the
 widget (see below).
 
+> ⚠️ **First, fix duplicate/empty telemetry sensors — do this before anything else.**
+> EdgeTX auto-discovery often creates **empty default sensors** (`RxBt`, `Curr`, `Capa`,
+> `Bat%`, …) that **shadow Rotorflight's real sensors of the same name**. The symptom in
+> UltiDash: **Current is blank and the fuel gauge shows `-` / `-`** instead of `%` / `mAh`.
+> **Fix (one-time, per model):** on the model's *Telemetry* page **delete every sensor that
+> shows `—`/no value**, then turn **"Discover new sensors" off**. Full details in
+> **[docs/REFERENCE.md §6.1](docs/REFERENCE.md)**.
+
 ## Configuration
 
 There is essentially **one EdgeTX widget option, `ViewMode`** — all real configuration
