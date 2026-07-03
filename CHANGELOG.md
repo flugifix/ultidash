@@ -2,6 +2,22 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.5.1 — 2026-07-03
+
+Bugfix release.
+
+### Fixed
+- **Crash on first placement without a config file** (`ERROR create(): attempt to get
+  length of a nil value (local 'items')`): the one-time migration snapshot that seeds
+  `cfg_m_<slot>.cfg` still iterated the settings groups directly and tripped over the
+  new *Alerts* submenu (which has sub-pages instead of a flat item list). It now uses
+  the submenu-aware iterator, so the per-alert settings are included in the snapshot
+  too.
+- **Hardening against EdgeTX's 20 000-instruction "CPU limit"**: the migration
+  snapshot + cfg file write no longer run inside the same `create()`/`update()` call
+  as the full UI build — they are deferred to a `refresh()` cycle of their own (one
+  skipped 20 Hz frame, invisible).
+
 ## v0.5 — 2026-07-03
 
 Major feature release on top of v0.4: per-alert configuration, master-volume control,

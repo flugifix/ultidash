@@ -3728,16 +3728,12 @@ local function update(wgt, options)
     -- effective option values into it. Only the Dashboard placement does this (its
     -- options carry the user's tuning; passive instances may sit at defaults).
     -- Prerequisite for eventually shrinking the EdgeTX option list to ViewMode.
+    -- DEFERRED to a refresh() cycle of its own: EdgeTX gives each widget call a
+    -- 20k-instruction budget (lua_widget.cpp MAX_INSTRUCTIONS), and snapshot +
+    -- cfg file write on top of the full UI build in this same call blew it
+    -- ("CPU limit" mid-build).
     if is_publisher(wgt) and ultidash_settings.load() == nil then
-        local snap = {}
-        for g = 1, #SETTINGS_GROUPS do
-            local items = SETTINGS_GROUPS[g].items
-            for i = 1, #items do
-                local k = items[i].key
-                if type(wgt.options[k]) == "number" then snap[k] = wgt.options[k] end
-            end
-        end
-        ultidash_settings.save(snap)
+        wgt.cfg_snapshot_pending = true
     end
 
 
@@ -3884,6 +3880,23 @@ local function refresh(wgt, event, touch_state)
         -- just the used total (dbg_lua_kb = collectgarbage count = whole-VM used)
         local okfm, fb = pcall(getAvailableMemory)
         wgt.dbg_free_kb = (okfm and type(fb) == "number") and math.floor(fb / 1024) or nil
+    end
+    -- Deferred one-time migration snapshot (flagged in update()): runs in its own
+    -- refresh cycle so snapshot + cfg file write get a fresh 20k-instruction
+    -- budget instead of sharing create()'s with the full UI build ("CPU limit").
+    -- Skipping the rest of this one 20 Hz cycle is invisible. Re-check load():
+    -- a menu autosave may have created the file meanwhile.
+    if wgt.cfg_snapshot_pending then
+        wgt.cfg_snapshot_pending = nil
+        if ultidash_settings.load() == nil then
+            local snap = {}
+            for_each_setting_item(function(it)
+                local k = it.key
+                if k and type(wgt.options[k]) == "number" then snap[k] = wgt.options[k] end
+            end)
+            ultidash_settings.save(snap)
+        end
+        return
     end
     -- Rebuild ONCE after leaving fullscreen. Root cause (EdgeTX 2.12 source): lvgl.box
     -- containers keep LV_OBJ_FLAG_CLICKABLE when built while fullscreen (EdgeTX clears

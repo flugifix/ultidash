@@ -1,7 +1,7 @@
 --[[
 #########################################################################
 #                                                                       #
-#  UltiDash v0.5 - Rotorflight LVGL dashboard widget for EdgeTX         #
+#  UltiDash v0.5.1 - Rotorflight LVGL dashboard widget for EdgeTX       #
 #  Tested on RadioMaster TX15 and TX16S MK3 (EdgeTX 2.12).              #
 #  Runs in principle on the TX16S MK2 (480x272) too, but that radio is  #
 #  not actively tested and its aspect ratio is less ideal for the UI.   #
@@ -60,7 +60,7 @@
 ]]
 
 local app_name = "UltiDash"
-local app_ver = "0.5"
+local app_ver = "0.5.1"
 local widg_dir = "/WIDGETS/UltiDash/"
 
 local ultidash = nil
