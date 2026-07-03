@@ -115,6 +115,13 @@ local MIN_PLAUSIBLE_CELL_V = 1.0
 -- reading is accepted live: real load sag must show immediately.
 local VOLT_ACCEPT_CS = 300   -- stability window (centiseconds) for a suspicious drop
 local VOLT_DROP_CELL = 0.2   -- per-cell drop (V) considered suspicious while disarmed
+-- Per-cell single-step drop (V) that marks a SUPPLY COLLAPSE rather than real load sag,
+-- applied even while ARMED/operating. A genuine in-flight sag between two 5 Hz frames is
+-- bounded (a hard collective punch is ~0.3-0.5 V/cell); a buffer takeover crashes the pack
+-- through >1 V/cell in a single frame. Beyond this the reading is REJECTED, so the latch
+-- freezes at the last HEALTHY value instead of an intermediate decay value (the old
+-- misleading "~11 V" artefact that then got announced). Also the trigger for power_lost.
+local COLLAPSE_DROP_CELL = 0.8
 
 -- ============================================================================
 -- LOCAL HELPER FUNCTIONS
@@ -154,17 +161,37 @@ local Shared = {
     thresholds = {
         source = nil,                                  -- "FC config" / "Manual"
         cell_full = nil, cell_warn = nil, cell_crit = nil,  -- volts (resolved)
-        reserve = nil, callout_int = nil,
+        reserve = nil,
         rq_warn = nil, rq_crit = nil,
         rss_warn = nil, rss_crit = nil, rss_hold = nil,
         pwr_warn_v = nil, skp_limit = nil,
+        bec_warn = nil, bec_crit = nil,
+        esc_load = nil, esc_gvar = nil, esc_warn = nil, esc_crit = nil, esc_hold = nil, esc_limit = nil,
     },
     alerts = {
-        mute = nil, haptic = nil,
+        mute = nil, escalating = nil, repeat_summary = nil,
         cellchk = nil, fuel = nil, volt = nil, arm = nil,
-        telem = nil, link = nil, rssi = nil, pwr = nil, skp = nil,
+        telem = nil, link = nil, rssi = nil, pwr = nil, bec = nil, escl = nil, skp = nil,
+    },
+    volume = {
+        callout = nil, gvar = nil, flight = nil, escal = nil, voice = nil,
     },
 }
+
+-- Per-alert repeat summary (Status page). The option keys (code..Rep/Cnt/Int) are
+-- precomputed once here so publish_shared never concatenates them on its 5 Hz path.
+local REP_ALERTS = {}
+do
+    local defs = {
+        { "Fuel", "Fuel" }, { "Volt", "Volt" }, { "Cell", "Cell" }, { "Arm", "Arm" },
+        { "Telem", "Telem" }, { "Link", "Link" }, { "Rssi", "Rssi" }, { "Pwr", "Pwr" },
+        { "Bec", "Bec" }, { "Skp", "Skp" },
+    }
+    for i = 1, #defs do
+        REP_ALERTS[i] = { code = defs[i][1], name = defs[i][2],
+            rep = defs[i][1] .. "Rep", cnt = defs[i][1] .. "Cnt", int = defs[i][1] .. "Int" }
+    end
+end
 
 function ultidash_functions.get_shared()
     return Shared
@@ -198,7 +225,6 @@ function ultidash_functions.publish_shared(wgt)
     t.cell_warn   = v.vcel_warning_threshold()
     t.cell_crit   = v.vcel_alarm_threshold()
     t.reserve     = o.Reserve
-    t.callout_int = o.CalloutInt
     t.rq_warn     = o.RQlyWarn
     t.rq_crit     = o.RQlyCrit
     t.rss_warn    = o.RssWarn
@@ -207,9 +233,49 @@ function ultidash_functions.publish_shared(wgt)
     t.pwr_warn_v  = (o.PwrWarnV or 90) / 10
     t.skp_limit   = o.SkpLimit
     t.tpwr_max    = o.TxPwrMax
+    t.bec_warn    = o.BecWarn
+    t.bec_crit    = o.BecCrit
+    t.esc_load    = (o.EscMon == 1 and (o.EscGvar or 0) ~= 0)   -- monitoring engaged
+    t.esc_gvar    = o.EscGvar
+    t.esc_warn    = o.EscWarn
+    t.esc_crit    = o.EscCrit
+    t.esc_hold    = o.EscHold
+    t.esc_limit   = wgt.escl_limit          -- session limit (A), nil until latched
 
-    a.mute    = (o.Mute == 2)
-    a.haptic  = (o.Haptic == 1)
+    local vol = Shared.volume
+    vol.callout = o.Volume or 0
+    vol.gvar    = o.VolGvar or 0
+    vol.flight  = o.VolFlight or 80
+    vol.escal   = o.VolEscal or 100
+    vol.voice   = (o.VoiceLang == 2) and "DE" or "EN"
+
+    a.mute       = (o.Mute == 2)
+    a.escalating = (wgt.escalate_active == true)
+    -- per-alert repeat summary: "Fuel 6s  Telem 5s x3 …" (x<n> = counted, else
+    -- continuous). Rebuilt ONLY when the underlying settings change (they change only
+    -- via the settings menu) — a cheap integer signature gates the table+string build,
+    -- which used to run on every 5 Hz publish for a value that almost never changes.
+    local sig = 0
+    for i = 1, #REP_ALERTS do
+        local ra = REP_ALERTS[i]
+        if o[ra.rep] == 1 then
+            sig = sig * 1000003 + i * 100000 + (o[ra.cnt] or 0) * 100 + (o[ra.int] or 5)
+        end
+    end
+    if sig ~= wgt.rep_sig then
+        wgt.rep_sig = sig
+        local rep = {}
+        for i = 1, #REP_ALERTS do
+            local ra = REP_ALERTS[i]
+            if o[ra.rep] == 1 then
+                local cnt = o[ra.cnt] or 0
+                local int = o[ra.int] or 5
+                rep[#rep + 1] = ra.name .. " " .. int .. "s" .. (cnt > 0 and (" x" .. cnt) or "")
+            end
+        end
+        wgt.rep_summary = (#rep > 0) and table.concat(rep, "  ") or nil
+    end
+    a.repeat_summary = wgt.rep_summary
     a.cellchk = (o.SndCellChk == 1)
     a.fuel    = (o.SndFuel == 1)
     a.volt    = (o.SndVolt == 1)
@@ -218,6 +284,8 @@ function ultidash_functions.publish_shared(wgt)
     a.link    = (o.SndLink == 1)
     a.rssi    = (o.SndRssi == 1)
     a.pwr     = (o.PwrWarn == 1)
+    a.bec     = (o.SndBec == 1)
+    a.escl    = (o.EscLoad == 1)
     a.skp     = (o.SkpWarn == 1)
 
     Shared.ready = true
@@ -243,9 +311,55 @@ local function play_number(value, unit, attr)
     end
 end
 
-local function play_vibe(wgt)
+-- Toolbox bank announcement: speak the active EnCh position (1..6) via the EdgeTX voice
+-- pack (honors master mute + the widget volume). Used by the adjustment tool pages.
+function ultidash_functions.tb_announce_pos(pos)
+    if type(pos) ~= "number" then return end
+    play_audio("bank")        -- speaks "Bank" ...
+    play_number(pos, 0, 0)    -- ... then the position number -> "Bank 1" ... "Bank 6"
+end
+
+-- Per-alert haptic. Each alert passes its code; vibration fires only when that
+-- alert's "<code>Vib" option is on (replaces the old global "Vibrate on critical").
+local function play_vibe(wgt, code)
     if master_muted then return end
-    if wgt.options.Haptic == 1 then playHaptic(100, 0, PLAY_NOW) end
+    if code and wgt.options[code .. "Vib"] == 1 then playHaptic(100, 0, PLAY_NOW) end
+end
+
+-- ============================================================================
+-- PER-ALERT REPEAT (additive layer)
+-- ============================================================================
+-- An alert, at its first announce, "arms" a repeat with a replay closure. crank_repeats
+-- re-plays it every "<code>Int" seconds, up to "<code>Cnt" total announcements (0 = until
+-- cleared), and it is dropped when the condition ends (clear_repeat) or the count is
+-- reached. This leaves each alert's own first-announce/debounce logic untouched. Alerts
+-- that already repeat continuously (Fuel/Voltage) do NOT arm here — they carry their own
+-- interval. State lives in wgt.rep[code] = { replay, n, next }; n counts the initial
+-- announce, so Cnt = total callouts including the first.
+local function arm_repeat(wgt, code, replay)
+    wgt.rep = wgt.rep or {}
+    if wgt.options[code .. "Rep"] ~= 1 then wgt.rep[code] = nil; return end
+    wgt.rep[code] = { replay = replay, n = 1, next = getTime() + (wgt.options[code .. "Int"] or 5) * 100 }
+end
+
+local function clear_repeat(wgt, code)
+    if wgt.rep then wgt.rep[code] = nil end
+end
+
+function ultidash_functions.crank_repeats(wgt)
+    local reps = wgt.rep
+    if not reps then return end
+    local o, now = wgt.options, getTime()
+    for code, st in pairs(reps) do
+        local cnt = o[code .. "Cnt"] or 0
+        if cnt > 0 and st.n >= cnt then
+            reps[code] = nil
+        elseif now >= st.next then
+            if st.replay then st.replay() end
+            st.n = st.n + 1
+            st.next = now + (o[code .. "Int"] or 5) * 100
+        end
+    end
 end
 
 -- Logging helper with ms prefix and configurable tag
@@ -301,6 +415,43 @@ local function is_rf_connected(wgt)
     return wgt.values.rf_connection_state ~= "disconnected"
 end
 
+-- Adaptive master-volume override (OFF unless the VolGvar option is set). Writes a
+-- DEDICATED GVAR that a model-side "Volume" special function reads (the SF can only take a
+-- source up to channels, so the GVAR is bridged through an input; gate the SF on
+-- "GVAR > -1024"). Sentinel -1024 ("lowest") = OFF -> the pilot's volume pot takes over;
+-- otherwise the flight volume as a raw FUNC_VOLUME value (volume = (1024+raw)/2048*max).
+-- Writes ONLY on change. Publisher-only side-effect; the GVAR is volume-only, so writing
+-- it (even while armed, for a later critical boost) cannot touch control. NOT MSP.
+local VOL_GVAR_OFF = -1024
+local function pct_to_vol_raw(pct)
+    if pct < 0 then pct = 0 elseif pct > 100 then pct = 100 end
+    local raw = math.floor(pct / 100 * 2048 - 1024 + 0.5)
+    if raw < -1024 then raw = -1024 elseif raw > 1024 then raw = 1024 end
+    return raw
+end
+function ultidash_functions.refresh_volume_override(wgt)
+    local o = wgt.options
+    if o == nil or type(model) ~= "table" or type(model.setGlobalVariable) ~= "function" then return end
+    local gv = o.VolGvar or 0   -- 0 = Off, 1..15 = GV1..GV15
+    -- feature off (or target changed): release the GVAR we last drove back to the pot, once
+    if gv == 0 or (wgt.vol_gvar_idx ~= nil and wgt.vol_gvar_idx ~= gv - 1) then
+        if wgt.vol_gvar_idx ~= nil then
+            pcall(model.setGlobalVariable, wgt.vol_gvar_idx, 0, VOL_GVAR_OFF)
+            wgt.vol_gvar_idx = nil
+            wgt.vol_gvar_last = nil
+        end
+        if gv == 0 then return end
+    end
+    wgt.vol_gvar_idx = gv - 1
+    -- normal flight volume, boosted to the escalation volume while a critical alert
+    -- (with "Escalation volume" enabled) is active — see update_escalation
+    local pct = wgt.escalate_active and (o.VolEscal or 100) or (o.VolFlight or 80)
+    local raw = is_rf_connected(wgt) and pct_to_vol_raw(pct) or VOL_GVAR_OFF
+    if raw ~= wgt.vol_gvar_last then
+        if pcall(model.setGlobalVariable, gv - 1, 0, raw) then wgt.vol_gvar_last = raw end
+    end
+end
+
 -- resolve the effective callout volume from the settings (see audio_volume above).
 -- Also resolves the voice-language folder (audio_path) from the same options table,
 -- since this runs at every sound-capable entry point alongside the mute refresh.
@@ -322,19 +473,52 @@ end
 -- bit 0 = armed) because it's always available and authoritative; the RFTool
 -- connection state ("armed") is only a fallback (it doesn't reliably report the
 -- armed sub-state on every setup, which left flight-time tracking at 00:00).
+-- Per-tick cache: within one refresh pass (same getTime centisecond) MANY callers ask
+-- (nearly every alert function), and each getSourceValue("ARM") is a name lookup. Cache
+-- the result keyed by the current centisecond so a pass does ONE sensor read, not ~8.
 local function is_craft_armed(wgt)
+    local now = getTime() or 0
+    if wgt.arm_cache_t == now then return wgt.arm_cache_v end
+    local result
     local arm = getSourceValue("ARM")
     if arm ~= nil then
         arm = math.floor(arm)
-        return (arm % 2) == 1 or arm == 1024
+        result = (arm % 2) == 1 or arm == 1024
+    else
+        result = wgt.values.rf_connection_state == "armed"
     end
-    return wgt.values.rf_connection_state == "armed"
+    wgt.arm_cache_t = now
+    wgt.arm_cache_v = result
+    return result
 end
 
 -- exported armed check (thin wrapper) for the UI layer (e.g. auto-closing the ELRS
 -- detail page when the craft arms)
 function ultidash_functions.is_armed(wgt)
     return is_craft_armed(wgt)
+end
+
+-- Raw ARM-sensor state, WITHOUT the rf_connection_state fallback: true only when the
+-- ARM telemetry sensor is present AND reports armed; nil telemetry (dropout) -> false.
+-- The EdgeTX logs show this sensor is clean (1 -> 0, no flicker) even through a
+-- main-power-lost, unlike the connection sub-state — so it's the trustworthy signal for
+-- the stats-page dismiss edge (a stale/flaky connection state must not reopen the page).
+function ultidash_functions.arm_sensor_on(wgt)
+    local arm = getSourceValue("ARM")
+    if arm == nil then return false end
+    arm = math.floor(arm)
+    return (arm % 2) == 1 or arm == 1024
+end
+
+-- "Operating" = actively flying, taken from the RF TOOL's armed state (its armed/disarmed
+-- transitions are clean on this setup — see the debug logs — whereas the ARM telemetry
+-- sensor holds a STALE "armed" for ~30 s after a disconnect). This gates the voltage
+-- LATCH and the widget's stats extrema ONLY: once the RF tool leaves "armed" (disarm or
+-- disconnect) the latch holds the last in-flight value and extrema stop, so a regular
+-- disarmed unplug / backup-buffer decay can't pollute the display or the statistics.
+-- (is_craft_armed, the MSP-safety gate, deliberately stays on the ARM sensor.)
+local function is_operating(wgt)
+    return wgt.values.rf_connection_state == "armed"
 end
 
 local function should_track_governor_run_extrema(wgt)
@@ -386,6 +570,8 @@ local function clear_live_telemetry_values(wgt)
     wgt.vcel_pending = nil
     wgt.vbec_pending = nil
     wgt.supply_collapsed = nil
+    wgt.power_lost = nil
+    wgt.pwr_lost_latched = nil
     wgt.values.vbat = nil
     wgt.values.vbat_min = nil
     wgt.values.vbat_max = nil
@@ -495,20 +681,39 @@ end
 -- ============================================================================
 -- GENERAL INFO UPDATES
 -- ============================================================================
+-- model.getInfo() allocates a fresh table per call and is read by BOTH update_craft_name
+-- and update_model_image every 5 Hz pass. Cache it per centisecond (the active model is
+-- global, so one module-local cache serves all instances) to drop the duplicate alloc.
+local mi_cache, mi_cache_t
+local function cached_model_info()
+    local now = getTime() or 0
+    if mi_cache_t ~= now then mi_cache = model.getInfo(); mi_cache_t = now end
+    return mi_cache
+end
+
 function ultidash_functions.update_craft_name(wgt)
     -- Prefer the Rotorflight FC model name and CACHE it, so the stats page (shown
     -- on disconnect, where rf2.modelName goes nil) keeps showing the FC name rather
     -- than falling back to the EdgeTX model/profile name. Only fall back to the
-    -- EdgeTX name if no FC name was ever seen.
+    -- EdgeTX name if no FC name was ever seen. Each gsub runs ONLY when its raw input
+    -- changes (it would otherwise allocate a string on every 5 Hz pass).
     local fc_name = rf2 and rf2.modelName
     if fc_name and fc_name ~= "" then
-        wgt.values.rf_craft_name = string.gsub(fc_name, "^>", "")
+        if fc_name ~= wgt.craft_name_raw then
+            wgt.craft_name_raw = fc_name
+            wgt.values.rf_craft_name = string.gsub(fc_name, "^>", "")
+        end
     end
 
     local name = wgt.values.rf_craft_name
     if not name then
-        local model_info = model.getInfo()
-        name = string.gsub((model_info and model_info.name) or "Unknown", "^>", "")
+        local model_info = cached_model_info()
+        local raw = (model_info and model_info.name) or "Unknown"
+        if raw ~= wgt.model_name_raw then
+            wgt.model_name_raw = raw
+            wgt.model_name_clean = string.gsub(raw, "^>", "")
+        end
+        name = wgt.model_name_clean
     end
     wgt.values.craft_name = name
 end
@@ -534,7 +739,7 @@ function ultidash_functions.update_model_image(wgt)
     if craft == "Unknown" or craft == "NotDefined" or craft == "-" or craft == "" then craft = nil end
 
     local cells = wgt.values.cel_count or wgt.values.rf_battery_cell_count or 0
-    local mi = model.getInfo()
+    local mi = cached_model_info()
     local model_bmp = mi and mi.bitmap
 
     if wgt.img_craft == craft and wgt.img_cells == cells and wgt.img_model_bmp == model_bmp then
@@ -610,9 +815,10 @@ end
 
 function ultidash_functions.update_tx_bat_voltage(wgt)
     wgt.values.vtx_volts = getSourceValue("tx-voltage")
-    wgt.values.vtx_volts_max = getGeneralSettings().battMax
-    wgt.values.vtx_volts_min = getGeneralSettings().battMin
-    wgt.values.vtx_volts_warn = getGeneralSettings().battWarn
+    local gs = getGeneralSettings()
+    wgt.values.vtx_volts_max = gs.battMax
+    wgt.values.vtx_volts_min = gs.battMin
+    wgt.values.vtx_volts_warn = gs.battWarn
 
     if wgt.values.vtx_volts == nil then
         wgt.values.vtx_volts_percent = nil
@@ -741,14 +947,31 @@ end
 -- ≤ 1 V never overwrites the held value; while disarmed a drop > drop_delta below
 -- the held value is only accepted once it stayed stable for VOLT_ACCEPT_CS.
 -- Returns true when `raw` was accepted into wgt.values[key].
-local function latch_voltage(wgt, key, raw, drop_delta)
+local function latch_voltage(wgt, key, raw, drop_delta, collapse_delta)
     local pend_key = key .. "_pending"
     if raw == nil or raw <= MIN_PLAUSIBLE_CELL_V then
         wgt[pend_key] = nil                       -- collapse tail / no data
         return false
     end
     local held = wgt.values[key]
-    if held == nil or is_craft_armed(wgt) or raw >= held - drop_delta then
+    if held == nil then
+        wgt.values[key] = raw
+        wgt[pend_key] = nil
+        return true
+    end
+    if is_operating(wgt) then
+        -- ARMED: accept real load sag live, but REJECT an implausibly large single-step
+        -- drop — that is a supply collapse (buffer takeover), not sag. Rejecting freezes
+        -- the latch at the last healthy value (see COLLAPSE_DROP_CELL); the caller reads
+        -- `not accepted` as supply_collapsed and engages power_lost.
+        if collapse_delta == nil or raw >= held - collapse_delta then
+            wgt.values[key] = raw
+            wgt[pend_key] = nil
+            return true
+        end
+        return false
+    end
+    if raw >= held - drop_delta then
         wgt.values[key] = raw
         wgt[pend_key] = nil
         return true
@@ -776,7 +999,8 @@ function ultidash_functions.update_cell(wgt)
     -- battery state instead of 0.00 / a mid-decay value. The collapse itself is still
     -- detected by update_power_warning, which reads the sensor directly.
     local raw = getSourceValue("Vbat")
-    local accepted = latch_voltage(wgt, "vbat", raw, VOLT_DROP_CELL * (wgt.values.cel_count or 6))
+    local cells = wgt.values.cel_count or 6
+    local accepted = latch_voltage(wgt, "vbat", raw, VOLT_DROP_CELL * cells, COLLAPSE_DROP_CELL * cells)
     -- Main-supply-collapse flag: a real Vbat reading that the latch rejected while we
     -- already hold a good value means the main supply is collapsing/collapsed (unplug
     -- on a buffer). Fires on the FIRST decay frame — other channels (BEC) use it to
@@ -784,10 +1008,22 @@ function ultidash_functions.update_cell(wgt)
     -- reading shows the buffer, not their own state. False at session start (no held
     -- value yet) and cleared as soon as a reading is accepted again.
     wgt.supply_collapsed = (raw ~= nil and not accepted and wgt.values.vbat ~= nil)
+    -- Sticky MAIN-POWER-LOST mode: engaged the moment a collapse is detected while a good
+    -- value is still held (main pack gone, the rail running on the buffer); held through the
+    -- ~0 V decay tail and cleared only when a healthy reading is accepted again (power
+    -- restored) or a disarm/disconnect resets the callout state. Drives the "only main-power-
+    -- lost + BEC" callout suppression, the "--" main-voltage display and the MAIN POWER LOST
+    -- status line. A disarmed bench unplug can also set supply_collapsed for one pass, but
+    -- update_battery_callout's disarmed guard clears power_lost again in the same cycle.
+    if wgt.supply_collapsed then
+        wgt.power_lost = true
+    elseif accepted then
+        wgt.power_lost = false
+    end
     -- Widget-tracked min/max, recorded ONLY while ARMED (operating) — like the RPM
     -- extrema gate on the governor run-state. The disarmed unplug decay is excluded
     -- twice over (armed gate + latch).
-    if is_craft_armed(wgt) and wgt.values.vbat ~= nil then
+    if is_operating(wgt) and wgt.values.vbat ~= nil then
         update_tracked_extrema(wgt, "vbat", "vbat_min", "vbat_max")
     end
 
@@ -800,9 +1036,9 @@ end
 
 function ultidash_functions.update_vcel(wgt)
     -- latched like update_cell (fixes "Latest 0.00" after a buffer-bridged unplug)
-    local accepted = latch_voltage(wgt, "vcel", getSourceValue("Vcel"), VOLT_DROP_CELL)
+    local accepted = latch_voltage(wgt, "vcel", getSourceValue("Vcel"), VOLT_DROP_CELL, COLLAPSE_DROP_CELL)
     -- widget-tracked, ARMED-only (see update_cell)
-    if is_craft_armed(wgt) and wgt.values.vcel ~= nil then
+    if is_operating(wgt) and wgt.values.vcel ~= nil then
         update_tracked_extrema(wgt, "vcel", "vcel_min", "vcel_max")
     end
     -- Cell count follows the voltage latch: the FC derives Cel# from Vbat, so during a
@@ -822,16 +1058,18 @@ function ultidash_functions.update_vcel(wgt)
 end
 
 function ultidash_functions.update_vbec(wgt)
-    -- During a main-supply collapse (flag from update_cell) the rail is fed by the
-    -- buffer, so the Vbec reading shows the BUFFER's voltage, not the BEC's normal
-    -- state (seen as stats "Latest" 8.21 below a Min of 8.30) -> hold the last normal
-    -- value for the whole event. The latch's own 0.5 V disarmed-drop guard would NOT
-    -- catch this (buffer voltage is typically only ~0.1 V below the BEC).
-    if not wgt.supply_collapsed then
-        latch_voltage(wgt, "vbec", getSourceValue("Vbec"), 0.5)
+    -- BEC is shown LIVE (NOT latched, unlike Vbat/Vcel): during a backup event (main pack
+    -- gone, the rail running on the buffer) the pilot must see the buffer actually sagging,
+    -- not a frozen last-normal value. Only the plausibility floor stays (ignore <=1 V "no
+    -- data" so a brief dropout doesn't blank the reading). NB: supply_collapsed is only a
+    -- transient collapse-in-progress flag (it clears once the buffer voltage settles and is
+    -- accepted as Vbat), so it can't gate this reliably — hence: no latch at all for Vbec.
+    local raw = getSourceValue("Vbec")
+    if raw ~= nil and raw > MIN_PLAUSIBLE_CELL_V then
+        wgt.values.vbec = raw
     end
-    -- widget-tracked, ARMED-only (see update_cell)
-    if is_craft_armed(wgt) and wgt.values.vbec ~= nil then
+    -- widget-tracked, operating-only (see update_cell / is_operating)
+    if is_operating(wgt) and wgt.values.vbec ~= nil then
         update_tracked_extrema(wgt, "vbec", "vbec_min", "vbec_max")
     end
 
@@ -950,7 +1188,7 @@ function ultidash_functions.update_battery_gauge(wgt)
                 wgt.batt_warn = false
             else
                 wgt.batt_warn = true
-                if wgt.options.SndCellChk == 1 then
+                if wgt.options.SndCellChk == 1 and not wgt.power_lost then
                     play_audio("batlow")
                     if vbat then play_number(vbat * 10, 1, PREC1) end
                 end
@@ -1028,44 +1266,53 @@ local function build_arm_disable_text(flags)
     return "* " .. table.concat(parts, " ")
 end
 
+-- Full (uncapped) list of active arming-disable reason names, space-joined — for the
+-- Status detail page (which has room to show them all). nil when nothing blocks arming.
+local function build_arm_disable_list(flags)
+    if not flags or flags == 0 then return nil end
+    local parts = {}
+    for i = 1, #ARM_DISABLE_DESCS do
+        if bit32.band(flags, bit32.lshift(1, i - 1)) ~= 0 then
+            parts[#parts + 1] = ARM_DISABLE_DESCS[i]
+        end
+    end
+    if #parts == 0 then return nil end
+    return table.concat(parts, "  ")
+end
+
 -- ============================================================================
 -- SWITCH VOICE ANNOUNCEMENTS
 -- ============================================================================
 -- Speak configured TX-switch positions (motor/rescue/governor on-off + profile
--- 1..3). READ-ONLY getValue on the physical switch — fully independent of the
--- model's mixer/logical-switch safety chain (which stays in the model) and of
--- telemetry. Each function is selectable in the settings incl. an inverted
--- variant (choice list: Off, SA, SA inv, SB, ... SH inv).
-
-local SWITCH_SRC = { "sa", "sb", "sc", "sd", "se", "sf", "sg", "sh" }
-
-local function switch_voice_pos(idx)
-    if idx == nil or idx <= 1 then return nil end          -- 1 = Off
-    if idx >= 100 then
-        -- logical switch (code = 100 + 2*ls_index, +1 = inverted): boolean on/off
-        local lsi = math.floor((idx - 100) / 2)
-        local ok, v = pcall(getLogicalSwitchValue, lsi)
-        if not ok or v == nil then return nil end
-        local p = v and 3 or 1
-        if idx % 2 == 1 then p = 4 - p end
-        return p
-    end
-    local si = math.floor((idx - 2) / 2) + 1
-    local src = SWITCH_SRC[si]
-    if src == nil then return nil end
-    local ok, v = pcall(getValue, src)
+-- 1..3). READ-ONLY getValue on the switch — fully independent of the model's
+-- mixer/logical-switch safety chain (which stays in the model) and of telemetry.
+-- The stored value is a SIGNED EdgeTX source index of the WHOLE switch, picked
+-- with the native lvgl.source popup (negative = the popup's "!" inverted entry,
+-- 0 = Off). getValue on a switch source returns -1024/0/1024 -> position 1/2/3;
+-- logical switches read as 2-pos (never mid). Legacy list codes are migrated to
+-- source indices once in ultidash.lua (legacy_switch_code_to_src).
+local function switch_voice_pos(src)
+    if type(src) ~= "number" or src == 0 then return nil end   -- 0 = Off
+    local ok, v = pcall(getValue, math.abs(src))
     if not ok or v == nil then return nil end
     local p
     if v > 200 then p = 3 elseif v < -200 then p = 1 else p = 2 end
-    if idx % 2 == 1 then p = 4 - p end                     -- odd indices = inverted
+    if src < 0 then p = 4 - p end                              -- inverted pick
     return p
 end
 
+-- Exported "is this configured switch in its ON (up) position?" — reuses the switch-voice
+-- source resolution (0 = Off -> false). Used by the Toolbox activation switch.
+function ultidash_functions.switch_is_on(src)
+    local p = switch_voice_pos(src)
+    return p ~= nil and p >= 3
+end
+
 local SWITCH_VOICES = {
-    { key = "MotorSw",   on = "motor_on",  off = "motor_off" },
-    { key = "RescueSw",  on = "rescue_on", off = "rescue_off" },
-    { key = "GovSw",     on = "gov_on",    off = "gov_off" },
-    { key = "ProfileSw", profile = true },
+    { key = "MotorSrc",   on = "motor_on",  off = "motor_off" },
+    { key = "RescueSrc",  on = "rescue_on", off = "rescue_off" },
+    { key = "GovSrc",     on = "gov_on",    off = "gov_off" },
+    { key = "ProfileSrc", profile = true },
 }
 
 function ultidash_functions.update_switch_voices(wgt)
@@ -1192,14 +1439,32 @@ function ultidash_functions.update_estatus(wgt)
         status_color = COLOR_THEME_DISABLED
     end
 
+    -- MAIN POWER LOST overrides everything on the status line (highest priority): the
+    -- clearest on-screen signal that the rail is on the buffer now (main voltage reads "--",
+    -- BEC becomes the interesting value).
+    if wgt.power_lost then
+        status_text = "MAIN POWER LOST"
+        status_color = BAR_COLOR_CRITICAL
+    end
+
     wgt.values.status_line_text = status_text or ""
     wgt.values.status_line_color = status_color or COLOR_THEME_PRIMARY1
+    -- full arming-disable reason list for the Status page (cached at 5 Hz; the reactive
+    -- page closures just read the string, no per-frame bit-scan / allocation)
+    wgt.values.arm_reasons_full = (connected and not armed) and build_arm_disable_list(wgt.values.arm_disable_flags) or nil
 
     -- armed/disarm voice on state change (skip the very first sample)
     if connected then
         if wgt.estatus_armed ~= nil and wgt.estatus_armed ~= armed then
             if wgt.options.SndArm == 1 then
                 play_audio(armed and "armed" or "disarm")
+                play_vibe(wgt, "Arm")
+                if armed then
+                    -- optional "still armed" reminder (only if Arm repeat is enabled)
+                    arm_repeat(wgt, "Arm", function() play_audio("armed"); play_vibe(wgt, "Arm") end)
+                else
+                    clear_repeat(wgt, "Arm")
+                end
             end
             estatus_log(wgt, armed and "Armed" or "Disarmed", esc.LEVEL_INFO)
         end
@@ -1214,6 +1479,28 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
     refresh_audio_volume(wgt)
     local telem_snd = wgt.options and wgt.options.SndTelem == 1
 
+    -- ESC-load session limit: the FC SETS the limit GVAR after connect but never clears
+    -- it, so UltiDash zeroes it when the session really ends — the DISARMED disconnect
+    -- (normal power-off; also fires on the initial disconnected state). An ARMED
+    -- disconnect is a telemetry blip/crash: keep latch + GVAR so bar/alarm survive a
+    -- mid-flight reconnect even if the FC does not re-send. GVAR-only write (no MSP),
+    -- same pattern as the volume override -> armed-safe by design anyway.
+    if new_state == "disconnected" and previous_state ~= "armed"
+            and wgt.options and wgt.options.EscMon == 1
+            and (wgt.options.EscGvar or 0) ~= 0 then
+        wgt.escl_limit = nil
+        wgt.escl_probe_until = nil
+        if type(model) == "table" and type(model.setGlobalVariable) == "function" then
+            local okfm, fm = pcall(getFlightMode)
+            local mode = (okfm and type(fm) == "number") and fm or 0
+            pcall(model.setGlobalVariable, (wgt.options.EscGvar or 1) - 1, mode, 0)
+        end
+    end
+    -- every fresh connect opens a fresh ESC-load probe window (see ESCL_PROBE_CS)
+    if previous_state == "disconnected" and new_state ~= "disconnected" then
+        wgt.escl_probe_until = nil
+    end
+
     if previous_state == "disconnected" and new_state ~= "disconnected" then
         clear_live_telemetry_values(wgt)
         ultidash_functions.reset_telemetry_stats(wgt)
@@ -1222,18 +1509,30 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
             play_audio("telem_ok")
         end
         wgt.link_lost_armed = false
+        clear_repeat(wgt, "Telem")
         return
     end
 
     -- telemetry lost while ARMED (in flight): urgent voice + vibrate.
     -- losses while disarmed / on the bench stay silent (logged only).
     if new_state == "disconnected" then
+        -- Stop the main-power-lost nag on the final cut-off: once telemetry is gone
+        -- update_power_warning can no longer clear it itself (Vbat reads nil and its armed
+        -- gate stays stale ~30 s), so the Pwr repeat would keep cranking. telem_lost below
+        -- then communicates that the system is gone.
+        wgt.pwr_pending = 0
+        wgt.pwr_announced = false
+        clear_repeat(wgt, "Pwr")
         if previous_state == "armed" then
             ultidash_functions.log("Connection lost (armed)")
             if telem_snd then
                 play_audio("telem_lost")
-                play_vibe(wgt)
+                play_vibe(wgt, "Telem")
                 wgt.link_lost_armed = true
+                arm_repeat(wgt, "Telem", function()
+                    play_audio("telem_lost")
+                    play_vibe(wgt, "Telem")
+                end)
             end
         elseif previous_state ~= nil then
             ultidash_functions.log("Connection lost")
@@ -1247,100 +1546,163 @@ end
 
 -- Reset the ePowerbar callout state machine (on disarm / disconnect).
 local function reset_callout_state(wgt)
+    wgt.power_lost = false                 -- leave the main-power-lost mode on disarm/disconnect
+    wgt.pwr_lost_latched = false           -- so no "restored" mis-fires after a reconnect
     wgt.callout_last_capa = 100
     wgt.callout_next_capa = 0
-    wgt.alert_pending = 0
-    wgt.alert_next = 0
-    wgt.alert_level = ALERTLEVEL_NONE
+    wgt.fuel_critical_on = false          -- true while fuel is in the critical (nag) band
+    wgt.volt_pending = 0
+    wgt.volt_level = ALERTLEVEL_NONE      -- worst level seen during the current debounce
+    wgt.volt_announced = ALERTLEVEL_NONE  -- highest level already spoken this episode
+    clear_repeat(wgt, "Fuel")
+    clear_repeat(wgt, "Volt")
 end
 
--- ePowerbar crankFuelCalls: announce fuel % on the 10s, singles when critical.
+-- ePowerbar crankFuelCalls (view A): the descending %-step callouts stay VALUE-driven
+-- (announced when the rounded % changes). The step DENSITY is configurable: silent above
+-- FuelStart, FuelStep in the coarse range, a finer FuelStepFine below the FuelDense
+-- breakpoint (defaults = the historical from-full / 10 % / 1 %-below-10 % cadence). The
+-- battry/batlow WORDING stays tied to the real low band (critical + FUEL_VLOW), independent
+-- of the density breakpoint. The CRITICAL/empty band is the "nag": announced once on entry,
+-- then repeated by the per-alert repeat engine (FuelRep / FuelCnt / FuelInt).
 local function crank_fuel_calls(wgt)
     -- bail if fuel callouts are switched off
-    if wgt.options.SndFuel ~= 1 then return end
+    if wgt.options.SndFuel ~= 1 then
+        wgt.fuel_critical_on = false
+        clear_repeat(wgt, "Fuel")
+        return
+    end
+    -- MAIN POWER LOST: the pack is gone (RF then reports the buffer's capacity as fuel %,
+    -- which is meaningless). Suppress all fuel callouts + their nag — only main-power-lost
+    -- and BEC speak in that state.
+    if wgt.power_lost then
+        wgt.fuel_critical_on = false
+        clear_repeat(wgt, "Fuel")
+        return
+    end
 
     local fuel = wgt.values.fuel
     if fuel == nil then return end
 
     local critical = fuel_critical(wgt)
-    local interval = math.max(1, wgt.options.CalloutInt or 6) * 100
-
-    local capa
-    if fuel > critical + FUEL_VLOW then
-        capa = math.ceil(fuel / 10) * 10
-    else
-        capa = fuel
-    end
-
+    local interval = math.max(1, wgt.options.FuelInt or 6) * 100
     local now = getTime()
-    if (wgt.callout_last_capa ~= capa or capa <= 0) and now > wgt.callout_next_capa then
-        -- skip the very first pass after arming
-        if wgt.callout_next_capa ~= 0 then
-            if capa > critical + FUEL_VLOW then
-                play_audio("battry")
-            elseif capa > critical then
-                play_audio("batlow")
-            else
-                play_audio("batcrt")
-                play_vibe(wgt)
+
+    if fuel > critical then
+        -- ABOVE critical: value-driven step callouts, no repeat engine
+        wgt.fuel_critical_on = false
+        clear_repeat(wgt, "Fuel")
+        local dense = wgt.options.FuelDense or 10
+        local step = (fuel <= dense) and math.max(1, wgt.options.FuelStepFine or 1)
+                                      or  math.max(1, wgt.options.FuelStep or 10)
+        local capa = math.ceil(fuel / step) * step
+        if capa > 100 then capa = 100 end
+        if wgt.callout_last_capa ~= capa and now > wgt.callout_next_capa then
+            -- announce only at/below the start threshold, and skip the very first pass
+            -- after arming (callout_next_capa == 0)
+            if wgt.callout_next_capa ~= 0 and fuel <= (wgt.options.FuelStart or 100) then
+                if fuel > critical + FUEL_VLOW then play_audio("battry") else play_audio("batlow") end
+                if capa >= 0 then play_number(capa, UNIT_PERCENT) end
             end
-            if capa >= 0 then
-                play_number(capa, UNIT_PERCENT)
-            end
+            wgt.callout_last_capa = capa
+            wgt.callout_next_capa = now + interval
         end
-        wgt.callout_last_capa = capa
-        wgt.callout_next_capa = now + interval
+    else
+        -- AT/BELOW critical: announce once on entry, then let the repeat engine nag
+        local function speak()
+            play_audio("batcrt")
+            play_vibe(wgt, "Fuel")
+            local c = wgt.values.fuel
+            if c and c >= 0 then play_number(c, UNIT_PERCENT) end
+        end
+        if not wgt.fuel_critical_on then
+            if wgt.callout_next_capa ~= 0 then       -- not the very first sample after arming
+                wgt.fuel_critical_on = true
+                speak()
+                arm_repeat(wgt, "Fuel", speak)
+            end
+            wgt.callout_last_capa = fuel
+            wgt.callout_next_capa = now + interval
+        end
     end
 end
 
--- ePowerbar crankVoltageAlerts: low/critical per-cell voltage alerts with debounce.
+-- crankVoltageAlerts (view A): low/critical per-cell voltage. Each level is announced
+-- ONCE on crossing (value-driven, with a short debounce so a brief sag doesn't trigger).
+-- The CRITICAL level is then nagged by the per-alert repeat engine (VoltRep / VoltCnt /
+-- VoltInt) — Repeat off = the single crossing announce only.
 local function crank_voltage_alerts(wgt)
     -- bail if voltage alerts are switched off
-    if wgt.options.SndVolt ~= 1 then return end
+    if wgt.options.SndVolt ~= 1 then
+        wgt.volt_pending = 0; wgt.volt_level = ALERTLEVEL_NONE; wgt.volt_announced = ALERTLEVEL_NONE
+        clear_repeat(wgt, "Volt")
+        return
+    end
+    -- MAIN POWER LOST: the frozen last-good voltage is not a real "critical cell" — suppress
+    -- the voltage callouts + nag; only main-power-lost and BEC speak in that state.
+    if wgt.power_lost then
+        wgt.volt_pending = 0; wgt.volt_level = ALERTLEVEL_NONE; wgt.volt_announced = ALERTLEVEL_NONE
+        clear_repeat(wgt, "Volt")
+        return
+    end
 
     local cellv = wgt.values.vcel
     -- ignore implausible (<1V) readings -> a collapsed/lost supply is no real "critical"
     if cellv == nil or cellv <= MIN_PLAUSIBLE_CELL_V then return end
 
     local now = getTime()
-    if now < wgt.alert_next then return end
-
     -- thresholds come from the Rotorflight FC (mspBatteryConfig), in centivolts
     local cv = math.floor(cellv * 100)
     local alarm = math.floor(wgt.values.vcel_alarm_threshold() * 100)
     local low = math.floor(wgt.values.vcel_warning_threshold() * 100)
+    local level = (cv <= alarm and ALERTLEVEL_CRITICAL) or (cv <= low and ALERTLEVEL_LOW) or ALERTLEVEL_NONE
 
-    local alert_level = (cv <= alarm and ALERTLEVEL_CRITICAL) or (cv <= low and ALERTLEVEL_LOW) or ALERTLEVEL_NONE
+    -- recovered above the warn threshold: re-arm for the next drop, stop any nag
+    if level == ALERTLEVEL_NONE then
+        wgt.volt_pending = 0; wgt.volt_level = ALERTLEVEL_NONE; wgt.volt_announced = ALERTLEVEL_NONE
+        clear_repeat(wgt, "Volt")
+        return
+    end
 
-    if wgt.alert_pending ~= 0 then
-        if alert_level == ALERTLEVEL_NONE then
-            -- condition cleared while pending
-            wgt.alert_pending = 0
-            return
-        elseif alert_level < wgt.alert_level then
-            wgt.alert_level = alert_level
-        end
+    -- not worse than what was already announced: stay silent. On an improvement that is
+    -- still in-band (e.g. critical -> low) drop the critical nag and lower the latch so a
+    -- renewed worsening re-announces.
+    if level <= (wgt.volt_announced or ALERTLEVEL_NONE) then
+        wgt.volt_pending = 0
+        if level < ALERTLEVEL_CRITICAL then clear_repeat(wgt, "Volt") end
+        wgt.volt_announced = level
+        return
+    end
 
-        if now >= wgt.alert_pending then
-            local haptic = false
-            if alert_level == ALERTLEVEL_LOW then
-                play_audio("batlow")
-            elseif alert_level == ALERTLEVEL_CRITICAL then
+    -- new or escalated level: debounce (must hold), then announce once
+    if (wgt.volt_pending or 0) == 0 then
+        wgt.volt_level = level
+        wgt.volt_pending = now + ALERT_SAMPLE_CS
+        return
+    end
+    if level > wgt.volt_level then wgt.volt_level = level end
+
+    if now >= wgt.volt_pending then
+        local function speak()
+            if wgt.volt_level >= ALERTLEVEL_CRITICAL then
                 play_audio("batcrt")
-                haptic = true
+                play_vibe(wgt, "Volt")
+            else
+                play_audio("batlow")
             end
             -- report total voltage (ePowerbar workaround for per-cell announce)
             local vbat = wgt.values.vbat
             if vbat then play_number(vbat * 10, UNIT_VOLTS, PREC1) end
-            if haptic then play_vibe(wgt) end
-
-            wgt.alert_next = now + math.max(1, wgt.options.CalloutInt or 6) * 100
-            wgt.alert_pending = 0
-            return
         end
-    elseif alert_level > ALERTLEVEL_NONE then
-        wgt.alert_level = alert_level
-        wgt.alert_pending = now + ALERT_SAMPLE_CS
+        speak()
+        wgt.volt_announced = wgt.volt_level
+        wgt.volt_pending = 0
+        -- critical: hand the "keep nagging" behaviour to the repeat engine
+        if wgt.volt_level >= ALERTLEVEL_CRITICAL then
+            arm_repeat(wgt, "Volt", speak)
+        else
+            clear_repeat(wgt, "Volt")
+        end
     end
 end
 
@@ -1373,6 +1735,7 @@ function ultidash_functions.update_link_warning(wgt)
         wgt.link_pending = 0
         wgt.link_level = 0
         wgt.link_announced = 0
+        clear_repeat(wgt, "Link")
         return
     end
     -- only while armed (in flight); no link callouts on the bench / disarmed
@@ -1380,6 +1743,7 @@ function ultidash_functions.update_link_warning(wgt)
         wgt.link_pending = 0
         wgt.link_level = 0
         wgt.link_announced = 0
+        clear_repeat(wgt, "Link")
         return
     end
 
@@ -1397,6 +1761,7 @@ function ultidash_functions.update_link_warning(wgt)
         wgt.link_pending = 0
         wgt.link_level = 0
         wgt.link_announced = 0
+        clear_repeat(wgt, "Link")
         return
     end
 
@@ -1416,16 +1781,21 @@ function ultidash_functions.update_link_warning(wgt)
     if level > wgt.link_level then wgt.link_level = level end
 
     if now >= wgt.link_pending then
-        if wgt.link_level >= 2 then
-            play_audio("link_crit")
-            play_vibe(wgt)
-        else
-            play_audio("link_warn")
+        local function speak()
+            if wgt.link_level >= 2 then
+                play_audio("link_crit")
+                play_vibe(wgt, "Link")
+            else
+                play_audio("link_warn")
+            end
+            -- announce the actual (current) link quality value
+            local q = getSourceValue("RQly")
+            if q then play_number(q, UNIT_PERCENT) end
         end
-        -- announce the actual link quality value
-        play_number(rqly, UNIT_PERCENT)
+        speak()
         wgt.link_announced = wgt.link_level
         wgt.link_pending = 0
+        arm_repeat(wgt, "Link", speak)   -- repeat only if LinkRep is on (else a no-op)
     end
 end
 
@@ -1438,12 +1808,14 @@ function ultidash_functions.update_rssi_warning(wgt)
         wgt.rssi_pending = 0
         wgt.rssi_level = 0
         wgt.rssi_announced = 0
+        clear_repeat(wgt, "Rssi")
         return
     end
     if not is_craft_armed(wgt) then
         wgt.rssi_pending = 0
         wgt.rssi_level = 0
         wgt.rssi_announced = 0
+        clear_repeat(wgt, "Rssi")
         return
     end
 
@@ -1464,6 +1836,7 @@ function ultidash_functions.update_rssi_warning(wgt)
         wgt.rssi_pending = 0
         wgt.rssi_level = 0
         wgt.rssi_announced = 0
+        clear_repeat(wgt, "Rssi")
         return
     end
     if level <= (wgt.rssi_announced or 0) then
@@ -1483,14 +1856,18 @@ function ultidash_functions.update_rssi_warning(wgt)
     if level > wgt.rssi_level then wgt.rssi_level = level end
 
     if now >= wgt.rssi_pending then
-        if wgt.rssi_level >= 2 then
-            play_audio("rssi_crit")
-            play_vibe(wgt)
-        else
-            play_audio("rssi_warn")
+        local function speak()
+            if wgt.rssi_level >= 2 then
+                play_audio("rssi_crit")
+                play_vibe(wgt, "Rssi")
+            else
+                play_audio("rssi_warn")
+            end
         end
+        speak()
         wgt.rssi_announced = wgt.rssi_level
         wgt.rssi_pending = 0
+        arm_repeat(wgt, "Rssi", speak)   -- repeat only if RssiRep is on (else a no-op)
     end
 end
 
@@ -1507,13 +1884,29 @@ function ultidash_functions.update_power_warning(wgt)
     if not wgt.options or wgt.options.PwrWarn ~= 1 then
         wgt.pwr_pending = 0
         wgt.pwr_announced = false
+        clear_repeat(wgt, "Pwr")
         return
     end
     if not is_craft_armed(wgt) then
         wgt.pwr_pending = 0
         wgt.pwr_announced = false
+        clear_repeat(wgt, "Pwr")
         return
     end
+
+    -- MAIN POWER RESTORED: announce once when we leave the power-lost state while STILL
+    -- armed & connected (the main pack came back without a full disconnect/reconnect — the
+    -- buffer bridged the gap). The pwr_lost_latched flag is armed while power_lost holds and
+    -- cleared on disarm/disconnect (reset_callout_state / clear_live_telemetry_values), so a
+    -- reconnect after a total loss never mis-fires "restored".
+    if wgt.pwr_lost_latched and not wgt.power_lost then
+        wgt.pwr_lost_latched = false
+        if is_rf_connected(wgt) then
+            play_audio("pwr_ok")
+            play_vibe(wgt, "Pwr")
+        end
+    end
+    if wgt.power_lost then wgt.pwr_lost_latched = true end
 
     local vbat = getSourceValue("Vbat")
     if vbat == nil then return end
@@ -1540,15 +1933,205 @@ function ultidash_functions.update_power_warning(wgt)
             return
         end
         if now >= wgt.pwr_pending then
-            play_audio("pwr_backup")
-            play_vibe(wgt)
+            -- "main power lost" + the current BEC/buffer voltage (live now that Vbec is not
+            -- latched) — so a repeated Pwr alert audibly counts the buffer down. Config
+            -- (repeat/count/interval/escalation/vibrate) is the per-alert "Main power lost".
+            local function speak()
+                play_audio("pwr_backup")
+                play_vibe(wgt, "Pwr")
+                local bec = wgt.values.vbec
+                if bec then play_number(bec * 10, UNIT_VOLTS, PREC1) end
+            end
+            speak()
             wgt.pwr_announced = true
             wgt.pwr_pending = 0
+            arm_repeat(wgt, "Pwr", speak)   -- repeat only if PwrRep is on (else a no-op)
         end
     else
         wgt.pwr_pending = 0
         wgt.pwr_announced = false
+        clear_repeat(wgt, "Pwr")
     end
+end
+
+-- BEC-voltage warning (relative, self-calibrating): while OPERATING (armed) the widget
+-- captures a reference = the highest plausible BEC seen this flight (the healthy nominal),
+-- so it adapts to any 5 V / 6 V / 8.4 V BEC. It then warns when the live BEC drops BecWarn %
+-- below the reference, critical at BecCrit %. Announced once per level (warn->crit announces
+-- again); the per-alert repeat engine handles repeats. Reference + state reset on
+-- disarm/disconnect. Sensor-derived (Vbec, live/un-latched), no MSP -> armed-safe.
+function ultidash_functions.update_bec_warning(wgt)
+    if not wgt.options or wgt.options.SndBec ~= 1 or not is_operating(wgt) then
+        wgt.bec_ref = nil; wgt.bec_pending = 0; wgt.bec_level = 0; wgt.bec_announced = 0
+        clear_repeat(wgt, "Bec")
+        return
+    end
+    local bec = wgt.values.vbec
+    if bec == nil or bec <= MIN_PLAUSIBLE_CELL_V then return end
+    -- reference: highest BEC seen while operating (the nominal, captured from arm onward)
+    if wgt.bec_ref == nil or bec > wgt.bec_ref then wgt.bec_ref = bec end
+    local ref = wgt.bec_ref
+    if ref == nil or ref <= 0 then return end
+
+    local drop = (ref - bec) / ref * 100
+    local warn = wgt.options.BecWarn or 8
+    local crit = wgt.options.BecCrit or 15
+    local level = (drop >= crit and 2) or (drop >= warn and 1) or 0
+
+    if level == 0 then
+        wgt.bec_pending = 0; wgt.bec_level = 0; wgt.bec_announced = 0
+        clear_repeat(wgt, "Bec")
+        return
+    end
+    -- already announced this severity (or worse): stay silent (repeats via the engine)
+    if level <= (wgt.bec_announced or 0) then
+        wgt.bec_pending = 0
+        return
+    end
+    local now = getTime()
+    -- new or escalated level: debounce (must hold), then announce once
+    if (wgt.bec_pending or 0) == 0 then
+        wgt.bec_level = level
+        wgt.bec_pending = now + ALERT_SAMPLE_CS
+        return
+    end
+    if level > wgt.bec_level then wgt.bec_level = level end
+    if now >= wgt.bec_pending then
+        local function speak()
+            if wgt.bec_level >= 2 then
+                play_audio("bec_crit")
+                play_vibe(wgt, "Bec")
+            else
+                play_audio("bec_low")
+            end
+            local b = wgt.values.vbec
+            if b then play_number(b * 10, UNIT_VOLTS, PREC1) end
+        end
+        speak()
+        wgt.bec_announced = wgt.bec_level
+        wgt.bec_pending = 0
+        arm_repeat(wgt, "Bec", speak)   -- repeat only if BecRep is on (else a no-op)
+    end
+end
+
+-- How long after connect the ESC-load monitor keeps polling the limit GVAR before
+-- giving up (centiseconds). The FC needs a moment to write the value; if nothing > 0
+-- arrived within this window, the feature counts as NOT SET UP on this model for the
+-- rest of the session (toggling the alert off/on or reconnecting opens a new window).
+local ESCL_PROBE_CS = 1000   -- 10 s
+
+-- ESC continuous-current LOAD monitor: a configurable GVAR (set by the FC) holds the
+-- ESC's continuous-current limit in AMPS; load% = Curr / limit * 100. One clear MASTER
+-- runs the whole feature: EscMon ("ESC load monitoring") + a configured limit GVAR
+-- (EscGvar). Off (or no GVAR) => nothing at all: no bar, no "ESC Load" tile value
+-- ("not set"), no colour evaluation, no alarm — and no GVAR probe/zero. When on, the
+-- display (bar + tile) always shows; the ALARM (warn at EscWarn %, critical at
+-- EscCrit %, level-latched + repeat engine) is an additional opt-in (the "ESC load"
+-- alert's Active = EscLoad) that fires only while ARMED — and, being gated by EscMon,
+-- goes silent the moment monitoring is switched off. GVAR read is local
+-- (getGlobalVariable) -> no MSP -> armed-safe.
+function ultidash_functions.update_esc_load_warning(wgt)
+    local o = wgt.options
+    -- master: monitoring ON and a limit GVAR configured. Off => whole feature off, and
+    -- we never probe or zero the GVAR, so a legacy cfg's stale EscGvar can't clobber an
+    -- unrelated GVAR.
+    if not o or o.EscMon ~= 1 or (o.EscGvar or 0) == 0 then
+        wgt.values.esc_load_pct = nil; wgt.values.esc_load_limit = nil
+        wgt.escl_limit = nil
+        wgt.escl_probe_until = nil
+        wgt.escl_warn_since = nil; wgt.escl_crit_since = nil
+        wgt.escl_level = 0; wgt.escl_announced = 0
+        clear_repeat(wgt, "EscL")
+        return
+    end
+
+    -- limit (amps): latched ONCE per session from the configured GVAR. The FC writes
+    -- the ESC's continuous-current limit there after connect; UltiDash polls only until
+    -- the first value > 0 arrives (latched for the whole session, no further GVAR
+    -- reads) — but at most for ESCL_PROBE_CS after connect. Still 0 when the window
+    -- closes = the feature is not set up on THIS model -> bar hidden, no alarm, no
+    -- more polling. Latch + GVAR are reset on the disarmed disconnect in
+    -- on_telemetry_state_changed (the FC never zeroes the GVAR itself).
+    if wgt.escl_limit == nil and is_rf_connected(wgt) then
+        local now = getTime()
+        if wgt.escl_probe_until == nil then wgt.escl_probe_until = now + ESCL_PROBE_CS end
+        if now < wgt.escl_probe_until
+                and type(model) == "table" and type(model.getGlobalVariable) == "function" then
+            local okfm, fm = pcall(getFlightMode)
+            local mode = (okfm and type(fm) == "number") and fm or 0
+            local okgv, gv = pcall(model.getGlobalVariable, (o.EscGvar or 1) - 1, mode)
+            if okgv and type(gv) == "number" and gv > 0 then wgt.escl_limit = gv end
+        end
+    end
+    wgt.values.esc_load_limit = wgt.escl_limit
+
+    local curr = wgt.values.curr
+    if wgt.escl_limit == nil or curr == nil then
+        wgt.values.esc_load_pct = nil
+    else
+        wgt.values.esc_load_pct = math.floor(curr / wgt.escl_limit * 100 + 0.5)
+    end
+
+    -- alarm: additional opt-in (the "ESC load" alert's Active = EscLoad), armed only.
+    -- Gated by EscMon above, so turning monitoring off also silences the alarm.
+    if o.EscLoad ~= 1 or not is_craft_armed(wgt) then
+        wgt.escl_warn_since = nil; wgt.escl_crit_since = nil
+        wgt.escl_level = 0; wgt.escl_announced = 0
+        clear_repeat(wgt, "EscL")
+        return
+    end
+    local pct = wgt.values.esc_load_pct
+    if pct == nil then return end
+    local warn = o.EscWarn or 80
+    local crit = o.EscCrit or 100
+    local now = getTime()
+
+    -- Sustained-load gating (EscHold, seconds): ESCs tolerate SHORT bursts above the
+    -- continuous limit, so a level alarms only after the load stayed at/above its
+    -- threshold for the WHOLE hold time. Each threshold runs its own clock — a dip
+    -- below crit resets only the crit clock, the warn clock keeps running while the
+    -- load is still >= warn (unlike the other alerts' max-level sample window, which
+    -- would announce a momentary crit spike as critical).
+    if pct >= warn then
+        if wgt.escl_warn_since == nil then wgt.escl_warn_since = now end
+    else
+        wgt.escl_warn_since = nil
+    end
+    if pct >= crit then
+        if wgt.escl_crit_since == nil then wgt.escl_crit_since = now end
+    else
+        wgt.escl_crit_since = nil
+    end
+
+    if pct < warn then
+        -- fully recovered: re-arm the announcements for the next sustained excursion
+        wgt.escl_level = 0; wgt.escl_announced = 0
+        clear_repeat(wgt, "EscL")
+        return
+    end
+
+    local hold_cs = (o.EscHold or 5) * 100
+    local level = 0
+    if wgt.escl_crit_since ~= nil and (now - wgt.escl_crit_since) >= hold_cs then
+        level = 2
+    elseif wgt.escl_warn_since ~= nil and (now - wgt.escl_warn_since) >= hold_cs then
+        level = 1
+    end
+    if level == 0 or level <= (wgt.escl_announced or 0) then return end
+
+    wgt.escl_level = level
+    local function speak()
+        if (wgt.escl_level or 0) >= 2 then
+            play_audio("escl_crit"); play_vibe(wgt, "EscL")
+        else
+            play_audio("escl_warn")
+        end
+        local p = wgt.values.esc_load_pct
+        if p then play_number(p, UNIT_PERCENT) end
+    end
+    speak()
+    wgt.escl_announced = level
+    arm_repeat(wgt, "EscL", speak)   -- repeat only if EscLRep is on (else a no-op)
 end
 
 -- Skipped-telemetry-packet warning: while ARMED, if the cumulative *Skp counter
@@ -1559,10 +2142,12 @@ end
 function ultidash_functions.update_skp_warning(wgt)
     if not wgt.options or wgt.options.SkpWarn ~= 1 then
         wgt.skp_announced = false
+        clear_repeat(wgt, "Skp")
         return
     end
     if not is_craft_armed(wgt) then
         wgt.skp_announced = false
+        clear_repeat(wgt, "Skp")
         return
     end
 
@@ -1573,12 +2158,56 @@ function ultidash_functions.update_skp_warning(wgt)
     local limit = wgt.options.SkpLimit or 50
     if skp >= limit then
         if not wgt.skp_announced then
-            play_audio("skp_high")
+            local function speak() play_audio("skp_high") end
+            speak()
             wgt.skp_announced = true
+            arm_repeat(wgt, "Skp", speak)   -- repeat only if SkpRep is on (else a no-op)
         end
     else
         wgt.skp_announced = false
+        clear_repeat(wgt, "Skp")
     end
+end
+
+-- ============================================================================
+-- ESCALATION VOLUME
+-- ============================================================================
+-- Alerts whose "escalation volume" boost is driven by a SUSTAINED critical/active
+-- state. One-shot informational alerts (Cell check, Armed/disarm) don't sustain a
+-- state, so they don't drive the boost.
+local ESC_CODES = { "Volt", "Fuel", "Telem", "Link", "Rssi", "Pwr", "Bec", "EscL", "Skp" }
+
+-- Is this alert currently in its escalation-worthy state? Reads cached values / the
+-- alert latches only (no extra sensor lookups), so it's cheap to call every pass.
+local function alert_active(wgt, code)
+    -- telemetry-lost is judged from its own latch (the ARM sensor is gone when the
+    -- link drops, so is_craft_armed can't be trusted here)
+    if code == "Telem" then return wgt.link_lost_armed == true end
+    if not is_craft_armed(wgt) then return false end
+    if code == "Volt" then return (wgt.volt_announced or 0) >= ALERTLEVEL_CRITICAL
+    elseif code == "Fuel" then return wgt.fuel_critical_on == true
+    elseif code == "Link" then return (wgt.link_announced or 0) >= 2
+    elseif code == "Rssi" then return (wgt.rssi_announced or 0) >= 2
+    elseif code == "Pwr"  then return wgt.pwr_announced == true
+    elseif code == "Bec"  then return (wgt.bec_announced or 0) >= 2
+    elseif code == "EscL" then return (wgt.escl_announced or 0) >= 2
+    elseif code == "Skp"  then return wgt.skp_announced == true
+    end
+    return false
+end
+
+-- Set each 5 Hz pass: true while any alert with "Escalation volume" enabled is active.
+-- Drives the escalation branch in refresh_volume_override and the Status readout.
+function ultidash_functions.update_escalation(wgt)
+    local o = wgt.options
+    local esc = false
+    if o then
+        for i = 1, #ESC_CODES do
+            local c = ESC_CODES[i]
+            if o[c .. "Esc"] == 1 and alert_active(wgt, c) then esc = true; break end
+        end
+    end
+    wgt.escalate_active = esc
 end
 
 function ultidash_functions.reset_telemetry_stats(wgt)
@@ -1638,7 +2267,11 @@ function ultidash_functions.background_refresh(wgt)
     ultidash_functions.update_link_warning(wgt)
     ultidash_functions.update_rssi_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
+    ultidash_functions.update_bec_warning(wgt)
+    ultidash_functions.update_esc_load_warning(wgt)
     ultidash_functions.update_skp_warning(wgt)
+    ultidash_functions.update_escalation(wgt)   -- after the alert latches are current
+    ultidash_functions.crank_repeats(wgt)       -- re-announce armed repeats when due
 
     -- refresh the sensors the flight-time condition depends on, then accumulate.
     -- read unconditionally (not gated by RFTool state) so headspeed-based tracking
@@ -1671,7 +2304,11 @@ function ultidash_functions.refresh(wgt)
     ultidash_functions.update_link_warning(wgt)
     ultidash_functions.update_rssi_warning(wgt)
     ultidash_functions.update_power_warning(wgt)
+    ultidash_functions.update_bec_warning(wgt)
+    ultidash_functions.update_esc_load_warning(wgt)
     ultidash_functions.update_skp_warning(wgt)
+    ultidash_functions.update_escalation(wgt)   -- after the alert latches are current
+    ultidash_functions.crank_repeats(wgt)       -- re-announce armed repeats when due
 end
 
 return ultidash_functions

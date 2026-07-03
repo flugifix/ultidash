@@ -2,6 +2,10 @@
 
 LVGL dashboard widget for EdgeTX / Rotorflight (RadioMaster TX16S MK3 / TX15, EdgeTX 2.12).
 
+> **Other radios:** UltiDash runs in principle on the RadioMaster **TX16S MK2** (480×272)
+> too, but that radio is **not actively tested** by the maintainer and its aspect ratio is
+> less ideal for the layout. Feedback welcome.
+
 UltiDash is based on **HeliDash** and integrates features from three widgets by
 Rob "bob00" Gayle:
 
@@ -26,6 +30,9 @@ Rob "bob00" Gayle:
 | `ultidashOptions.lua` | The single EdgeTX widget option (`ViewMode`) |
 | `ultidashSettings.lua` | Per-model settings store (SD-card cfg files) — the in-widget settings overlay |
 | `ultidashEsc.lua` | Multi-vendor ESC status/fault decoder (from eStatus) |
+| `ultidashDebug.lua` | Optional SD-card debug logger (see §11) |
+| `toolbox/adjmap.lua`, `toolbox/adjed.lua` | Toolbox tool pages: RF Adjustment Map / Editor (see §2.7b and [TOOLBOX.md](TOOLBOX.md)) |
+| `toolbox/labels.example.lua` | Optional custom adjustment-function labels (copy to `labels.lua`) |
 
 ---
 
@@ -52,18 +59,20 @@ Everything else is configured **inside the widget**, not in the EdgeTX option li
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **☰ menu glyph** (top-left, before the clock) — **disarmed only** (no config
    in flight). The tap target is the whole top-left corner.
-3. Menu entries (laid out as a button grid): **Settings**, **Status**,
-   **Reset settings to defaults** (with a confirmation dialog).
+3. Menu entries (laid out as a button grid): **Settings**, **Status**, **Toolbox**
+   (opens the tool pages, §2.7b), **Reset settings to defaults** (with a confirmation
+   dialog).
 
-**Settings** opens a **submenu** of the eight configuration groups (also a grid) — pick
-one to open its page; its back arrow returns to the submenu. Groups: **Display**,
-**Tele Main**, **Tele Details** (§2.3a), **Battery**, **Thresholds**, **Alerts**,
-**Switch voice**, **General** (§2.7a). Bools are real toggle switches, multi-value options
-are dropdown pickers, numbers use −/+ buttons (long-press = bigger step). Edits are **saved
-automatically** when a page is left (back arrow or **RTN**); arming or leaving full-screen
-also saves. Each group page also has a **Reset <page> to defaults** button (with
-confirmation) that resets only that page's settings; the menu-level *Reset to defaults*
-resets the whole model.
+**Settings** opens a **submenu** of the configuration groups (also a grid) — pick one to
+open its page; its back arrow returns to the submenu. Groups: **Display**, **Tele Main**,
+**Tele Details** (§2.3a), **Battery**, **Thresholds**, **ESC load** (§2.5a), **Volume**
+(§2.6), **Alerts** (§2.6a — itself a submenu with one page per alert), **Switch voice**,
+**General** (§2.7a), **Toolbox** (§2.7b). Bools are real toggle switches, multi-value
+options are dropdown pickers, numbers use −/+ buttons (long-press = bigger step), the two
+volume percentages are real sliders. Edits are **saved automatically** when a page is left
+(back arrow or **RTN**); arming or leaving full-screen also saves. Each group page also
+has a **Reset <page> to defaults** button (with confirmation) that resets only that page's
+settings; the menu-level *Reset to defaults* resets the whole model.
 
 ### 2.3 Settings — Display
 
@@ -81,6 +90,7 @@ resets the whole model.
 | **Top bar: RSSI bars** | bool | on | show 1RSS (+ 2RSS with antenna diversity) |
 | **Top bar: TX voltage** | bool | off | show the radio battery voltage next to the icon |
 | **Bottom bar: TPWR** | bool | on | show TX power in the flight-view status bar |
+| **TPWR bar max (mW)** | num | not set | 100 % reference for the TPWR bar in the ELRS detail; unset → bar shows a hint |
 | **Close detail pages on arm** | bool | off | when on, arming closes an open detail page (off = keep ELRS detail open in flight) |
 | **Tap zones for detail pages** | bool | on | enable tapping the bars / status line / gauge to open detail pages (the menu glyph stays active either way) |
 | **Link bars: color only on warning** | bool | on | bars stay neutral while fine; color only on warn/crit (key `BarsQuiet`) |
@@ -98,27 +108,44 @@ sensors**. Two groups configure them; each row is a **sensor picker**.
 | Group | Slots | Default sensors |
 |-------|-------|-----------------|
 | **Tele Main** | `Panel 1..5` (the 5 right-hand dashboard rows) | Voltage (auto), Headspeed, Current, ESC Temp, BEC |
-| **Tele Details** | `Detail 1..12` (the Telemetry detail grid) | Battery, Cell, Current, Energy Used, Fuel, ESC Temp, BEC, Headspeed, then 4× **Off** |
+| **Tele Details** | `Detail 1..12` (the Telemetry detail grid) | Battery, Cell, Current, Energy Used, Fuel, then 7× **Off** |
 
-- Each picker lists **— Off —**, **Voltage (auto)** and every sensor present on the model
-  (plus any already-chosen sensor, so a selection survives offline). The selection is
-  stored as the EdgeTX **sensor name** (string) so it stays identified before EdgeTX
-  re-discovers it.
+Each row is a **two-field hybrid**, both writing the same slot:
+
+- The **curated dropdown** lists **— Off —**, **Voltage (auto)**, **ESC Load (calc)** and
+  the Rotorflight sensors UltiDash knows on this model (friendly labels) — plus a single
+  **‹ Raw sensor ›** display entry.
+- The **raw field** next to it is EdgeTX's **native telemetry source picker**: pick *any*
+  sensor the radio has, including ones UltiDash doesn't curate. A raw pick flips the
+  dropdown to ‹ Raw sensor ›; a curated pick blanks the raw field (`---`). The selection
+  is stored as the EdgeTX **sensor name** (string) so it stays identified before EdgeTX
+  re-discovers it (raw picks additionally persist the source index so both the picker and
+  the value read survive a restart).
 - **Voltage (auto)** is the smart cell/battery voltage with the warn color (the dashboard's
   original slot-1 behaviour) — it follows *Display → Voltage shown as*.
+- **ESC Load (calc)** is the computed ESC utilization % (§2.5a) — it shows `not set`
+  until ESC-load monitoring is on and the limit GVAR is delivered.
 - Known Rotorflight sensors get a friendly label, decimals and a **unit** (V, A, °C, mAh,
-  %, rpm, …); unknown sensors show their raw EdgeTX name and the precision EdgeTX reports.
+  %, rpm, …); raw sensors show their EdgeTX name and the precision EdgeTX reports.
 
 ### 2.4 Settings — Battery
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
 | **Reserve (%)** | num | 20 | reserve capacity; 0 % displayed = reserve reached |
+| **Fuel: announce below (%)** | num | from full | fuel callouts start below this level (100 = from full) |
+| **Fuel: coarse step (%)** | num | 10 | callout spacing above the dense zone |
+| **Fuel: dense below (%)** | num | 10 | below this level the fine step applies |
+| **Fuel: fine step (%)** | num | 1 | callout spacing in the dense zone |
 | **Cell thresholds from** | choice | FC config | FC config (`mspBatteryConfig`) / Manual |
 | **Full cell (manual)** | num | 4.12 V | only used when *Manual* |
 | **Low cell (manual)** | num | 3.45 V | only used when *Manual* |
 | **Critical cell (manual)** | num | 3.30 V | only used when *Manual* |
 | **Cell-check delay (s)** | num | 4 | duration of the startup cell-check |
+
+The four **Fuel** settings shape the fuel-callout density (value-driven, descending %):
+quiet up high, denser near the end. The defaults reproduce the historical cadence
+(announce from full in 10 % steps, every 1 % below 10 %).
 
 With **FC config** the thresholds come from the Rotorflight FC
 (`vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`), read on
@@ -126,17 +153,28 @@ connect/disarm and cached. Cell count and capacity always come from the FC.
 
 ### 2.5 Settings — Thresholds
 
+Warning thresholds, grouped by subject with section headers on the page. *(The former
+"Callout interval" is gone — repeat cadence is now configured **per alert**, §2.6a. The
+TPWR bar max moved to Display, the ESC-load thresholds to their own group, §2.5a.)*
+
+**Link & signal**
+
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
-| **Callout interval (s)** | num | 6 | minimum spacing between fuel/voltage callouts |
 | **Link warn (%)** | num | 80 | RQly warning. High by design — RQly sits at ~100 % in clean flight |
-| **Link critical (%)** | num | 50 | RQly critical (with vibration) |
+| **Link critical (%)** | num | 50 | RQly critical |
 | **RSSI warn (% headroom)** | num | 15 | best-antenna signal margin above the rate floor (see note) |
-| **RSSI critical (%)** | num | 8 | RSSI critical (with vibration) |
+| **RSSI critical (%)** | num | 8 | RSSI critical |
 | **RSSI hold time (s)** | num | 2 | low RSSI must persist this long before warning (filters rotational nulls) |
-| **Power warn voltage** | num | 9.0 V | armed + connected: `Vbat` below this → main-power-loss callout |
 | **Skipped-packet limit** | num | 50 | armed: `*Skp` counter reaching this → callout |
-| **TPWR bar max (mW)** | num | not set | 100 % reference for the TPWR bar in the ELRS detail; unset → bar shows a hint |
+
+**Power & BEC**
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
+| **Power warn voltage** | num | 9.0 V | armed + connected: `Vbat` below this → main-power-loss callout |
+| **BEC warn (% drop)** | num | 8 | live BEC this far below the flight's reference → warning |
+| **BEC critical (% drop)** | num | 15 | … and this far below → critical |
 
 > **RSSI thresholds are `% headroom`, not raw dBm.** The widget maps the ELRS RSSI
 > (`1RSS`/`2RSS`) to 0–100 % between the **current rate's sensitivity floor** (from `RFMD`)
@@ -144,27 +182,88 @@ connect/disarm and cached. Cell count and capacity always come from the FC.
 > thresholds work across rates. Defaults (15 / 8) are intentionally low: in real "all fine"
 > logs the headroom stayed ≥ 16 % with RQly at 100 %.
 
-### 2.6 Settings — Alerts
+> **BEC thresholds are relative (self-calibrating).** While armed the widget captures a
+> reference — the highest plausible BEC voltage seen this flight (the healthy nominal) —
+> so the same % thresholds work for any 5 V / 6 V / 8.4 V BEC without configuration.
+
+### 2.5a Settings — ESC load
+
+An **entirely optional** feature (off by default): the ESC continuous-current **load
+monitor**. A GVAR on the model holds the ESC's continuous-current limit in **amps**.
+
+**Prerequisite — filling the GVAR:** the Rotorflight **RF2/RFTool Lua suite** (which
+UltiDash requires anyway) can be configured **per model** to write FC values into GVARs —
+map the ESC's continuous-current limit to a free GVAR there, and point *ESC limit: GVAR*
+at it. UltiDash only ever **reads** the GVAR (and zeroes it at session end, since the
+writer never clears it).
+
+UltiDash then computes **load % = current / limit × 100** and shows it as a full-width
+bar under the dashboard's Current row plus the **ESC Load (calc)** telemetry slot
+(§2.3a).
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
-| **Callout volume** | num | System | System / 1 (min) … 5 (max) — see §5.4 |
+| **ESC load monitoring** | bool | off | **master switch** — off = the whole feature is off (no bar, tile shows `not set`, no alarm, the GVAR is never touched) |
+| **ESC limit: GVAR (A)** | num | Off | which GVAR holds the limit; **Off = feature off** as well |
+| **Warn (%)** | num | 80 | bar/tile turn yellow; sustained → warn alarm |
+| **Critical (%)** | num | 100 | bar/tile turn red; sustained → critical alarm |
+| **Alarm hold time (s)** | num | 5 | load must stay at/above a threshold this long before the alarm fires (ESCs tolerate short bursts above the continuous limit) |
+
+- The limit is **latched once per session** (polled for up to 10 s after connect); on the
+  disarmed disconnect the latch and the GVAR are cleared for the next session. GVAR reads
+  are local — no MSP, armed-safe.
+- The **alarm** is a separate opt-in: the *ESC load* alert's **Active** switch (§2.6a).
+  It fires only while armed, and only when monitoring is on — display without alarm is
+  simply *monitoring on, alert off*.
+
+### 2.6 Settings — Volume
+
+Two independent loudness worlds (see §5.4 for the full picture):
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
+| **Callout volume** | num | System | System / 1 (min) … 5 (max) — the per-WAV mix level of UltiDash's own callouts |
 | **Widget volume applies** | choice | Always | Always / Only connected |
+| **Master volume via GVAR** | num | Off | Off / GV1…GV15 — bridge to the radio's **master volume** through a model *Volume* special function (§5.4) |
+| **Normal volume (%)** | slider | 80 | master volume written while connected (GVAR world only) |
+| **Escalation volume (%)** | slider | 100 | master volume while an alert with *Escalation volume* is active (GVAR world only) |
+
+The GVAR bridge is **optional** and needs a **one-time radio-side model setup** (an
+input, a logical switch and a *Volume* special function — step-by-step example in §5.4).
+Without it, callouts simply use the radio volume and the two sliders do nothing.
+
+### 2.6a Settings — Alerts (per-alert pages)
+
+**Alerts** is a submenu: a **Voice / mute** page plus **one page per alert**, so every
+alert is configured in one place.
+
+**Voice / mute**
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
 | **Voice language** | choice | English | English / Deutsch — picks the `/SOUNDS/<lang>/ultidash/` voice pack (spoken numbers/units still follow the radio's system language) |
 | **Mute (master)** | choice | None | None / **All** silences every voice + vibration |
-| **Vibrate on critical** | bool | on | vibration master |
-| **Sound: startup cell-check** | bool | on | |
-| **Sound: fuel callouts** | bool | on | |
-| **Sound: voltage alerts** | bool | on | |
-| **Sound: armed / disarm** | bool | on | |
-| **Sound: telemetry lost/ok** | bool | on | |
-| **Sound: link quality** | bool | on | |
-| **Sound: RSSI / signal** | bool | on | |
-| **Sound: main power lost** | bool | on | |
-| **Sound: skipped packets** | bool | off | |
 
-Each switch disables that event's **voice and its vibration** together. `Mute = All` is
-the master kill-switch over everything.
+**Per-alert pages** — Fuel, Voltage, Cell check, Armed / disarm, Telemetry, Link quality,
+RSSI / signal, Main power lost, BEC voltage, ESC load, Skipped packets. Each page has the
+same rows:
+
+| Setting | Type | Notes |
+|---------|------|-------|
+| **Active** | bool | the alert's on/off (voice + vibration together) |
+| **Repeat** | bool | re-announce while the condition still holds |
+| **Repeat count** | num | 0 = until cleared, else max repeats |
+| **Repeat interval (s)** | num | spacing between repeats |
+| **Escalation volume** | bool | while this alert is active, boost the GVAR master volume to *Escalation volume (%)* (§2.6 — GVAR world only) |
+| **Vibrate** | bool | haptic pulse with this alert |
+| **Overlay (prep)** | bool | reserved — fullscreen alert overlay, not implemented yet |
+
+Defaults: every alert **Active** except **ESC load** (off — enable after setting up
+§2.5a). **Fuel** and **Voltage** default to *Repeat = on, until cleared, 6 s* — exactly
+the historical continuous callout cadence; the other alerts default to *Repeat = off*
+(announce once per episode). **Vibrate** defaults to on for Fuel, Voltage, Telemetry,
+BEC and ESC load (the historical "vibrate on critical" set). `Mute = All` remains the
+master kill-switch over everything.
 
 ### 2.7 Settings — Switch voice
 
@@ -178,12 +277,17 @@ the model's mixer / logical-switch / arming logic.
 | **Governor mode switch** | switch | Off | "governor on" / "governor off" |
 | **Profile switch (1-3)** | switch | Off | "profile" + 1/2/3 |
 
-Each picker lists **Off**, the physical switches **SA…SH** (and an inverted `… inv`
-variant), **plus every logical switch defined in the model** (`L1`, `L1 inv`, …). Use a
-logical switch to follow real conditions — e.g. tie "motor on/off" to your arming-gate
-logical switch instead of the raw switch. Announcements are debounced (0.3 s, so a 3-pos
-switch passing through the middle stays quiet) and silent on boot / on first assignment.
-Logical switches are on/off only; the 3-position profile needs a physical switch.
+Each row uses **EdgeTX's native switch picker** (filtered to physical + logical
+switches, with the `!…` inverted variants) — so it shows exactly the switches *this*
+radio has, including custom names. Use a logical switch to follow real conditions — e.g.
+tie "motor on/off" to your arming-gate logical switch instead of the raw switch.
+Announcements are debounced (0.3 s, so a 3-pos switch passing through the middle stays
+quiet) and silent on boot / on first assignment. Logical switches are on/off only; the
+3-position profile needs a physical switch.
+
+> ⚠️ **Upgrading from ≤ v0.4:** the switch selections use new storage keys (the native
+> picker's source index). Old selections are **not migrated** — re-pick your switches
+> once in *Settings ▸ Switch voice* (and the Toolbox activation switch, §2.7b).
 
 ### 2.7a Settings — General
 
@@ -194,6 +298,25 @@ Meta settings: config-file behaviour and diagnostics.
 | **Config file per craft** | bool | off | keep a separate config per craft flown from the same model slot (see §2.8) |
 | **Debug log to SD card** | bool | off | write a diagnostics log to the SD card (see §11) |
 | **Debug log: sessions kept** | num | 20 | 1–50 — how many rotating log files to retain |
+
+### 2.7b Settings — Toolbox
+
+The Toolbox embeds the **RF Adjustment Map / Editor** tool pages (view and touch-adjust
+Rotorflight adjustment functions from the radio). Full setup — model prerequisites,
+channels, GVAR pulse, labels — in **[TOOLBOX.md](TOOLBOX.md)**.
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
+| **Activation switch** | switch | Off | native switch picker; flipping it opens the chosen tool (full-screen) |
+| **Switch opens** | choice | Off | Off / Adjust Map / Adjust Edit |
+| **Adj: Config channel** | num | CH11 | channel carrying the adjustment-function selector |
+| **Adj: Value channel** | num | CH12 | channel carrying the adjustment value |
+| **Adj editor: GVAR** | num | GV1 | GVAR pulsed by the editor's − / + buttons |
+| **Adj editor: pulse (ms)** | num | 150 | pulse length |
+| **Adj value divider** | num | 1 | display divider for the value channel |
+| **Adj editor: ranges hint** | bool | off | show the recommended-range hint in the editor |
+| **Toolbox sunlight mode** | bool | off | high-contrast toolbox palette |
+| **Announce bank (voice)** | bool | on | speak "bank" + number when the adjustment bank changes |
 
 ### 2.8 Where settings are stored
 
@@ -303,21 +426,26 @@ Tap-zones are gated by *Display → Tap zones for detail pages*. Close with a ta
 a detail page is open — you can watch the ELRS detail in flight without losing callouts.
 
 - **Telemetry** (tap the right value panel): a **3-column grid of up to 12** freely chosen
-  sensors (§2.3a — *Tele Details*). Off slots are skipped. Each tile shows the label, the
-  big value **+ its unit**, and a dim **`min .. max` chip** — the EdgeTX session low/high
-  read from the sensor's **`-`/`+` variants** (so every sensor gets a low/high, not just the
-  few the stats page tracks). The tile lays the label left of the value on the wide TX16S,
-  above it on the narrow TX15. *(Reading the per-sensor min/max is gated to while this page
-  is open, to keep the dashboard's sensor-lookup budget light.)*
+  sensors (§2.3a — *Tele Details*). Off slots are skipped. This page shows **raw sensor
+  data** — the live EdgeTX reading, not the dashboard's latched/filtered values. Each tile
+  shows the label, the big value **+ its unit**, and a dim **`min .. max` chip** — the
+  EdgeTX session low/high read from the sensor's **`-`/`+` variants** (so every sensor
+  gets a low/high, not just the few the stats page tracks). The tile lays the label left
+  of the value on the wide TX16S, above it on the narrow TX15. *(Reading the per-sensor
+  min/max is gated to while this page is open, to keep the dashboard's sensor-lookup
+  budget light.)*
 - **ELRS link** (tap the top-bar bars): six labelled bars — **RQ, TQ, 1RSS, 2RSS, SNR,
   TPWR** — with reactive threshold ticks and values; the rate/mode header; footer with
   SNR, active antenna and session RQ-min. SNR is mapped −10…+10 dB; TPWR is inverted (high
   power = working hard) relative to *TPWR bar max* (shows a hint until that is set).
-- **Status & events** (tap the ESC/status line): arm state / governor / throttle summary,
-  the colored status line, and a **timestamped ESC event log** (every ESC status change,
-  RESTART, and arm/disarm — newest first, color by severity). A footer shows dev metrics
-  (Lua heap, UI loop Hz, pass ms). The menu's **Status** entry shows the same configuration
-  overview as the passive *Status info* view.
+- **Status & events** (tap the ESC/status line): a bordered **status card** — arm state /
+  governor / throttle, the ESC status and the arming status including the **full
+  arming-disable reason list** — above a **scrollable, timestamped ESC event log** (every
+  ESC status change, RESTART, and arm/disarm — newest first, color by severity; ▲/▼
+  paging with an `N-M/30` position readout). A small footer shows dev metrics (Lua heap,
+  free heap, UI loop Hz, pass ms). The menu's **Status** entry shows the same grouped
+  configuration overview as the passive *Status info* view (thresholds & their source,
+  alert switches incl. repeat summary and ESC-load state, volume setup).
 - **Battery** (tap the gauge): a **cell-voltage scale** with the active crit/low/full
   thresholds marked (and whether they come from FC or manual), then the battery in the
   dashboard segment look with % and used mAh inside it, and a Batt / Cell-min / Reserve
@@ -371,30 +499,47 @@ voice + spoken total voltage.
 
 ## 5. Voice callouts & vibration
 
-All outputs are UltiDash's own WAVs in `/SOUNDS/en/ultidash/` (spoken numbers/units come
-from the EdgeTX voice pack). Each has its own on/off; `Mute = All` overrides everything.
+All outputs are UltiDash's own WAVs in `/SOUNDS/en/ultidash/` or `/SOUNDS/de/ultidash/`
+(*Voice language*; spoken numbers/units come from the EdgeTX voice pack). Every alert has
+its own page (§2.6a) with Active / Repeat / Vibrate / Escalation; `Mute = All` overrides
+everything.
 
 ### 5.1 Telemetry-driven callouts
 
-| # | Trigger | Condition | Output | Switch | Background |
+The *vib* column shows the **default** — vibration is per-alert configurable now.
+
+| # | Trigger | Condition | Output | Active key | Background |
 |---|----------|-----------|---------|--------|-----------|
 | 1 | **Startup cell-check** | after the delay, if cell < FC full-cell | `batlow` + voltage | `SndCellChk` | no |
-| 2 | **Fuel callout** | connected + armed, by fuel level | `battry`/`batlow`/`batcrt` + % (+vib crit) | `SndFuel` | yes |
-| 3 | **Voltage alert** | connected + armed, cell ≤ FC warn/min | `batlow`/`batcrt` + voltage (+vib crit) | `SndVolt` | yes |
+| 2 | **Fuel callout** | connected + armed, by fuel level | `battry`/`batlow`/`batcrt` + % (+vib) | `SndFuel` | yes |
+| 3 | **Voltage alert** | connected + armed, cell ≤ FC warn/min | `batlow`/`batcrt` + voltage (+vib) | `SndVolt` | yes |
 | 4 | **Armed / disarm** | arm state change | `armed` / `disarm` | `SndArm` | no |
 | 5 | **Telemetry lost / ok** | armed-only loss; "ok" only after an armed loss | `telem_lost` (+vib) / `telem_ok` | `SndTelem` | yes |
-| 6 | **Low link quality** | armed; RQly ≤ Link warn/crit | `link_warn`/`link_crit` + % (+vib crit) | `SndLink` | yes |
-| 7 | **Low RSSI / signal** | armed; best-antenna headroom ≤ RSSI warn/crit, held *RSSI hold* s | `rssi_warn`/`rssi_crit` (+vib crit) | `SndRssi` | yes |
-| 8 | **Main power lost** | armed + connected; `Vbat` < power-warn (incl. collapse to ~0) | `pwr_backup` (+vib) | `PwrWarn` | yes |
-| 9 | **Skipped packets** | armed; `*Skp` ≥ limit | `skp_high` | `SkpWarn` | yes |
+| 6 | **Low link quality** | armed; RQly ≤ Link warn/crit | `link_warn`/`link_crit` + % | `SndLink` | yes |
+| 7 | **Low RSSI / signal** | armed; best-antenna headroom ≤ RSSI warn/crit, held *RSSI hold* s | `rssi_warn`/`rssi_crit` | `SndRssi` | yes |
+| 8 | **Main power lost** | armed + connected; `Vbat` < power-warn (incl. collapse to ~0) | `pwr_backup` + **BEC voltage** · restored: `pwr_ok` | `PwrWarn` | yes |
+| 9 | **BEC voltage** | armed; live BEC ≥ *BEC warn/crit %* below the flight's reference | `bec_low`/`bec_crit` + voltage (+vib) | `SndBec` | yes |
+| 10 | **ESC load** | armed + monitoring on (§2.5a); load ≥ warn/crit % for the hold time | `escl_warn`/`escl_crit` + % (+vib) | `EscLoad` | yes |
+| 11 | **Skipped packets** | armed; `*Skp` ≥ limit | `skp_high` | `SkpWarn` | yes |
 
 Notes:
+- **Repeat engine (per alert, §2.6a):** an alert with *Repeat = on* re-announces on its
+  own interval while the condition holds (count-limited or until cleared). Fuel and
+  Voltage ship with the historical continuous cadence (6 s, until cleared); everything
+  else defaults to once per episode (re-armed on recovery; a warn→crit escalation
+  announces once more).
+- **Escalation volume:** while any alert with *Escalation volume = on* is active, the
+  GVAR master volume (§5.4) is raised to *Escalation volume (%)* — the repeats get
+  louder; back to *Normal volume (%)* once cleared.
 - **Voltage alert** ignores ≤ 1 V/cell readings — a collapsed/lost supply (~0 V) never
   produces a misleading "battery critical 0 V"; that case is the main-power-loss warning.
-- **Link / RSSI** are each announced **once per low episode** (re-armed on recovery; a
-  warn→crit escalation announces once more), not repeated on the callout interval.
-- **Main power lost** distinguishes a buffer-kick (telemetry still flowing → reported) from
-  a plain dropout (handled as telemetry-lost).
+- **Main power lost** distinguishes a buffer-kick (telemetry still flowing → reported)
+  from a plain dropout (handled as telemetry-lost). The callout speaks the **live BEC
+  voltage** with each repeat — an audible countdown of the buffer. If the main pack comes
+  back while still armed (the buffer bridged the gap), **`pwr_ok`** announces the
+  recovery. While the mode is active the status line shows **MAIN POWER LOST** (highest
+  priority, red), the main voltage reads `--` (BEC is the interesting value now), and the
+  fuel/voltage callouts are suppressed — only main-power-lost and BEC speak.
 - ⚠️ EdgeTX may have its **own** "telemetry lost" callout → it can double up; disable the
   EdgeTX trigger if so.
 
@@ -403,18 +548,37 @@ See §2.7 — motor / rescue / governor (on-off) and profile (1-3), read read-on
 configurable physical or logical switch.
 
 ### 5.3 Vibration
-Critical fuel/voltage, telemetry-lost, link-crit, RSSI-crit and main-power-loss vibrate
-(when *Vibrate on critical* is on and the event's own switch is on).
+Per alert: each alert page's **Vibrate** switch (§2.6a). Defaults reproduce the old
+"vibrate on critical" set (fuel, voltage, telemetry, BEC, ESC load). `Mute = All` also
+silences vibration.
 
-### 5.4 Callout volume
-*Callout volume* (1–5) plays UltiDash's callouts at a fixed level regardless of the radio
-setting; *System* (default) follows the radio. *Widget volume applies = Only connected*
-limits the override to when telemetry is up.
+### 5.4 Volume (two worlds)
 
-> ⚠️ This overrides the **WAV mix level**, not the radio's **master volume** (which Lua
-> cannot set). If a model Special Function changes the master volume on connect (e.g.
-> `VOLUME MAX` on a telemetry-beat switch), set that SF to a constant `ON` so the widget
-> volume governs the callouts reliably.
+**Callout volume (WAV mix level).** *Callout volume* (1–5) plays UltiDash's callouts at a
+fixed level regardless of the radio setting; *System* (default) follows the radio.
+*Widget volume applies = Only connected* limits the override to when telemetry is up.
+This is the per-WAV level Lua can pass to `playFile` — it cannot change the radio's
+master volume.
+
+**Master volume via GVAR (optional — needs a one-time model setup on the radio).** To
+control the actual **radio master volume**, UltiDash writes a volume value into a
+dedicated GVAR; a model-side **Special Function** applies it. The SF's Volume source
+can't take a GVAR directly, so it is bridged through an Input. Wire it up once per model
+(numbers are examples — use whatever is free):
+
+1. **Widget:** *Volume ▸ Master volume via GVAR* = **GV9** — a GVAR used for **nothing
+   else** on this model.
+2. **Inputs:** add an input, e.g. `I15 "Vol"`, **Source = GV9** (weight 100).
+3. **Logical switch:** `L10: a > x` with **a = GV9, x = −1024** — true while UltiDash is
+   driving the volume.
+4. **Special Function:** `SF: switch L10 → Volume = I15 (Vol)`.
+
+UltiDash writes **−1024 as the "off" sentinel** whenever the override is inactive
+(feature off, disconnected) → `L10` goes false → the SF releases and the radio's volume
+pot rules again. While connected, UltiDash drives the master volume to **Normal
+volume (%)** — and to **Escalation volume (%)** while an escalating alert is active
+(§5.1). Without the GVAR setup the two sliders do nothing and callouts simply follow the
+radio volume.
 
 ---
 
@@ -488,6 +652,7 @@ to the Status detail's event log.
 ### Status line – priority (topmost matching rule wins)
 | State | Display | Color |
 |---------|---------|-------|
+| main power lost (buffer takeover, §5.1) | `MAIN POWER LOST` | Red |
 | disarmed **and** arming-disable flags active | reasons, e.g. `* NOGYRO THROTTLE` | Yellow |
 | ESC reports restart (`0xFF`) | `RESTART ESC` | Red |
 | ESC fault (`Esc#`/`EscF`) | plain text, e.g. `ESC Over Temp` | Yellow/Red by severity |
@@ -522,13 +687,17 @@ to the Status detail's event log.
   absent, the state stays "disconnected". **MSP is only read on connect/disarm, and the
   only MSP *write* is the battery-profile switch (§3.5), disarmed — never during armed
   flight.**
-- **Performance:** the telemetry/alert/publish pass is throttled to 5 Hz; touch is handled
-  every cycle. The Status detail footer shows the live UI loop rate as a load indicator.
-- **Sounds** in `/SOUNDS/en/ultidash/` (own subfolder, `AUDIO_PATH`). All shipped:
+- **Performance:** the telemetry/alert/publish pass is throttled to 5 Hz (idle-throttled
+  to 2 Hz while disconnected); touch is handled every cycle. The Status detail footer
+  shows the live UI loop rate as a load indicator.
+- **Sounds** in `/SOUNDS/en/ultidash/` and `/SOUNDS/de/ultidash/` (own subfolders,
+  selected by *Voice language*). All shipped:
   - Battery: `batcrt`, `batlow`, `battry` · Arm: `armed`, `disarm`
   - Link/telemetry: `telem_lost`, `telem_ok`, `link_warn`, `link_crit`
-  - Signal/RSSI: `rssi_warn`, `rssi_crit` · Power: `pwr_backup` · Packets: `skp_high`
+  - Signal/RSSI: `rssi_warn`, `rssi_crit` · Packets: `skp_high`
+  - Power: `pwr_backup`, `pwr_ok` · BEC: `bec_low`, `bec_crit` · ESC load: `escl_warn`, `escl_crit`
   - Switches: `motor_on`/`motor_off`, `rescue_on`/`rescue_off`, `gov_on`/`gov_off`, `profile`
+  - Toolbox: `bank`
   - All peak-normalized to match the EdgeTX voice-pack loudness. Spoken numbers/units still
     come from the EdgeTX voice pack.
 - **Model images** in `/images/`: a single file named after the Rotorflight model name
@@ -547,7 +716,12 @@ to the Status detail's event log.
 - Stats "mAh Used (%)" shows the raw, not reserve-adjusted, percentage.
 - Touch is only delivered to the widget in **full-screen** — the menu, detail pages and
   the stats manual-dismiss work full-screen only.
-- Callout volume overrides the WAV level, not the radio master volume (see §5.4).
+- *Callout volume* overrides the WAV level only; controlling the radio **master volume**
+  needs the GVAR bridge + model Special Function (§5.4).
+- The **escalation volume boost** (GVAR world) is only written while the Dashboard is
+  on-screen; an alert announced off-screen still speaks, just at the normal volume.
+- The per-alert **Overlay** switch is preparation only — the fullscreen alert overlay is
+  not implemented yet.
 - A passive *ELRS details* / *Status info* instance needs a running **Dashboard** instance
   to mirror.
 
@@ -589,6 +763,9 @@ IO, no heap growth).
 - **Contents:** every connection-`STATE` transition and a 1 Hz `PERF` snapshot
   (`hz / heap kB / pass ms / state / armed / view / menu / detail`); messages logged
   internally are mirrored in too.
-- **Low impact:** lines are buffered in a capped RAM ring and rewritten to SD only every few
-  seconds — **never while armed** (the buffer is flushed on disarm/disconnect), so there is
-  no in-flight SD hitch.
+- **Low impact:** lines are buffered in a capped RAM ring and **appended incrementally**
+  to the session file — only the lines since the last flush are written. Disarmed the
+  flush runs every ~3 s; **while armed it keeps flushing too**, at a conservative ~10 s
+  cadence (the appends are tiny), so a crash / power loss in flight loses at most the
+  last few seconds of log. A per-session file cap (~5000 lines) bounds SD growth; hitting
+  it writes a marker line and stops that session's log.

@@ -354,10 +354,15 @@ function M.createValues(wgt)
         end,
 
         display_voltage_label = function()
-            if use_total_voltage_display(wgt) then
-                return wgt.values.label_battery_voltage .. " " .. wgt.values.cel_count_formatted()
-            end
-            return wgt.values.label_cell_v .. " " .. wgt.values.cel_count_formatted()
+            local base = use_total_voltage_display(wgt) and wgt.values.label_battery_voltage
+                or wgt.values.label_cell_v
+            local cells = wgt.values.cel_count_formatted()   -- memoized
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            local e = c.dv_label
+            if e ~= nil and e.b == base and e.c == cells then return e.s end
+            local s = base .. " " .. cells
+            if e ~= nil then e.b = base; e.c = cells; e.s = s else c.dv_label = { b = base, c = cells, s = s } end
+            return s
         end,
         -- short voltage label without the cell-count suffix (cell count is shown
         -- inside the battery gauge instead, so the right-panel label never wraps)
@@ -366,6 +371,9 @@ function M.createValues(wgt)
             return wgt.values.label_cell_v
         end,
         display_voltage_formatted = function()
+            -- main power lost: the main pack is gone; show "--" instead of the frozen
+            -- last-good value (the BEC/buffer voltage is the interesting one now)
+            if wgt.power_lost then return "--" end
             if use_total_voltage_display(wgt) then return wgt.values.vbat_formatted() end
             return wgt.values.vcel_formatted()
         end,
@@ -384,6 +392,7 @@ function M.createValues(wgt)
             return get_display_voltage_threshold(wgt, get_cell_alarm_threshold(wgt))
         end,
         display_voltage_actual_color = function()
+            if wgt.power_lost then return COLOR_THEME_PRIMARY1 end   -- "--" shown neutral
             if use_total_voltage_display(wgt) then return get_display_voltage_color_for_value(wgt, wgt.values.vbat) end
             return get_display_voltage_color_for_value(wgt, wgt.values.vcel)
         end,
@@ -421,12 +430,20 @@ function M.createValues(wgt)
         -- effective fill level for the gauge: startup-check progress while checking,
         -- else the reserve-adjusted fuel %, clamped to 0..100 (ePowerbar)
         gauge_fill_percent = function()
-            if wgt.values.batt_checking then return wgt.values.batt_check_progress or 0 end
-            local fuel = wgt.values.fuel or 0
-            return math.max(0, math.min(100, fuel))
+            -- called once per gauge segment (6-9x/frame): memo by input so the clamp
+            -- runs once per value change, not once per segment per frame
+            local checking = wgt.values.batt_checking
+            local raw = checking and (wgt.values.batt_check_progress or 0) or (wgt.values.fuel or 0)
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            local e = c.gauge_fill
+            if e ~= nil and e.r == raw and e.k == checking then return e.v end
+            local v = checking and raw or math.max(0, math.min(100, raw))
+            if e ~= nil then e.r = raw; e.k = checking; e.v = v else c.gauge_fill = { r = raw, k = checking, v = v } end
+            return v
         end,
         -- centered percent label: dashes during the startup cell-check, else fuel %
         gauge_percent_formatted = function()
+            if wgt.power_lost then return "--" end   -- pack gone: buffer % is meaningless
             if wgt.values.batt_checking then return "--" end
             local f = wgt.values.fuel
             if f ~= nil and f < 0 then f = 0 end
@@ -496,7 +513,9 @@ function M.createValues(wgt)
             if not (wgt.rf and wgt.rf.available) then return "RFTools widget missing" end
             local current_flag = get_current_arm_disable_flag(wgt)
             if current_flag == nil then return "" end
-            return "Arming Disabled: " .. current_flag
+            -- the cycled flag changes at most every 2 s; memo so the concat is not
+            -- re-allocated on every status-bar frame
+            return sfmt(wgt, "arm_flags_txt", current_flag, "Arming Disabled: %s")
         end,
         rf_connection_state = "disconnected",
         rf_connection_state_formatted = function()
@@ -541,7 +560,12 @@ function M.createValues(wgt)
             return math.max(0, math.min(100, p)) / 100
         end,
         vtx_fill_color = function()
-            return wgt.values.vtx_low and lcd.RGB(0xff, 0x33, 0x33) or lcd.RGB(0x30, 0xc0, 0x30)
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            if c.vtx_col_lo == nil then
+                c.vtx_col_lo = lcd.RGB(0xff, 0x33, 0x33)
+                c.vtx_col_hi = lcd.RGB(0x30, 0xc0, 0x30)
+            end
+            return wgt.values.vtx_low and c.vtx_col_lo or c.vtx_col_hi
         end,
 
         -- date / time for the top bar (getDateTime is always available)
@@ -595,29 +619,39 @@ function M.createValues(wgt)
         rf_battery_profile_display_formatted = function()
             local profile_value = wgt.values.rf_battery_profile
             if profile_value == nil or profile_value < 0 then return "-" end
-            profile_value = tostring(profile_value)
-            local capacity_value = wgt.values.rf_battery_capacity_display_formatted()
-            if capacity_value == "-" then return profile_value end
-            return string.format("%s (%s)", capacity_value, profile_value)
+            local cap = wgt.values.rf_battery_capacity_display_formatted()   -- memoized
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            local e = c.rf_prof_disp
+            if e ~= nil and e.p == profile_value and e.c == cap then return e.s end
+            local s = (cap == "-") and tostring(profile_value) or string.format("%s (%s)", cap, profile_value)
+            if e ~= nil then e.p = profile_value; e.c = cap; e.s = s
+            else c.rf_prof_disp = { p = profile_value, c = cap, s = s } end
+            return s
         end,
         rf_battery_capacity_mah = nil,
         rf_battery_capacity_display_formatted = function()
-            if wgt.values.rf_battery_capacity_mah == nil then return "-" end
-            return string.format("%.0f", wgt.values.rf_battery_capacity_mah)
+            return sfmt(wgt, "rf_cap", wgt.values.rf_battery_capacity_mah, "%.0f")
         end,
         rf_battery_profile_compact_formatted = function()
-            local capacity_value = wgt.values.rf_battery_capacity_display_formatted()
+            local capacity_value = wgt.values.rf_battery_capacity_display_formatted()   -- memoized
             if capacity_value ~= "-" then return capacity_value end
-            if wgt.values.rf_battery_profile == nil or wgt.values.rf_battery_profile < 0 then return "-" end
-            return tostring(wgt.values.rf_battery_profile)
+            local p = wgt.values.rf_battery_profile
+            if p == nil or p < 0 then return "-" end
+            return sfmt(wgt, "rf_prof_compact", p, "%d")
         end,
         battery_usage_summary_formatted = function()
-            local used_value = wgt.values.capa_formatted()
-            local percent_value = wgt.values.capa_percent_formatted()
+            local used_value = wgt.values.capa_formatted()            -- memoized
+            local percent_value = wgt.values.capa_percent_formatted() -- memoized
             if used_value == "-" and percent_value == "-" then return "-" end
             if used_value == "-" then return percent_value end
             if percent_value == "-" then return used_value end
-            return string.format("%s (%s)", used_value, percent_value)
+            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
+            local e = c.batt_usage
+            if e ~= nil and e.u == used_value and e.p == percent_value then return e.s end
+            local s = string.format("%s (%s)", used_value, percent_value)
+            if e ~= nil then e.u = used_value; e.p = percent_value; e.s = s
+            else c.batt_usage = { u = used_value, p = percent_value, s = s } end
+            return s
         end,
         rf_battery_cell_count = nil,
         rf_total_flights = nil,

@@ -2,6 +2,91 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.5 — 2026-07-03
+
+Major feature release on top of v0.4: per-alert configuration, master-volume control,
+the ESC-load monitor, the Toolbox (RF adjustment map/editor), a main-power-lost flight
+mode and a native-picker settings overhaul. **Experimental — still under testing in the
+field.**
+
+### ⚠️ Breaking / upgrade notes
+- **Switch selections must be re-picked once** (*Settings ▸ Switch voice* and the Toolbox
+  activation switch): the rows now use EdgeTX's **native switch picker** and new storage
+  keys; old selections are ignored (no auto-migration — an in-widget migration tripped
+  the CPU limit on SD remount).
+- **Thresholds regrouped:** the ESC-load thresholds moved to the new **ESC load** group
+  (with new keys — re-check them if you used the v0.4 ESC-load preview), *TPWR bar max*
+  moved to **Display**, and the global *Callout interval* is gone — repeat cadence is now
+  **per alert** (Fuel/Voltage default to the historical 6 s continuous cadence).
+- The global *Vibrate on critical* switch was replaced by a **per-alert Vibrate** switch
+  (defaults reproduce the old behaviour).
+
+### Added
+- **Per-alert configuration** (*Settings ▸ Alerts* is now a submenu with one page per
+  alert): **Active / Repeat / Repeat count (0 = until cleared) / Repeat interval /
+  Escalation volume / Vibrate / Overlay (prep)** for each of the 11 alerts.
+- **Volume group** with two loudness worlds: the per-WAV **Callout volume** (moved from
+  Alerts) and an optional **master-volume bridge via GVAR** — UltiDash drives the radio's
+  master volume to **Normal volume (%)** while connected and boosts it to **Escalation
+  volume (%)** while an alert with *Escalation volume* is active (sentinel −1024 releases
+  the volume back to the pot). Real LVGL sliders for the two percentages.
+- **BEC voltage alert** (relative, self-calibrating): warns when the live BEC drops a
+  configurable % below the flight's own reference voltage — works for any 5/6/8.4 V BEC
+  without configuration. New sounds `bec_low` / `bec_crit` (en + de).
+- **ESC load monitor** (new *ESC load* settings group): a model GVAR holds the ESC's
+  continuous-current limit (A); UltiDash computes load % = current/limit, shows a
+  green/yellow/red **utilization bar** under the dashboard's Current row plus a new
+  **ESC Load (calc)** telemetry slot, and (separate opt-in alert, sustained-load gated
+  with a hold time) warns at configurable warn/critical %. One clear **ESC load
+  monitoring** master switch; off = feature fully off. New sounds `escl_warn` /
+  `escl_crit` (en + de).
+- **Main-power-lost mode** (buffer takeover): a collapsed main pack with live telemetry
+  flips the dashboard into a dedicated state — status line **MAIN POWER LOST**, main
+  voltage `--`, fuel/voltage callouts suppressed; the power callout speaks the **live BEC
+  voltage** with every repeat (an audible buffer countdown) and **`pwr_ok`** (new sound,
+  en + de) announces recovery if the pack comes back mid-flight.
+- **Toolbox** (main-menu entry + activation switch): the **RF Adjustment Map** and
+  **RF Adjustment Editor** tool pages integrated as UltiDash tool pages (matching
+  palette, sunlight mode, voice bank announce (`bank` sound), configurable
+  config/value channels, GVAR pulse editor). Setup guide in `docs/TOOLBOX.md`.
+- **Fuel-callout density settings** (*Battery*): announce-below level, coarse step,
+  dense-below level and fine step (defaults = the historical cadence).
+- **Raw telemetry sensors** in the value slots: each Tele Main / Tele Details row is now
+  a **two-field hybrid** — the curated dropdown plus EdgeTX's **native telemetry source
+  picker**, so *any* sensor on the radio can be shown (persisted with its source index so
+  it survives restarts).
+- **Status detail page redesign:** bordered status card (arm/gov/throttle, ESC status,
+  arming status with the **full arming-disable reason list**), **scrollable** timestamped
+  ESC event log (▲/▼ paging, position readout), footer with free-heap readout.
+- **Status/config overview** (menu ▸ Status and the passive *Status info* view): grouped
+  sections covering thresholds & their source, per-alert switches with a repeat summary,
+  ESC-load state and the volume setup.
+
+### Changed
+- **Settings menu:** groups reorganized (Display / Tele Main / Tele Details / Battery /
+  Thresholds / **ESC load** / **Volume** / **Alerts** / Switch voice / General /
+  **Toolbox**); Thresholds page now has section headers (*Link & signal*, *Power & BEC*).
+- **Telemetry detail page shows raw sensor data** (live EdgeTX readings, not the
+  dashboard's latched values).
+- **BEC value is live** (the latch is gone); it is held through a supply collapse so the
+  buffer rail stays readable.
+- **Performance:** disconnected idle throttle (2 Hz instead of 5), memoized per-frame
+  allocators, deduplicated 5 Hz reads (ARM/settings/model info cached), repeat summary
+  rebuilt only when settings change.
+- **Debug log:** flushes **in flight** now — incremental appends (only new lines) at a
+  conservative 10 s cadence while armed (3 s disarmed), so a crash loses at most the last
+  few seconds; per-session file cap (~5000 lines) with a marker line.
+
+### Fixed
+- **Raw-sensor slots showed `-`**: raw picks are now read via their verified source
+  index (the stored display name doesn't round-trip through EdgeTX's name lookup),
+  including the detail page's min/max.
+- **Stats page reappearing after dismiss** in the main-power-lost aftermath (an armed
+  flicker reset the dismiss flag): arm-clear is debounced and reconnects no longer reset
+  the dismissal.
+- **ESC-load GVAR hygiene:** the limit GVAR is only probed/zeroed while the feature is
+  actually enabled — a stale config value can no longer touch an unrelated GVAR.
+
 ## v0.4 — 2026-06-29
 
 Feature + polish + performance release on top of v0.3. **Experimental — still under

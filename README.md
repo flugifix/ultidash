@@ -2,7 +2,7 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.4 — experimental, under testing`
+`Status: v0.5 — experimental, under testing`
 
 UltiDash brings flight telemetry, battery state, ESC status, the ELRS link and radio
 info together on a single self-contained screen — designed so you can drop the EdgeTX
@@ -24,7 +24,9 @@ The flight view packs a lot in; tapping a panel (in full-screen) drills into it:
 > still being tested in the field. Expect rough edges and changes.
 > **Use entirely at your own risk — there is NO warranty of any kind (see [License](#license)).**
 > Intended for the **RadioMaster TX15 and TX16S MK3 running ELRS**, on EdgeTX 2.12 with
-> **Rotorflight 2.3 (required)**. Feedback and bug reports are very welcome.
+> **Rotorflight 2.3 (required)**. It runs in principle on the **TX16S MK2** (480×272)
+> too, but that radio is **not actively tested** and its aspect ratio is less ideal for
+> the layout. Feedback and bug reports are very welcome.
 
 ---
 
@@ -68,10 +70,26 @@ here, I will of course respect that.
 - **In-widget settings menu** — no EdgeTX option list to fight: open the full-screen menu
   and edit everything with real toggle switches, dropdowns and +/− steppers, grouped into
   named pages. Settings are **saved per model** on the SD card.
-- **Voice & vibration callouts** — fuel %, cell voltage, armed/disarm, ELRS link-quality,
-  RSSI/signal, telemetry-lost, main-power-loss and skipped-packet warnings, plus optional
-  **switch announcements** (motor / rescue / governor / profile). Each individually
-  switchable, with a master mute and an optional fixed callout volume.
+- **Voice & vibration callouts, configurable per alert** — fuel %, cell voltage,
+  armed/disarm, ELRS link-quality, RSSI/signal, telemetry-lost, main-power-loss,
+  **BEC-drop**, **ESC-load** and skipped-packet warnings, plus optional **switch
+  announcements** (motor / rescue / governor / profile). Every alert has its own page:
+  on/off, **repeat** (count/interval), **escalation volume**, vibration — with a master
+  mute, English/German voice packs and two volume worlds (fixed callout volume and an
+  optional **master-volume control via GVAR**, boosted while a critical alert repeats —
+  needs a small one-time model setup, see the reference §5.4).
+- **Main-power-lost mode** — a collapsed main pack with live telemetry (backup buffer
+  took over) flips the dashboard into a dedicated state: **MAIN POWER LOST** status, the
+  repeating callout counts the **live BEC voltage** down, and recovery is announced if
+  the pack comes back mid-flight.
+- **ESC load monitor** *(optional, off by default)* — a model GVAR delivers the ESC's
+  continuous-current limit (mapped via the RF2/RFTool Lua suite's per-model GVAR
+  feature); UltiDash shows the utilization as a green/yellow/red bar (plus an *ESC Load*
+  telemetry slot) and can alarm on sustained overload.
+- **Toolbox** *(optional)* — the **RF Adjustment Map / Editor** tool pages built in: see
+  and touch-adjust Rotorflight adjustment functions from the radio. Needs a one-time
+  model setup (channels + a dedicated GVAR) — guide in
+  [docs/TOOLBOX.md](docs/TOOLBOX.md).
 - **Second-screen views** — place UltiDash again on another screen set to **ELRS details**
   or **Status info**; these passive instances mirror the dashboard's data.
 - **No external libraries** — UltiDash loads only its own files.
@@ -88,9 +106,10 @@ here, I will of course respect that.
   `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `Thr`,
   `Esc#` + `EscF` (ESC status), the ELRS sensors above, and `*Skp` (skipped-packet counter
   — the label really starts with `*`).
-- Sounds in `/SOUNDS/en/ultidash/` (all included, in their own subfolder so they don't
-  clash with the EdgeTX voice pack). Spoken numbers/units (`percent`, `volts`, digits)
-  still come from your EdgeTX voice pack.
+- Sounds in `/SOUNDS/en/ultidash/` and `/SOUNDS/de/ultidash/` (all included, in their own
+  subfolders so they don't clash with the EdgeTX voice pack; pick the language in
+  *Alerts ▸ Voice / mute*). Spoken numbers/units (`percent`, `volts`, digits) still come
+  from your EdgeTX voice pack.
 - Optional model image in `/images/`: a single file named after the **Rotorflight model
   name** is enough — e.g. `MyHeli.png` or `MyHeli.jpg`. (Advanced/optional: a
   `<model>-<cells>S` variant is preferred when present; otherwise the plain name, then the
@@ -104,6 +123,7 @@ what's already there:
 ```
 WIDGETS/UltiDash/      →  <SD>/WIDGETS/UltiDash/
 SOUNDS/en/ultidash/    →  <SD>/SOUNDS/en/ultidash/
+SOUNDS/de/ultidash/    →  <SD>/SOUNDS/de/ultidash/
 ```
 
 Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen. The
@@ -126,22 +146,25 @@ lives in an **in-widget settings menu**:
 
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **menu symbol** (the ☰ glyph, top-left, next to the clock) — *disarmed only*.
-3. The menu offers **Settings** (a submenu of the configuration groups), **Status** and
-   **Reset settings to defaults**. The menu and the Settings submenu are laid out as a
-   button grid; each group opens its own page.
+3. The menu offers **Settings** (a submenu of the configuration groups), **Status**,
+   **Toolbox** and **Reset settings to defaults**. The menu and the Settings submenu are
+   laid out as a button grid; each group opens its own page.
 
-The **Settings** submenu has eight groups:
+The **Settings** submenu groups:
 
 | Group | Covers |
 |-------|--------|
-| **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, detail-page behaviour, quiet bars |
-| **Tele Main** | the 5 right-hand dashboard value slots (pick any sensor, or *Voltage (auto)*) |
-| **Tele Details** | the 12 sensor slots of the Telemetry detail page |
-| **Battery** | reserve %, cell-threshold source (FC config / manual cell voltages), startup cell-check delay |
-| **Thresholds** | callout interval, link (RQly) warn/crit, RSSI warn/crit/hold, power-warn voltage, skipped-packet limit, TPWR bar max |
-| **Alerts** | callout volume + when it applies, **voice language (English / Deutsch)**, master mute, vibration, and a per-event on/off for every announcement |
-| **Switch voice** | announce motor / rescue / governor / profile from a chosen TX switch (physical **or** logical) |
+| **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, TPWR bar max, detail-page behaviour, quiet bars |
+| **Tele Main** | the 5 right-hand dashboard value slots (curated sensors, *Voltage (auto)*, *ESC Load (calc)* — or **any raw sensor** via the native picker) |
+| **Tele Details** | the 12 sensor slots of the Telemetry detail page (same hybrid pickers) |
+| **Battery** | reserve %, fuel-callout density, cell-threshold source (FC config / manual cell voltages), startup cell-check delay |
+| **Thresholds** | link (RQly) warn/crit, RSSI warn/crit/hold, skipped-packet limit, power-warn voltage, BEC warn/crit |
+| **ESC load** | the ESC continuous-current load monitor: master switch, limit GVAR, warn/critical %, alarm hold time |
+| **Volume** | fixed callout volume + when it applies, and the optional **master-volume bridge via GVAR** with normal / escalation percentages |
+| **Alerts** | **voice language (English / Deutsch)**, master mute, and **one page per alert**: active, repeat (count / interval), escalation volume, vibrate |
+| **Switch voice** | announce motor / rescue / governor / profile from a chosen TX switch (physical **or** logical, native picker) |
 | **General** | per-craft config, and the **debug log** (off by default) + how many log sessions to keep |
+| **Toolbox** | the RF adjustment tools: activation switch, channels, GVAR pulse, look & voice (see [docs/TOOLBOX.md](docs/TOOLBOX.md)) |
 
 Each group page also has a **Reset … to defaults** button that resets only that page; the
 menu's *Reset to defaults* resets the whole model.

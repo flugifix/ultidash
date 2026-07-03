@@ -3,6 +3,16 @@ local ultidash_functions = loadScript(script_dir .. "ultidashFunctions.lua")()
 local ultidash_values = loadScript(script_dir .. "ultidashValues.lua")()
 local rf_service = loadScript(script_dir .. "ultidashRf.lua")()
 local ultidash_settings = loadScript(script_dir .. "ultidashSettings.lua")()
+-- Toolbox tool pages (RF adjustment map/editor), loaded modular + pcall'd so a missing
+-- file degrades gracefully (the Toolbox menu entries just won't do anything).
+local tb_adjmap = nil
+local tb_adjed = nil
+do
+    local ok1, m1 = pcall(function() return loadScript(script_dir .. "toolbox/adjmap.lua")() end)
+    if ok1 then tb_adjmap = m1 end
+    local ok2, m2 = pcall(function() return loadScript(script_dir .. "toolbox/adjed.lua")() end)
+    if ok2 then tb_adjed = m2 end
+end
 local show_debug_border = 0
 
 -- ============================================================================
@@ -85,6 +95,30 @@ local function set_palette(scheme)
         COLOR_TRACK = COLOR_THEME_SECONDARY2   -- subtle fill against the theme bg
         COLOR_TICK  = COLOR_THEME_SECONDARY1   -- strong line/mark colour
         COLOR_DIM   = COLOR_THEME_DISABLED     -- greyed/dim text
+    end
+end
+
+-- Palette for the Toolbox tool pages so they FIT the dashboard's look. The tools are kept
+-- MONOCHROME like the detail pages (light = black on light-grey, dark = white on dark-grey):
+-- header, labels and the +/- buttons use the theme fg/greys, and ONLY the VALUES carry the
+-- scheme accent colour so they stand out (the "blue everywhere" of the old palette is gone).
+-- Handed to the tool modules via wgt.tb_pal (the sunlight option overrides inside the module).
+local function toolbox_palette(scheme)
+    if scheme == 1 then         -- UltiDash clean (light): mono black/grey, values in the accent
+        return { bg = lcd.RGB(248,250,248), accent = lcd.RGB(24,24,24), hint = lcd.RGB(216,96,0), line = lcd.RGB(180,184,190),
+                 text = lcd.RGB(24,24,24), textDim = lcd.RGB(130,130,130),
+                 valText = lcd.RGB(48,90,144), valHi = lcd.RGB(192,48,56), bannerBg = lcd.RGB(192,48,40), bannerFg = lcd.RGB(255,255,255),
+                 btnBg = lcd.RGB(208,212,218), btnPressed = lcd.RGB(184,190,200), btnDim = lcd.RGB(226,228,231), btnFg = lcd.RGB(24,24,24) }
+    elseif scheme == 3 then     -- UltiDash dark: mono white/grey, values in the neon accent
+        return { bg = lcd.RGB(0,0,0), accent = lcd.RGB(240,240,240), hint = lcd.RGB(255,122,26), line = lcd.RGB(56,60,64),
+                 text = lcd.RGB(240,240,240), textDim = lcd.RGB(150,156,162),
+                 valText = lcd.RGB(0,229,255), valHi = lcd.RGB(255,176,0), bannerBg = lcd.RGB(255,68,56), bannerFg = lcd.RGB(0,0,0),
+                 btnBg = lcd.RGB(48,52,58), btnPressed = lcd.RGB(74,80,88), btnDim = lcd.RGB(34,36,40), btnFg = lcd.RGB(235,235,235) }
+    else                        -- EdgeTX theme: mono theme fg/bg, values in the theme focus colour
+        return { bg = COLOR_THEME_SECONDARY3, accent = COLOR_THEME_PRIMARY1, hint = COLOR_THEME_DISABLED, line = COLOR_THEME_SECONDARY1,
+                 text = COLOR_THEME_PRIMARY1, textDim = COLOR_THEME_DISABLED,
+                 valText = COLOR_THEME_FOCUS, valHi = COLOR_THEME_WARNING, bannerBg = COLOR_THEME_WARNING, bannerFg = COLOR_THEME_PRIMARY2,
+                 btnBg = COLOR_THEME_SECONDARY2, btnPressed = COLOR_THEME_SECONDARY1, btnDim = COLOR_THEME_SECONDARY3, btnFg = COLOR_THEME_PRIMARY2 }
     end
 end
 -- Header font - set dynamically in the active UI builder based on available space
@@ -190,7 +224,10 @@ local function get_target_view(widget)
 
     if widget.values.rf_connection_state == "armed" then
         view.ever_armed = true
-        widget.stats_dismissed = false
+        -- NB: do NOT clear stats_dismissed here — the "armed" sub-state is unreliable on
+        -- this RFTool and can briefly bounce back to "armed" right after disarming, which
+        -- would undo a just-made manual dismiss ("stats closes then reopens instantly").
+        -- A REAL arm clears the dismiss via the ARM sensor (armed_now) in the 5 Hz pass.
         return "flight"
     end
     if mode == STATS_VIEW_MODE_NEVER or view.ever_armed ~= true then
@@ -242,7 +279,10 @@ local function handle_telemetry_state_change(widget, previous_state, new_state)
     -- flight view. Live values + stats are already cleared in on_telemetry_state_changed.
     if previous_state == "disconnected" and new_state ~= "disconnected" then
         init_view_state(widget).ever_armed = false
-        widget.stats_dismissed = false
+        -- NB: do NOT clear stats_dismissed on reconnect. A main-power-lost aftermath can
+        -- bounce the link (disconnect/reconnect) while the pilot is trying to close the
+        -- stats page, and re-clearing here reopened it. The "arming forgets the dismiss"
+        -- clear (debounced, in the 5 Hz pass) is the single source for that reset now.
     end
     sync_view_for_telemetry(widget)
 end
@@ -383,11 +423,18 @@ end
 -- The right-hand value panel (5 slots) and the "Telemetry" detail page (8 slots)
 -- show sensors the user picks in Settings ▸ Values. A selection is stored as the
 -- EdgeTX sensor NAME (a string in the cfg file) so the chosen sensor stays
--- identified even offline / before EdgeTX has (re)discovered it. Two sentinels are
--- not real sensors: SENSOR_OFF (empty slot) and VOLT_AUTO (the smart cell/battery
--- voltage with warn colour — the dashboard's original slot-1 behaviour).
+-- identified even offline / before EdgeTX has (re)discovered it. Three sentinels are
+-- not real sensors: SENSOR_OFF (empty slot), VOLT_AUTO (the smart cell/battery
+-- voltage with warn colour — the dashboard's original slot-1 behaviour) and
+-- ESCL_AUTO (the computed ESC utilization %, see update_esc_load_warning).
 local SENSOR_OFF = "~off"
 local VOLT_AUTO  = "~volt"
+local ESCL_AUTO  = "~escl"
+-- Dropdown DISPLAY state only (never stored): marks "this slot holds a raw sensor
+-- picked via the native raw field". Keeps the curated dropdown short — raw names
+-- don't get folded into it; the dropdown just shows this one "‹ Raw ›" entry and
+-- the raw field shows which source it is.
+local RAW_SENTINEL = "~raw"
 
 -- Friendly label + default decimals for known Rotorflight / ELRS sensor names
 -- (EdgeTX only stores the terse 4-char name). Unknown sensors fall back to their
@@ -422,6 +469,8 @@ local SENSOR_INFO = {
     TQly     = { lbl = "Uplink Qual",  dec = 0, unit = "%" },
     RSNR     = { lbl = "SNR",          dec = 0, unit = "dB" },
     TPWR     = { lbl = "TX Power",     dec = 0, unit = "mW" },
+    -- virtual (computed) sensors also resolve label/decimals/unit through this table
+    ["~escl"] = { lbl = "ESC Load",    dec = 0, unit = "%" },
 }
 
 -- precision learned live from model.getSensor (used only for unknown sensors)
@@ -435,6 +484,7 @@ local SENSOR_VALUE_FIELD = {
     Vbat = "vbat", Vcel = "vcel", ["Cel#"] = "cel_count",
     Curr = "curr", Capa = "capa", ["Bat%"] = "capa_percent",
     Tesc = "esc_temp", Vbec = "vbec", Hspd = "headspeed",
+    ["~escl"] = "esc_load_pct",   -- virtual: computed by update_esc_load_warning
 }
 
 -- keys of all configurable value slots (5 panel + 8 detail)
@@ -444,6 +494,14 @@ local DETAIL_SLOT_KEYS = { "DetV1", "DetV2", "DetV3", "DetV4", "DetV5", "DetV6",
 
 local function is_off_sensor(name)
     return name == nil or name == SENSOR_OFF or name == ""
+end
+
+-- a "raw" pick = a sensor name UltiDash doesn't curate (not Off / the two virtual
+-- entries / a known SENSOR_INFO name). These are chosen via the native raw field and
+-- shown in the curated dropdown only as the single ‹ Raw › state.
+local function is_raw_sensor(name)
+    return not is_off_sensor(name) and name ~= VOLT_AUTO and name ~= ESCL_AUTO
+        and name ~= RAW_SENTINEL and SENSOR_INFO[name] == nil
 end
 
 local function sensor_dec(name)
@@ -472,23 +530,29 @@ local function sensor_unit(name)
     return (info and info.unit) or ""
 end
 
--- label shown in the settings dropdown (friendly + raw for disambiguation)
+-- label shown in the settings dropdown (friendly). Curated names get their nice
+-- label; the ‹ Raw › entry is the display state for a raw pick (chosen in the raw
+-- field, not here).
 local function sensor_pick_label(name)
     if is_off_sensor(name) then return "— Off —" end
     if name == VOLT_AUTO then return "Voltage (auto)" end
+    if name == ESCL_AUTO then return "ESC Load (calc)" end
+    if name == RAW_SENTINEL then return "‹ Raw sensor ›" end
     local info = SENSOR_INFO[name]
     if info then return info.lbl .. " (" .. name .. ")" end
     return name
 end
 
--- Build the sensor pick list for the settings dropdown: Off + smart-voltage +
--- every sensor present on the model (model.getSensor) + any sensor already chosen
--- (so a stored selection stays selectable even offline / not yet discovered).
--- Codes are the NAME strings stored in the cfg.
+-- Build the CURATED pick list for the settings dropdown: Off + smart-voltage +
+-- ESC load + only the model's sensors that UltiDash KNOWS (SENSOR_INFO — with
+-- friendly labels), so the list stays short. Everything else is picked via the
+-- native raw source field instead; a currently chosen raw name is still added
+-- (labelled "Raw: …") so the dropdown can DISPLAY it and a stored selection
+-- stays selectable offline. Codes are the NAME strings stored in the cfg.
 local function build_sensor_list(wgt)
-    local labels = { sensor_pick_label(SENSOR_OFF), sensor_pick_label(VOLT_AUTO) }
-    local codes  = { SENSOR_OFF, VOLT_AUTO }
-    local seen   = { [SENSOR_OFF] = true, [VOLT_AUTO] = true }
+    local labels = { sensor_pick_label(SENSOR_OFF), sensor_pick_label(VOLT_AUTO), sensor_pick_label(ESCL_AUTO) }
+    local codes  = { SENSOR_OFF, VOLT_AUTO, ESCL_AUTO }
+    local seen   = { [SENSOR_OFF] = true, [VOLT_AUTO] = true, [ESCL_AUTO] = true }
     local function add(name)
         if name == nil or name == "" or seen[name] then return end
         seen[name] = true
@@ -500,13 +564,21 @@ local function build_sensor_list(wgt)
             local ok, s = pcall(model.getSensor, i)
             if ok and type(s) == "table" and type(s.name) == "string" and s.name ~= "" then
                 if type(s.prec) == "number" then sensor_prec_cache[s.name] = s.prec end
-                add(s.name)
+                if SENSOR_INFO[s.name] then add(s.name) end   -- curated: known only
             end
         end
     end
+    -- keep a currently-chosen KNOWN sensor selectable even offline (before
+    -- model.getSensor has (re)discovered it). Raw picks are NOT added — they show
+    -- via the ‹ Raw › entry, so the curated list stays short.
     local src = wgt.settings_working or wgt.options or {}
-    for i = 1, #PANEL_SLOT_KEYS  do add(src[PANEL_SLOT_KEYS[i]])  end
-    for i = 1, #DETAIL_SLOT_KEYS do add(src[DETAIL_SLOT_KEYS[i]]) end
+    local function add_known(name) if name and SENSOR_INFO[name] then add(name) end end
+    for i = 1, #PANEL_SLOT_KEYS  do add_known(src[PANEL_SLOT_KEYS[i]])  end
+    for i = 1, #DETAIL_SLOT_KEYS do add_known(src[DETAIL_SLOT_KEYS[i]]) end
+    -- trailing display state for a raw pick (selecting it is inert — pick the raw
+    -- sensor in the raw field beside the dropdown)
+    labels[#labels + 1] = sensor_pick_label(RAW_SENTINEL)
+    codes[#codes + 1]   = RAW_SENTINEL
     return labels, codes
 end
 
@@ -534,6 +606,23 @@ local function sensor_value_text(wgt, name)
     end
 end
 
+-- Like sensor_value_text but ALWAYS the RAW sensor reading (user_sensors_raw, filled
+-- while the telemetry detail page is open). The detail page shows raw data so the value
+-- matches its raw "min .. max" chip — no latching / plausibility filtering / mapping.
+local function sensor_value_text_raw(wgt, name)
+    local fmt = "%." .. sensor_dec(name) .. "f"
+    local last_v, last_s, primed = nil, "-", false
+    return function()
+        local cache = wgt.values.user_sensors_raw
+        local v = cache and cache[name]
+        if primed and v == last_v then return last_s end
+        last_v = v
+        last_s = (v == nil) and "-" or string.format(fmt, v)
+        primed = true
+        return last_s
+    end
+end
+
 -- Reactive low/high text for a sensor slot: EdgeTX keeps a per-sensor session
 -- min/max, addressable by appending "-" / "+" to the name (e.g. Tesc-, Tesc+) — we
 -- cache both at 5 Hz (update_user_sensors) and format them as "min .. max" here.
@@ -543,6 +632,13 @@ local function sensor_minmax_text(wgt, name)
         local lo = wgt.values.display_voltage_min_formatted
         local hi = wgt.values.display_voltage_max_formatted
         return function() return (lo and lo() or "-") .. " .. " .. (hi and hi() or "-") end
+    end
+    if name == ESCL_AUTO then
+        -- computed value, no EdgeTX session min/max: the chip shows the session limit
+        return function()
+            local lim = wgt.values.esc_load_limit
+            return lim and ("limit " .. lim .. " A") or "not set"
+        end
     end
     local fmt = "%." .. sensor_dec(name) .. "f"
     return function()
@@ -562,6 +658,23 @@ local function sensor_test_text(name)
     return "99.99"
 end
 
+-- Reactive color for the virtual ESC-load value: neutral below warn, then the same
+-- warn/crit palette as the panel's utilization bar (theme-aware via dark_scheme).
+local function esc_load_color(wgt)
+    return function()
+        local p = wgt.values.esc_load_pct
+        if p == nil then return COLOR_THEME_PRIMARY1 end
+        local o = wgt.options
+        if p >= ((o and o.EscCrit) or 100) then
+            return dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
+        end
+        if p >= ((o and o.EscWarn) or 80) then
+            return dark_scheme and lcd.RGB(0xFF, 0xE0, 0x00) or lcd.RGB(0xF0, 0xC0, 0x00)
+        end
+        return COLOR_THEME_PRIMARY1
+    end
+end
+
 -- 5 Hz pass: refresh the cache of user-selected sensor values. A nil reading (no
 -- telemetry) KEEPS the last value, so the panel/detail stay populated while
 -- configuring with no craft connected.
@@ -576,26 +689,77 @@ local function update_user_sensors(wgt)
     if o == nil then return end
     local v = wgt.values
     local cache = v.user_sensors; if cache == nil then cache = {}; v.user_sensors = cache end
+
+    -- RAW picks: the stored name is getSourceName's DISPLAY string, but
+    -- getSourceValue's STRING lookup (luaFindFieldByName, 2.12 api_general.cpp)
+    -- matches the sensor LABEL — the two don't reliably round-trip, so raw slots
+    -- read "-". Fix: getSourceValue also accepts the numeric MIXSRC index (same
+    -- space as getSourceName / the lvgl.source picker), and the picker's index is
+    -- persisted as the <slot>Raw shadow key. Verify index -> name still matches
+    -- (getSourceName), then read BY INDEX. Telemetry sources come as value/min/max
+    -- index triples (idx / idx+1 "-" / idx+2 "+"), each verified by name before
+    -- use. Verification is cached per name (re-checked only when the persisted
+    -- index changes) so the 5 Hz pass stays cheap — index reads are cheaper than
+    -- the failing name lookups were.
+    local raw_src = wgt.raw_src; if raw_src == nil then raw_src = {}; wgt.raw_src = raw_src end
+    local function raw_sources(name, key)
+        if not is_raw_sensor(name) then return nil end
+        local idx = o[key .. "Raw"]
+        if type(idx) ~= "number" or idx == 0 then return nil end
+        local rs = raw_src[name]
+        if rs and rs.probe == idx then return rs.ok and rs or nil end
+        rs = { probe = idx, ok = false }
+        local okn, n = pcall(getSourceName, idx)
+        if okn and n == name then
+            rs.ok = true
+            rs.v = idx
+            local okm, m = pcall(getSourceName, idx + 1)
+            if okm and m == name .. "-" then rs.mn = idx + 1 end
+            local okx, x = pcall(getSourceName, idx + 2)
+            if okx and x == name .. "+" then rs.mx = idx + 2 end
+        end
+        raw_src[name] = rs
+        return rs.ok and rs or nil
+    end
+
     -- main values: mapped sensors already live in wgt.values.* (latched /
-    -- plausibility-filtered / simulator demo); others read the raw EdgeTX source
-    local function pull_val(name)
+    -- plausibility-filtered / simulator demo); others read the raw EdgeTX source —
+    -- raw picks by verified index, everything else (and as fallback) by name
+    local function pull_val(key)
+        local name = o[key]
         if is_off_sensor(name) or name == VOLT_AUTO or SENSOR_VALUE_FIELD[name] then return end
-        local ok, val = pcall(getSourceValue, name)
+        local rs = raw_sources(name, key)
+        local ok, val
+        if rs then ok, val = pcall(getSourceValue, rs.v) end
+        if not (ok and val ~= nil) then ok, val = pcall(getSourceValue, name) end
         if ok and val ~= nil then cache[name] = val end
     end
-    for i = 1, #PANEL_SLOT_KEYS  do pull_val(o[PANEL_SLOT_KEYS[i]])  end
-    for i = 1, #DETAIL_SLOT_KEYS do pull_val(o[DETAIL_SLOT_KEYS[i]]) end
+    for i = 1, #PANEL_SLOT_KEYS  do pull_val(PANEL_SLOT_KEYS[i])  end
+    for i = 1, #DETAIL_SLOT_KEYS do pull_val(DETAIL_SLOT_KEYS[i]) end
 
-    -- low/high: only needed by the open telemetry detail page, and only for its slots
+    -- value + low/high: only needed by the open telemetry detail page, and only for its
+    -- slots. The detail page shows RAW data, so pull the raw value here too (even for the
+    -- "mapped" sensors that the dashboard shows latched) into a dedicated raw cache.
     if wgt.detail_view == "telem" then
+        local craw = v.user_sensors_raw; if craw == nil then craw = {}; v.user_sensors_raw = craw end
         local cmin = v.user_sensors_min; if cmin == nil then cmin = {}; v.user_sensors_min = cmin end
         local cmax = v.user_sensors_max; if cmax == nil then cmax = {}; v.user_sensors_max = cmax end
         for i = 1, #DETAIL_SLOT_KEYS do
-            local name = o[DETAIL_SLOT_KEYS[i]]
-            if not is_off_sensor(name) and name ~= VOLT_AUTO then
-                local okn, vmin = pcall(getSourceValue, name .. "-")
+            local key = DETAIL_SLOT_KEYS[i]
+            local name = o[key]
+            if not is_off_sensor(name) and name ~= VOLT_AUTO and name ~= ESCL_AUTO then
+                local rs = raw_sources(name, key)
+                local okv, val
+                if rs then okv, val = pcall(getSourceValue, rs.v) end
+                if not (okv and val ~= nil) then okv, val = pcall(getSourceValue, name) end
+                if okv and val ~= nil then craw[name] = val end
+                local okn, vmin
+                if rs and rs.mn then okn, vmin = pcall(getSourceValue, rs.mn) end
+                if not (okn and vmin ~= nil) then okn, vmin = pcall(getSourceValue, name .. "-") end
                 if okn and vmin ~= nil then cmin[name] = vmin end
-                local okx, vmax = pcall(getSourceValue, name .. "+")
+                local okx, vmax
+                if rs and rs.mx then okx, vmax = pcall(getSourceValue, rs.mx) end
+                if not (okx and vmax ~= nil) then okx, vmax = pcall(getSourceValue, name .. "+") end
                 if okx and vmax ~= nil then cmax[name] = vmax end
             end
         end
@@ -612,6 +776,11 @@ local function build_flight_values_panel(container, wgt, x, y, c_w, c_h)
     local label_w = math.floor(c_w * 0.55)
     local value_x = padding + label_w
     local value_w = c_w - value_x - padding
+    -- ESC continuous-current load bar (shown on the Curr row when monitoring is on)
+    local esc_on = (wgt.options.EscMon == 1)
+    local ESC_GREEN = dark_scheme and lcd.RGB(0x39, 0xFF, 0x14) or lcd.RGB(0x20, 0xB0, 0x20)
+    local ESC_YELL  = dark_scheme and lcd.RGB(0xFF, 0xE0, 0x00) or lcd.RGB(0xF0, 0xC0, 0x00)
+    local ESC_RED   = dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
     -- 5 configurable slots (Settings ▸ Values). Defaults reproduce the original
     -- panel: smart voltage, headspeed, current, ESC temp, BEC. VOLT_AUTO keeps the
     -- cell/battery toggle + warn colour; a plain sensor uses the cheap cache getter;
@@ -633,7 +802,8 @@ local function build_flight_values_panel(container, wgt, x, y, c_w, c_h)
                 title = sensor_short_label(name),
                 value = sensor_value_text(wgt, name),
                 test  = sensor_test_text(name),
-                color = COLOR_THEME_PRIMARY1
+                color = (name == ESCL_AUTO) and esc_load_color(wgt) or COLOR_THEME_PRIMARY1,
+                esc_bar = esc_on and (name == "Curr")
             }
         end
     end
@@ -675,6 +845,33 @@ local function build_flight_values_panel(container, wgt, x, y, c_w, c_h)
             align = RIGHT
         }
         })
+
+        -- ESC-load utilization bar along the bottom of the Current row, FULL row width
+        -- (track + reactive fill), same span as the row divider. Hidden entirely while
+        -- no session limit is latched (GVAR still 0 -> not set up on THIS model).
+        if rows[i].esc_bar then
+            local bx  = x + padding
+            local bw  = c_w - 2 * padding
+            local byy = y + row_y + current_row_h - 6
+            local esc_vis = function() return wgt.values.esc_load_limit ~= nil end
+            container:build({
+                { type = "rectangle", x = bx, y = byy, w = bw, h = 5, filled = true, rounded = 2, color = COLOR_TRACK, visible = esc_vis },
+                { type = "rectangle", x = bx, y = byy, w = 1, h = 5, filled = true, rounded = 2, visible = esc_vis,
+                    size = function()
+                        local p = wgt.values.esc_load_pct
+                        if p == nil then return 1, 5 end
+                        if p < 0 then p = 0 elseif p > 100 then p = 100 end
+                        return math.max(1, math.floor(bw * p / 100)), 5
+                    end,
+                    color = function()
+                        local p = wgt.values.esc_load_pct
+                        if p == nil then return COLOR_TRACK end
+                        local warn = wgt.options.EscWarn or 80
+                        local crit = wgt.options.EscCrit or 100
+                        if p >= crit then return ESC_RED elseif p >= warn then return ESC_YELL else return ESC_GREEN end
+                    end },
+            })
+        end
 
         if i < 5 then
             container:hline({ x = x + padding, y = y + row_y + current_row_h, w = c_w - 2 * padding, h = 1, color =
@@ -1490,10 +1687,18 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         y = y + y_off,
         w = date_w,
         h = font_h,
-        text = function()
-            if time_only then return wgt.values.clock_time_formatted() end
-            return wgt.values.clock_date_formatted() .. "  " .. wgt.values.clock_time_formatted()
-        end,
+        text = (function()
+            -- both parts are already time-throttled memoized strings; memo the
+            -- concatenation too so the top bar allocates only when the string changes
+            local last_d, last_t, last_s
+            return function()
+                if time_only then return wgt.values.clock_time_formatted() end
+                local d = wgt.values.clock_date_formatted()
+                local t = wgt.values.clock_time_formatted()
+                if d ~= last_d or t ~= last_t then last_d, last_t, last_s = d, t, d .. "  " .. t end
+                return last_s
+            end
+        end)(),
         font = header_font,
         color = COLOR_THEME_PRIMARY1,
         align = LEFT
@@ -1861,19 +2066,36 @@ local function build_elrs_view(wgt, zone, as_detail)
         font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
 end
 
+-- Add a filled triangle (up/down) to a build-table list from stacked 1px bars — the
+-- EdgeTX font has no ▲/▼ glyphs, so scroll arrows are drawn. `size` = rows (px tall);
+-- base width = 2*size-1, centered at cx, starting at top_y.
+local function add_tri(list, cx, top_y, size, up, col)
+    for r = 0, size - 1 do
+        local wr = up and (2 * r + 1) or (2 * (size - r) - 1)
+        -- 2px-tall bars stepped by 1px overlap into a solid triangle (1px bars were too
+        -- thin to render visibly on the radio)
+        list[#list + 1] = { type = "rectangle", filled = true, x = cx - math.floor(wr / 2), y = top_y + r, w = math.max(2, wr), h = 2, color = col }
+    end
+end
+
 --- Build the STATUS DETAIL page (opened by tapping the ESC/arming status line,
---- fullscreen only — modeled after eStatus' app-mode view): current arm/governor/
---- throttle summary, the colored status line, and the timestamped ESC event log.
---- All rows are reactive (the log updates live without rebuilds).
+--- fullscreen only). A bordered "status card" (arm/gov/throttle + ESC status + arming
+--- status incl. the FULL disable-reason list) over the timestamped ESC event log, with
+--- a tiny diagnostics footer. All rows are reactive (log updates live, no rebuilds).
 local function build_estatus_view(wgt, zone)
     local w = zone.w
     local h = zone.h
     local C_RED = dark_scheme and lcd.RGB(0xFF, 0x1A, 0x40) or lcd.RGB(0xE0, 0x30, 0x30)
+    local C_GRN = dark_scheme and lcd.RGB(0x39, 0xFF, 0x14) or lcd.RGB(0x20, 0xB0, 0x20)
+    -- neutral grey for hints/timestamps (NOT the theme DISABLED color, which is orange-red
+    -- in the Clean palette and made the empty hint look like an error)
+    local C_DIM = COLOR_DIM
 
     local title_font = h >= 170 and DBLSIZE or MIDSIZE
     local row_font   = h >= 170 and MIDSIZE or 0
     local title_w, title_h = lcd.sizeText("Status", title_font)
     local _, row_th = lcd.sizeText("Ag", row_font)
+    local _, sml_h  = lcd.sizeText("Ag", SMLSIZE)
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
         filled = force_bg_fill or (ultidash_functions.get_shared().bg_filled == true) })
@@ -1881,84 +2103,133 @@ local function build_estatus_view(wgt, zone)
     -- header: title + craft name + close hint
     panel:label({ x = 10, y = 4, text = "Status", font = title_font, color = COLOR_THEME_PRIMARY1 })
     panel:label({ x = 10 + title_w + 14, y = 4 + math.floor((title_h - row_th) / 2),
-        w = w - title_w - 140, h = row_th + 2,
+        w = w - title_w - 150, h = row_th + 2,
         text = function() return wgt.values.craft_name_formatted() end,
         font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
-    panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
-    local top = 4 + title_h + 4
-    panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
+    panel:label({ x = w - 110, y = 8, w = 100, h = 18, text = "tap to close", font = SMLSIZE, color = C_DIM, align = RIGHT })
+    local top = 8 + title_h + 4
 
-    -- neutral grey for hints/trace/timestamps — deliberately NOT the theme's
-    -- DISABLED color (the Clean palette maps that to orange-red, which made the
-    -- "no events yet" hint look like an error)
-    local C_DIM = COLOR_DIM
+    -- ---------- Status card: arm/gov/thr + ESC status + arming status ----------
+    local cx, cw = 6, w - 12
+    local rpad = 4
+    local lh = row_th + 2
+    local card_h = rpad * 2 + lh * 3
+    panel:build({ { type = "rectangle", x = cx, y = top, w = cw, h = card_h, thickness = 1, rounded = 8,
+        color = COLOR_THEME_SECONDARY1 } })
 
-    -- summary: arm state / governor / throttle — governor gets the widest column
-    -- ("Throttle off" wrapped into the status line below with equal thirds)
-    local sy = top + 4
-    local arm_w = math.floor(w * 0.24)
-    local gov_w = math.floor(w * 0.46)
-    panel:label({ x = 10, y = sy, w = arm_w, h = row_th + 2,
+    local ix = cx + 10
+    local iw = cw - 20
+    local lblW = math.max(40, math.floor(iw * 0.14))   -- "ESC"/"Arm" tag column
+
+    -- row 1: ARMED/Disarmed | Gov | Thr
+    local r1 = top + rpad
+    local aw = math.floor(iw * 0.28)
+    local gw = math.floor(iw * 0.42)
+    panel:label({ x = ix, y = r1, w = aw, h = lh, font = row_font, align = LEFT,
         text = function() return wgt.armed_now and "ARMED" or "Disarmed" end,
-        font = row_font,
-        color = function() return wgt.armed_now and C_RED or COLOR_THEME_PRIMARY1 end,
-        align = LEFT })
-    panel:label({ x = 10 + arm_w, y = sy, w = gov_w, h = row_th + 2,
-        text = function() return "Gov: " .. wgt.values.gov_state_formatted() end,
-        font = row_font, color = COLOR_THEME_PRIMARY1, align = LEFT })
-    panel:label({ x = 10 + arm_w + gov_w, y = sy, w = w - 20 - arm_w - gov_w, h = row_th + 2,
-        text = function() return "Thr: " .. (wgt.values.throttle_text or "-") end,
-        font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+        color = function() return wgt.armed_now and C_RED or COLOR_THEME_PRIMARY1 end })
+    panel:label({ x = ix + aw, y = r1, w = gw, h = lh, font = row_font, align = LEFT,
+        text = function() return "Gov: " .. wgt.values.gov_state_formatted() end, color = COLOR_THEME_PRIMARY1 })
+    panel:label({ x = ix + aw + gw, y = r1, w = iw - aw - gw, h = lh, font = row_font, align = RIGHT,
+        text = function() return "Thr: " .. (wgt.values.throttle_text or "-") end, color = COLOR_THEME_PRIMARY1 })
 
-    -- current status line (ESC status / arming-disable reasons / placeholder)
-    local ly = sy + row_th + 8
-    panel:label({ x = 10, y = ly, w = w - 20, h = row_th + 2,
-        text = function() return wgt.values.status_line_text end,
-        font = row_font,
-        color = function() return wgt.values.status_line_color end,
-        align = CENTER })
+    -- row 2: ESC status (level-colored)
+    local r2 = r1 + lh
+    panel:label({ x = ix, y = r2, w = lblW, h = lh, font = row_font, text = "ESC", color = C_DIM, align = LEFT })
+    panel:label({ x = ix + lblW, y = r2, w = iw - lblW, h = lh, font = row_font, align = LEFT,
+        text = function()
+            if wgt.esc_status_text and wgt.esc_status_text ~= "" then return wgt.esc_status_text end
+            return (wgt.values.rf_connection_state == "disconnected") and "-" or "OK"
+        end,
+        color = function()
+            local lvl = wgt.esc_status_level
+            if lvl == nil then return COLOR_THEME_PRIMARY1 end
+            if lvl >= 3 then return C_RED end
+            if lvl == 2 then return COLOR_THEME_WARNING end
+            return COLOR_THEME_PRIMARY1
+        end })
 
-    -- timestamped event log (newest first), reactive slots — like eStatus' app
-    -- mode. Standard font on purpose: smaller than the summary -> more rows fit.
+    -- row 3: arming status (Armed / Ready to arm / the full disable-reason list)
+    local r3 = r2 + lh
+    panel:label({ x = ix, y = r3, w = lblW, h = lh, font = row_font, text = "Arm", color = C_DIM, align = LEFT })
+    panel:label({ x = ix + lblW, y = r3, w = iw - lblW, h = lh, font = row_font, align = LEFT,
+        text = function()
+            if wgt.armed_now then return "Armed" end
+            local r = wgt.values.arm_reasons_full
+            if r and r ~= "" then return r end
+            return (wgt.values.rf_connection_state == "disconnected") and "-" or "Ready to arm"
+        end,
+        color = function()
+            if wgt.armed_now then return COLOR_THEME_PRIMARY1 end
+            local r = wgt.values.arm_reasons_full
+            if r and r ~= "" then return COLOR_THEME_WARNING end
+            return (wgt.values.rf_connection_state == "disconnected") and C_DIM or C_GRN
+        end })
+
+    -- ---------- Event log ----------
     local log_font = 0
     local time_w, log_th = lcd.sizeText("00:00:00", log_font)
     time_w = time_w + 10
-    local log_top = ly + row_th + 10
-    panel:hline({ y = log_top - 2, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
-    local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
-    panel:label({ x = 10, y = log_top + 2, w = 200, h = sml_h + 2, text = "Event log", font = SMLSIZE, color = C_DIM, align = LEFT })
-    -- dev metrics footer (Lua heap / UI loop rate / 5Hz-pass duration)
-    panel:label({ x = 10, y = h - log_th - 4, w = w - 20, h = log_th + 2,
-        text = function()
-            return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB     UI " .. (wgt.dbg_hz or "-")
-                .. " Hz     pass " .. ((wgt.dbg_pass_cs or 0) * 10) .. " ms"
-        end,
-        font = SMLSIZE, color = C_DIM, align = LEFT })
+    local footer_h = sml_h + 6
+    local log_lbl_y = top + card_h + 6
+    panel:label({ x = 10, y = log_lbl_y, w = 200, h = sml_h + 2, text = "Event log", font = SMLSIZE, color = C_DIM, align = LEFT })
+    panel:hline({ y = log_lbl_y + sml_h + 3, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
 
-    local list_y = log_top + sml_h + 6
-    local log_row_h = log_th + 3
-    local slots = math.max(1, math.floor((h - list_y - log_th - 10) / log_row_h))
+    local list_y = log_lbl_y + sml_h + 8
+    local list_bottom = h - footer_h - 4
+    local log_row_h = log_th + 4
+    local slots = math.max(1, math.floor((list_bottom - list_y) / log_row_h))
+
+    -- scroll offset (0 = newest at top), clamped to the current log length. The ▲/▼
+    -- buttons (handled in refresh()) change wgt.estatus_scroll and rebuild.
+    local log0 = ultidash_functions.get_esc_log(wgt)
+    local nlog = log0 and #log0 or 0
+    local maxscroll = math.max(0, nlog - slots)
+    local scroll = math.min(math.max(0, wgt.estatus_scroll or 0), maxscroll)
+    wgt.estatus_scroll = scroll
+
+    if nlog > slots then
+        local sb  = sml_h + 8
+        local sby = log_lbl_y - math.floor((sb - sml_h) / 2)
+        local sdx = w - 10 - sb
+        local sux = sdx - 6 - sb
+        local tri_sz = math.max(5, math.floor(sb * 0.42))
+        local tri_y  = sby + math.floor((sb - tri_sz) / 2)
+        local btns = {
+            { type = "rectangle", x = sux, y = sby, w = sb, h = sb, thickness = 1, rounded = 4, color = COLOR_THEME_SECONDARY1 },
+            { type = "rectangle", x = sdx, y = sby, w = sb, h = sb, thickness = 1, rounded = 4, color = COLOR_THEME_SECONDARY1 },
+        }
+        add_tri(btns, sux + math.floor(sb / 2), tri_y, tri_sz, true,  COLOR_THEME_PRIMARY1)   -- up (newer)
+        add_tri(btns, sdx + math.floor(sb / 2), tri_y, tri_sz, false, COLOR_THEME_PRIMARY1)   -- down (older)
+        panel:build(btns)
+        wgt.estatus_scroll_up   = { x = sux, y = sby, w = sb, h = sb }
+        wgt.estatus_scroll_down = { x = sdx, y = sby, w = sb, h = sb }
+        panel:label({ x = sux - 96, y = log_lbl_y, w = 90, h = sml_h + 2, font = SMLSIZE, align = RIGHT, color = C_DIM,
+            text = string.format("%d-%d / %d", scroll + 1, math.min(scroll + slots, nlog), nlog) })
+    else
+        wgt.estatus_scroll_up   = nil
+        wgt.estatus_scroll_down = nil
+    end
+
+    local function log_empty()
+        local log = ultidash_functions.get_esc_log(wgt)
+        return log == nil or #log == 0
+    end
+    -- clean centered empty-state (instead of a broken half-line in the timestamp column)
+    panel:label({ x = 0, y = math.floor((list_y + list_bottom) / 2 - log_th / 2), w = w, h = log_th + 2,
+        font = log_font, color = C_DIM, align = CENTER, text = "No events yet", visible = log_empty })
+
     for i = 1, slots do
-        local idx = i   -- 1 = newest
+        local idx = i   -- 1 = newest (before scroll)
         local ry = list_y + (i - 1) * log_row_h
         local function entry()
             local log = ultidash_functions.get_esc_log(wgt)
-            return log and log[#log - (idx - 1)] or nil
+            return log and log[#log - (idx - 1) - scroll] or nil
         end
-        -- dim timestamp column + level-colored text column
-        panel:label({ x = 10, y = ry, w = time_w, h = log_th + 2,
-            text = function()
-                local e = entry()
-                if e then return e.time end
-                return (idx == 1 and ultidash_functions.get_esc_log(wgt) == nil) and "no events yet" or ""
-            end,
-            font = log_font, color = C_DIM, align = LEFT })
-        panel:label({ x = 10 + time_w, y = ry, w = w - 20 - time_w, h = log_th + 2,
-            text = function()
-                local e = entry()
-                return e and e.text or ""
-            end,
-            font = log_font,
+        panel:label({ x = 10, y = ry, w = time_w, h = log_th + 2, font = log_font, color = C_DIM, align = LEFT,
+            text = function() local e = entry(); return e and e.time or "" end })
+        panel:label({ x = 10 + time_w, y = ry, w = w - 20 - time_w, h = log_th + 2, font = log_font, align = LEFT,
+            text = function() local e = entry(); return e and e.text or "" end,
             color = function()
                 local e = entry()
                 if not e then return C_DIM end
@@ -1966,9 +2237,15 @@ local function build_estatus_view(wgt, zone)
                 if e.level == 2 then return COLOR_THEME_WARNING end
                 if e.level <= 0 then return C_DIM end
                 return COLOR_THEME_PRIMARY1
-            end,
-            align = LEFT })
+            end })
     end
+
+    -- tiny diagnostics footer (kept subtle, per the "klein/dezent" choice)
+    panel:label({ x = 10, y = h - footer_h + 2, w = w - 20, h = sml_h + 2, font = SMLSIZE, color = C_DIM, align = LEFT,
+        text = function()
+            return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB  free " .. (wgt.dbg_free_kb or "-")
+                .. " kB   UI " .. (wgt.dbg_hz or "-") .. " Hz   pass " .. ((wgt.dbg_pass_cs or 0) * 10) .. " ms"
+        end })
 end
 
 --- Build the BATTERY DETAIL page (tap the center fuel gauge, fullscreen only):
@@ -2266,9 +2543,15 @@ local function build_telem_view(wgt, zone)
             panel:label({ x = val_x, y = val_top, w = val_w, h = val_h + 2,
                 text = wgt.values.display_voltage_formatted, font = val_font,
                 color = wgt.values.display_voltage_color, align = RIGHT })
-        else
+        elseif name == ESCL_AUTO then
+            -- computed (no raw sensor behind it): the 5 Hz-cached load % with the
+            -- bar's warn/crit colour semantics
             panel:label({ x = val_x, y = val_top, w = val_w, h = val_h + 2,
                 text = sensor_value_text(wgt, name), font = val_font,
+                color = esc_load_color(wgt), align = RIGHT })
+        else
+            panel:label({ x = val_x, y = val_top, w = val_w, h = val_h + 2,
+                text = sensor_value_text_raw(wgt, name), font = val_font,
                 color = COLOR_THEME_PRIMARY1, align = RIGHT })
         end
         -- unit: small, sitting on the big value's baseline at the value area's right edge
@@ -2303,25 +2586,40 @@ local function build_status_view(wgt, zone, as_page)
     local w = zone.w
     local h = zone.h
     local shared = ultidash_functions.get_shared()
-    local th, al = shared.thresholds, shared.alerts
+    local th, al, vol = shared.thresholds, shared.alerts, shared.volume
 
     local function num(v, fmt) if v == nil then return "-" end return string.format(fmt, v) end
+    local function sounds_off()
+        if not shared.ready then return "-" end
+        local off = {}
+        if al.cellchk == false then off[#off + 1] = "CellChk" end
+        if al.fuel    == false then off[#off + 1] = "Fuel" end
+        if al.volt    == false then off[#off + 1] = "Volt" end
+        if al.arm     == false then off[#off + 1] = "Arm" end
+        if al.telem   == false then off[#off + 1] = "Telem" end
+        if al.link    == false then off[#off + 1] = "Link" end
+        if al.rssi    == false then off[#off + 1] = "Rssi" end
+        if al.pwr     == false then off[#off + 1] = "Pwr" end
+        if al.bec     == false then off[#off + 1] = "Bec" end
+        if al.skp     == false then off[#off + 1] = "Skp" end
+        if #off == 0 then return "none (all enabled)" end
+        return table.concat(off, ", ")
+    end
 
-    local rows = {
+    -- section markers ({ section=... }) group the config; the rest are label/value rows
+    local items = {
         { lbl = "Model / link", val = function()
             if not shared.ready then return "-" end
-            local name = shared.model_name or "-"
-            return name .. (shared.connected and "  (connected)" or "  (disconnected)")
+            return (shared.model_name or "-") .. (shared.connected and "  (conn)" or "  (disc)")
         end },
+        { section = "Battery" },
         { lbl = "Cell source", val = function() return th.source or "-" end },
         { lbl = "Cell full / low / crit", val = function()
             if th.cell_full == nil then return "-" end
             return string.format("%.2f / %.2f / %.2f V", th.cell_full or 0, th.cell_warn or 0, th.cell_crit or 0)
         end },
-        { lbl = "Reserve / callout", val = function()
-            if not shared.ready then return "-" end
-            return num(th.reserve, "%d %%") .. "  /  " .. num(th.callout_int, "%d s")
-        end },
+        { lbl = "Reserve", val = function() if not shared.ready then return "-" end return num(th.reserve, "%d %%") end },
+        { section = "Link" },
         { lbl = "RQly warn / crit", val = function()
             if not shared.ready then return "-" end
             return num(th.rq_warn, "%d %%") .. "  /  " .. num(th.rq_crit, "%d %%")
@@ -2330,57 +2628,70 @@ local function build_status_view(wgt, zone, as_page)
             if not shared.ready then return "-" end
             return num(th.rss_warn, "%d %%") .. " / " .. num(th.rss_crit, "%d %%") .. " / " .. num(th.rss_hold, "%d s")
         end },
-        { lbl = "Power warn / Skp limit", val = function()
+        { section = "Alerts" },
+        { lbl = "Power warn", val = function() if not shared.ready then return "-" end return num(th.pwr_warn_v, "%.1f V") end },
+        { lbl = "BEC warn / crit", val = function()
             if not shared.ready then return "-" end
-            return num(th.pwr_warn_v, "%.1f V") .. "  /  " .. num(th.skp_limit, "%d")
+            return num(th.bec_warn, "%d %%") .. "  /  " .. num(th.bec_crit, "%d %%")
         end },
-        { lbl = "Mute / haptic", val = function()
+        { lbl = "ESC load", val = function()
             if not shared.ready then return "-" end
-            return (al.mute and "ALL MUTED" or "none") .. "  /  " .. (al.haptic and "on" or "off")
+            if not th.esc_load then return "off" end
+            local lim = th.esc_limit and (th.esc_limit .. " A") or "not set"
+            return "GV" .. (th.esc_gvar or "?") .. "  " .. lim .. "  " .. num(th.esc_warn, "%d") .. " / " .. num(th.esc_crit, "%d %%")
+                .. "  " .. num(th.esc_hold, "%d s")
         end },
-        { lbl = "Sounds off", val = function()
+        { lbl = "Skipped limit", val = function() if not shared.ready then return "-" end return num(th.skp_limit, "%d") end },
+        { lbl = "Repeat", val = function() if not shared.ready then return "-" end return al.repeat_summary or "none" end },
+        { lbl = "Mute / escalation", val = function()
             if not shared.ready then return "-" end
-            local off = {}
-            if al.cellchk == false then off[#off + 1] = "CellChk" end
-            if al.fuel    == false then off[#off + 1] = "Fuel" end
-            if al.volt    == false then off[#off + 1] = "Volt" end
-            if al.arm     == false then off[#off + 1] = "Arm" end
-            if al.telem   == false then off[#off + 1] = "Telem" end
-            if al.link    == false then off[#off + 1] = "Link" end
-            if al.rssi    == false then off[#off + 1] = "Rssi" end
-            if al.pwr     == false then off[#off + 1] = "Pwr" end
-            if al.skp     == false then off[#off + 1] = "Skp" end
-            if #off == 0 then return "none (all enabled)" end
-            return table.concat(off, ", ")
+            return (al.mute and "ALL MUTED" or "none") .. "  /  " .. (al.escalating and "ACTIVE" or "idle")
+        end },
+        { lbl = "Sounds off", val = sounds_off },
+        { section = "Volume" },
+        { lbl = "Callout / voice", val = function()
+            if not shared.ready or vol == nil then return "-" end
+            local c = vol.callout or 0
+            return ((c == 0) and "System" or (c .. "/5")) .. "  /  " .. (vol.voice or "-")
+        end },
+        { lbl = "Master (GVAR)", val = function()
+            if not shared.ready or vol == nil then return "-" end
+            if (vol.gvar or 0) == 0 then return "off (radio vol)" end
+            return "GV" .. vol.gvar .. "   " .. (vol.flight or "-") .. " / " .. (vol.escal or "-") .. " %"
         end },
     }
 
     if as_page then
+        -- scrollable page (menu -> Status): sections + rows, everything fits via scroll
         local pg = lvgl.page({
-            title = "UltiDash",
-            subtitle = "Status",
-            back = function()
-                wgt.menu_view = "menu"
-                init_view_state(wgt).dirty = true
-            end,
+            title = "UltiDash", subtitle = "Status",
+            back = function() wgt.menu_view = "menu"; init_view_state(wgt).dirty = true end,
         })
-        local row_h = 28
-        local lblw = math.floor(w * 0.48)
-        for i = 1, #rows do
-            local ry = (i - 1) * row_h + 4
-            pg:label({ x = 10, y = ry, w = lblw, h = 24, text = rows[i].lbl, color = COLOR_THEME_SECONDARY1, align = LEFT })
-            pg:label({ x = 10 + lblw, y = ry, w = w - lblw - 34, h = 24, text = rows[i].val, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+        local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
+        local row_h = 26
+        local lblw = math.floor(w * 0.46)
+        local y = 2
+        for i = 1, #items do
+            local it = items[i]
+            if it.section then
+                y = y + 6
+                pg:label({ x = 10, y = y, w = w - 40, h = sml_h + 2, text = it.section, font = SMLSIZE, color = COLOR_THEME_FOCUS, align = LEFT })
+                y = y + sml_h + 4
+            else
+                pg:label({ x = 10, y = y, w = lblw, h = 22, text = it.lbl, color = COLOR_THEME_SECONDARY1, align = LEFT })
+                pg:label({ x = 10 + lblw, y = y, w = w - lblw - 34, h = 22, text = it.val, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+                y = y + row_h
+            end
         end
-        -- dev metrics (same line as on the tap-the-status-line event-log page)
-        pg:label({ x = 10, y = #rows * row_h + 10, w = w - 34, h = 20,
+        pg:label({ x = 10, y = y + 8, w = w - 34, h = 20, font = SMLSIZE, color = COLOR_DIM, align = LEFT,
             text = function()
-                return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB     UI " .. (wgt.dbg_hz or "-")
-                    .. " Hz     pass " .. ((wgt.dbg_pass_cs or 0) * 10) .. " ms"
-            end,
-            font = SMLSIZE, color = COLOR_DIM, align = LEFT })
+                return "Lua " .. (wgt.dbg_lua_kb or "-") .. " kB  free " .. (wgt.dbg_free_kb or "-")
+                    .. " kB   UI " .. (wgt.dbg_hz or "-") .. " Hz"
+            end })
         return
     end
 
+    -- passive ViewMode "Status info" panel (fixed height): same items, equal rows
     local big = h >= 170
     local title_font = big and MIDSIZE or 0
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = force_bg_fill or (shared.bg_filled == true) })
@@ -2390,14 +2701,19 @@ local function build_status_view(wgt, zone, as_page)
     panel:label({ x = 10, y = 4, text = "UltiDash config", font = title_font, color = COLOR_THEME_PRIMARY1 })
     panel:hline({ y = top - 2, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
 
-    local row_h = math.floor((h - top - foot) / #rows)
+    local row_h = math.floor((h - top - foot) / #items)
     local row_font = select_font(row_h - 1, nil, nil)
-    local lbl_w = math.floor(w * 0.48)
+    local lbl_w = math.floor(w * 0.46)
 
-    for i = 1, #rows do
+    for i = 1, #items do
+        local it = items[i]
         local ry = top + (i - 1) * row_h
-        panel:label({ x = 10, y = ry, w = lbl_w, h = row_h, text = rows[i].lbl, font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
-        panel:label({ x = 10 + lbl_w, y = ry, w = w - lbl_w - 14, h = row_h, text = rows[i].val, font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+        if it.section then
+            panel:label({ x = 10, y = ry, w = w - 20, h = row_h, text = it.section, font = row_font, color = COLOR_THEME_FOCUS, align = LEFT })
+        else
+            panel:label({ x = 10, y = ry, w = lbl_w, h = row_h, text = it.lbl, font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
+            panel:label({ x = 10 + lbl_w, y = ry, w = w - lbl_w - 14, h = row_h, text = it.val, font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
+        end
     end
 
     panel:label({ x = 10, y = h - foot + 2, w = w - 14, h = foot - 2,
@@ -2428,13 +2744,24 @@ local SETTINGS_DISPLAY = {
     { key = "ShowRSSI",      lbl = "Top bar: RSSI bars",    kind = "bool", def = 1 },
     { key = "ShowTxV",       lbl = "Top bar: TX voltage",   kind = "bool", def = 0 },
     { key = "ShowTPWR",      lbl = "Bottom bar: TPWR",      kind = "bool", def = 1 },
+    { key = "TxPwrMax",      lbl = "TPWR bar max (mW)",     kind = "num", def = 0, min = 0, max = 1000, step = 10, big = 50,
+                             fmt = function(v) return v == 0 and "not set" or (v .. " mW") end },
     { key = "ArmClose",      lbl = "Close detail pages on arm", kind = "bool", def = 0 },
     { key = "TapDetails",    lbl = "Tap zones for detail pages", kind = "bool", def = 1 },
     { key = "BarsQuiet",     lbl = "Link bars: color only on warning", kind = "bool", def = 1 },
 }
 
+local function fmt_pctval(v) return v .. " %" end
+
 local SETTINGS_BATTERY = {
     { key = "Reserve",      lbl = "Reserve (%)",            kind = "num", def = 20,  min = 0,   max = 40,  step = 1, big = 5 },
+    -- Fuel-callout density (value-driven descending %): quiet up high, denser near the end.
+    -- Defaults reproduce the historical fixed cadence (from full, 10 % steps, 1 % below 10 %).
+    { key = "FuelStart",    lbl = "Fuel: announce below (%)", kind = "num", def = 100, min = 5, max = 100, step = 5, big = 10,
+                            fmt = function(v) return (v >= 100) and "from full" or (v .. " %") end },
+    { key = "FuelStep",     lbl = "Fuel: coarse step (%)",  kind = "num", def = 10, min = 1, max = 50, step = 1, big = 5, fmt = fmt_pctval },
+    { key = "FuelDense",    lbl = "Fuel: dense below (%)",   kind = "num", def = 10, min = 0, max = 100, step = 5, big = 10, fmt = fmt_pctval },
+    { key = "FuelStepFine", lbl = "Fuel: fine step (%)",    kind = "num", def = 1,  min = 1, max = 50, step = 1, big = 5, fmt = fmt_pctval },
     { key = "CellSource",   lbl = "Cell thresholds from",   kind = "choice", def = 1, vals = { "FC config", "Manual" } },
     { key = "CellFull",     lbl = "Full cell (manual)",     kind = "num", def = 412, min = 300, max = 480, step = 1, big = 10, fmt = fmt_centivolt },
     { key = "CellLow",      lbl = "Low cell (manual)",      kind = "num", def = 345, min = 300, max = 440, step = 1, big = 10, fmt = fmt_centivolt },
@@ -2442,20 +2769,53 @@ local SETTINGS_BATTERY = {
     { key = "StartupDelay", lbl = "Cell-check delay (s)",   kind = "num", def = 4,   min = 1,   max = 20,  step = 1, big = 5 },
 }
 
+local function fmt_pctdrop(v) return v .. " %" end
+
+-- Warning thresholds, grouped by subject via non-interactive section headers
+-- (kind="info" rows). ESC-load thresholds live in their own "ESC load" group;
+-- the TPWR bar max moved to Display (it scales the bottom-bar TPWR display).
 local SETTINGS_THRESHOLDS = {
-    { key = "CalloutInt", lbl = "Callout interval (s)",   kind = "num", def = 6,  min = 1,  max = 60,   step = 1,  big = 5 },
+    { kind = "info", lbl = "Link & signal" },
     { key = "RQlyWarn",   lbl = "Link warn (%)",          kind = "num", def = 80, min = 0,  max = 100,  step = 1,  big = 5 },
     { key = "RQlyCrit",   lbl = "Link critical (%)",      kind = "num", def = 50, min = 0,  max = 100,  step = 1,  big = 5 },
     { key = "RssWarn",    lbl = "RSSI warn (% headroom)", kind = "num", def = 15, min = 0,  max = 100,  step = 1,  big = 5 },
     { key = "RssCrit",    lbl = "RSSI critical (%)",      kind = "num", def = 8,  min = 0,  max = 100,  step = 1,  big = 5 },
     { key = "RssHold",    lbl = "RSSI hold time (s)",     kind = "num", def = 2,  min = 1,  max = 10,   step = 1,  big = 2 },
-    { key = "PwrWarnV",   lbl = "Power warn voltage",     kind = "num", def = 90, min = 30, max = 500,  step = 5,  big = 20, fmt = fmt_decivolt },
     { key = "SkpLimit",   lbl = "Skipped-packet limit",   kind = "num", def = 50, min = 10, max = 2000, step = 10, big = 100 },
-    { key = "TxPwrMax",   lbl = "TPWR bar max (mW)",      kind = "num", def = 0, min = 0, max = 1000, step = 10, big = 50,
-                          fmt = function(v) return v == 0 and "not set" or (v .. " mW") end },
+    { kind = "info", lbl = "Power & BEC" },
+    { key = "PwrWarnV",   lbl = "Power warn voltage",     kind = "num", def = 90, min = 30, max = 500,  step = 5,  big = 20, fmt = fmt_decivolt },
+    { key = "BecWarn",    lbl = "BEC warn (% drop)",      kind = "num", def = 8,  min = 1,  max = 50,   step = 1,  big = 5, fmt = fmt_pctdrop },
+    { key = "BecCrit",    lbl = "BEC critical (% drop)",  kind = "num", def = 15, min = 1,  max = 60,   step = 1,  big = 5, fmt = fmt_pctdrop },
 }
 
-local SETTINGS_ALERTS = {
+-- ESC continuous-current LOAD monitor (own settings group). The FC writes the ESC's
+-- continuous-current limit (amps) into the configured GVAR after connect;
+-- load% = Curr / limit * 100. One MASTER switch runs the whole feature:
+--   * EscMon ("ESC load monitoring") + a configured EscGvar. Off (or no GVAR) => the
+--     whole feature is off: no bar, no "ESC Load" tile value ("not set"), no alarm.
+--   * When on, the bar (Current row) + the "ESC Load" virtual sensor show; Warn/
+--     Critical % colour both. The ALARM is an additional opt-in — the "ESC load"
+--     alert's Active (key EscLoad) under Alerts > ESC load — and is itself gated by
+--     EscMon (monitoring off = alarm silent). EscHold gates how long the load must
+--     stay high before it fires (alarm is armed-only).
+local SETTINGS_ESC = {
+    { key = "EscMon",   lbl = "ESC load monitoring",   kind = "bool", def = 0 },
+    { key = "EscGvar",  lbl = "ESC limit: GVAR (A)",   kind = "num", def = 0, min = 0, max = 15, step = 1, big = 1,
+                        fmt = function(v) return (v == 0) and "Off" or ("GV" .. v) end },
+    { key = "EscWarn",  lbl = "Warn (%)",              kind = "num", def = 80,  min = 10, max = 200, step = 5, big = 10, fmt = fmt_pctval },
+    { key = "EscCrit",  lbl = "Critical (%)",          kind = "num", def = 100, min = 10, max = 200, step = 5, big = 10, fmt = fmt_pctval },
+    { key = "EscHold",  lbl = "Alarm hold time (s)",   kind = "num", def = 5,   min = 1,  max = 30,  step = 1, big = 5, fmt = function(v) return v .. " s" end },
+    { kind = "info", lbl = "Monitoring off = feature off. GVAR holds the ESC continuous-current limit (A), written by the FC. Alarm on/off is under Alerts > ESC load." },
+}
+
+local function fmt_pct(v) return tostring(v) .. " %" end
+
+-- Loudness / volume — its own settings group (see the "Volume" entry in
+-- SETTINGS_GROUPS). Two independent loudness worlds:
+--   * the per-callout WIDGET volume (Volume 1..5, passed to playFile/playNumber), and
+--   * the GVAR MASTER-volume bridge (VolGvar drives a model "Volume" special function).
+-- Normal vs. escalation % (VolFlight / VolEscal) only apply in the GVAR world.
+local SETTINGS_VOLUME = {
     { key = "Volume",     lbl = "Callout volume",            kind = "num", def = 0, min = 0, max = 5, step = 1, big = 1,
                           fmt = function(v)
                               if v == 0 then return "System" end
@@ -2464,57 +2824,83 @@ local SETTINGS_ALERTS = {
                               return tostring(v) .. " / 5"
                           end },
     { key = "VolWhen",    lbl = "Widget volume applies",     kind = "choice", def = 1, vals = { "Always", "Only connected" } },
+    { key = "VolGvar",    lbl = "Master volume via GVAR",     kind = "num", def = 0, min = 0, max = 15, step = 1, big = 1,
+                          fmt = function(v) return (v == 0) and "Off" or ("GV" .. v) end },
+    { kind = "info", lbl = "GVAR is optional. Without it, callouts use the radio volume; the normal/escalation % below apply only when a GVAR is set." },
+    { key = "VolFlight",  lbl = "Normal volume (%)",          kind = "slider", def = 80,  min = 0, max = 100, step = 5, big = 10, fmt = fmt_pct },
+    { key = "VolEscal",   lbl = "Escalation volume (%)",      kind = "slider", def = 100, min = 0, max = 100, step = 5, big = 10, fmt = fmt_pct },
+}
+
+-- Global voice settings (language + master mute), reached via the Alerts submenu's
+-- first entry ("Voice / mute"). Separate from the per-alert pages.
+local SETTINGS_VOICE = {
     { key = "VoiceLang",  lbl = "Voice language",            kind = "choice", def = 1, vals = { "English", "Deutsch" } },
     { key = "Mute",       lbl = "Mute (master)",             kind = "choice", def = 1, vals = { "None", "All" } },
-    { key = "Haptic",     lbl = "Vibrate on critical",       kind = "bool", def = 1 },
-    { key = "SndCellChk", lbl = "Sound: startup cell-check", kind = "bool", def = 1 },
-    { key = "SndFuel",    lbl = "Sound: fuel callouts",      kind = "bool", def = 1 },
-    { key = "SndVolt",    lbl = "Sound: voltage alerts",     kind = "bool", def = 1 },
-    { key = "SndArm",     lbl = "Sound: armed / disarm",     kind = "bool", def = 1 },
-    { key = "SndTelem",   lbl = "Sound: telemetry lost/ok",  kind = "bool", def = 1 },
-    { key = "SndLink",    lbl = "Sound: link quality",       kind = "bool", def = 1 },
-    { key = "SndRssi",    lbl = "Sound: RSSI / signal",      kind = "bool", def = 1 },
-    { key = "PwrWarn",    lbl = "Sound: main power lost",    kind = "bool", def = 1 },
-    { key = "SkpWarn",    lbl = "Sound: skipped packets",    kind = "bool", def = 1 },
 }
 
--- Switch voice announcements: pick the physical TX switch per function; "inv"
--- entries flip the position order (e.g. a governor mixed with weight -100).
--- READ-ONLY — the model's mixer/arming logic is untouched.
-local SWITCH_CHOICES = { "Off",
-    "SA", "SA inv", "SB", "SB inv", "SC", "SC inv", "SD", "SD inv",
-    "SE", "SE inv", "SF", "SF inv", "SG", "SG inv", "SH", "SH inv" }
-
-local SETTINGS_SWITCHES = {
-    { key = "MotorSw",   lbl = "Motor on/off switch",  kind = "switch", def = 1 },
-    { key = "RescueSw",  lbl = "Rescue switch",        kind = "switch", def = 1 },
-    { key = "GovSw",     lbl = "Governor mode switch", kind = "switch", def = 1 },
-    { key = "ProfileSw", lbl = "Profile switch (1-3)", kind = "switch", def = 1 },
+-- Per-alert configuration. Each alert is its own settings sub-page (the Alerts
+-- submenu). The historical on/off key (enKey) is REUSED as "Active" so existing
+-- user choices survive; the rest are new per-alert keys, prefixed by `code`:
+--   <code>Rep  repeat on/off          <code>Cnt  repeat count (0 = until cleared)
+--   <code>Int  repeat interval (s)     <code>Esc  boost to escalation volume
+--   <code>Vib  vibrate                 <code>Ovl  fullscreen overlay (prep only)
+-- repDef/cntDef/intDef default the repeat behaviour. Fuel & Voltage already repeat
+-- continuously while the condition holds, so they default to Repeat=on / count=until
+-- cleared / 6 s (reproducing the previous CalloutInt cadence); the once-shot alerts
+-- default to Repeat=off (announce once, as before). vibDef mirrors the old "vibrate on
+-- critical" (fuel/voltage/telemetry).
+local ALERTS_SPEC = {
+    { code = "Fuel",  name = "Fuel",            enKey = "SndFuel",    enDef = 1, vibDef = 1, repDef = 1, cntDef = 0, intDef = 6 },
+    { code = "Volt",  name = "Voltage",         enKey = "SndVolt",    enDef = 1, vibDef = 1, repDef = 1, cntDef = 0, intDef = 6 },
+    { code = "Cell",  name = "Cell check",      enKey = "SndCellChk", enDef = 1, vibDef = 0, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Arm",   name = "Armed / disarm",  enKey = "SndArm",     enDef = 1, vibDef = 0, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Telem", name = "Telemetry",       enKey = "SndTelem",   enDef = 1, vibDef = 1, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Link",  name = "Link quality",    enKey = "SndLink",    enDef = 1, vibDef = 0, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Rssi",  name = "RSSI / signal",   enKey = "SndRssi",    enDef = 1, vibDef = 0, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Pwr",   name = "Main power lost", enKey = "PwrWarn",    enDef = 1, vibDef = 0, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Bec",   name = "BEC voltage",     enKey = "SndBec",     enDef = 1, vibDef = 1, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "EscL",  name = "ESC load",        enKey = "EscLoad",    enDef = 0, vibDef = 1, repDef = 0, cntDef = 3, intDef = 5 },
+    { code = "Skp",   name = "Skipped packets", enKey = "SkpWarn",    enDef = 1, vibDef = 0, repDef = 0, cntDef = 3, intDef = 5 },
 }
 
--- Dynamic switch list, read from EdgeTX: physical SA..SH (stable codes 2..17,
--- identical to the static era so stored selections survive) plus every DEFINED
--- logical switch (codes 100 + 2*ls_index, +1 = inverted). Selections are stored
--- as CODES, not list positions, so adding/removing logical switches in the model
--- never silently re-targets a saved selection.
-local function build_switch_list()
-    local labels = {}
-    local codes = {}
-    for i = 1, #SWITCH_CHOICES do
-        labels[#labels + 1] = SWITCH_CHOICES[i]
-        codes[#codes + 1] = i
-    end
-    for i = 0, 63 do
-        local ok, ls = pcall(model.getLogicalSwitch, i)
-        if ok and ls ~= nil and ls.func ~= nil and ls.func ~= 0 then
-            labels[#labels + 1] = "L" .. (i + 1)
-            codes[#codes + 1] = 100 + i * 2
-            labels[#labels + 1] = "L" .. (i + 1) .. " inv"
-            codes[#codes + 1] = 101 + i * 2
-        end
-    end
-    return labels, codes
+local function build_alert_items(a)
+    return {
+        { key = a.enKey,         lbl = "Active",             kind = "bool", def = a.enDef },
+        { key = a.code .. "Rep", lbl = "Repeat",             kind = "bool", def = a.repDef },
+        { key = a.code .. "Cnt", lbl = "Repeat count",       kind = "num", def = a.cntDef, min = 0, max = 20, step = 1, big = 5,
+                                 fmt = function(v) return (v == 0) and "until cleared" or tostring(v) end },
+        { key = a.code .. "Int", lbl = "Repeat interval (s)", kind = "num", def = a.intDef, min = 1, max = 60, step = 1, big = 5 },
+        { key = a.code .. "Esc", lbl = "Escalation volume",  kind = "bool", def = 0 },
+        { key = a.code .. "Vib", lbl = "Vibrate",            kind = "bool", def = a.vibDef },
+        { key = a.code .. "Ovl", lbl = "Overlay (prep)",     kind = "bool", def = 0 },
+    }
 end
+
+-- Alerts submenu: a "Voice / mute" entry plus one page per alert.
+local ALERT_PAGES = { { name = "Voice / mute", items = SETTINGS_VOICE } }
+for i = 1, #ALERTS_SPEC do
+    ALERT_PAGES[#ALERT_PAGES + 1] = { name = ALERTS_SPEC[i].name, items = build_alert_items(ALERTS_SPEC[i]) }
+end
+
+-- Switch voice announcements: the switch per function is picked with the NATIVE
+-- EdgeTX source picker (lvgl.source, filtered to switches + logical switches).
+-- Stored value = SIGNED EdgeTX source index of the WHOLE switch (negative =
+-- inverted, picked as "!SA" in the popup; 0 = Off) — so the picker shows only
+-- switches this radio actually has, including custom names, and the 3-position
+-- semantics (read via getValue -> -1024/0/1024) stay intact.
+-- READ-ONLY — the model's mixer/arming logic is untouched.
+local SETTINGS_SWITCHES = {
+    { key = "MotorSrc",   lbl = "Motor on/off switch",  kind = "switch", def = 0 },
+    { key = "RescueSrc",  lbl = "Rescue switch",        kind = "switch", def = 0 },
+    { key = "GovSrc",     lbl = "Governor mode switch", kind = "switch", def = 0 },
+    { key = "ProfileSrc", lbl = "Profile switch (1-3)", kind = "switch", def = 0 },
+}
+
+-- NB: the pre-native stored codes (own list: 1=Off, 2..17 SA..SH, 18..29 CFS,
+-- 100+ logical switches, old keys MotorSw/RescueSw/GovSw/ProfileSw/TbSwitch) are
+-- NOT auto-migrated: an in-widget migration needed file I/O inside update() and
+-- tripped the CPU limit on SD remount. Existing models: re-pick the switches
+-- once in Settings > Switch voice; the old cfg keys are simply ignored.
 
 -- Configurable telemetry value slots, split into two settings groups:
 --   "Tele Main"    = the 5 rows of the dashboard's right-hand value panel
@@ -2552,27 +2938,58 @@ local SETTINGS_GENERAL = {
     { key = "DebugKeep",   lbl = "Debug log: sessions kept", kind = "num", def = 20, min = 1, max = 50, step = 1, big = 5 },
 }
 
+-- Toolbox: RF adjustment map/editor tool pages (sources default to ch11/ch12/AdjV/BEAT/PID#)
+local SETTINGS_TOOLBOX = {
+    { key = "TbSrc",    lbl = "Activation switch",       kind = "switch", def = 0 },
+    { key = "TbTool",   lbl = "Switch opens",            kind = "choice", def = 1, vals = { "Off", "Adjust Map", "Adjust Edit" } },
+    { key = "TbConfigCh", lbl = "Adj: Config channel",  kind = "num", def = 11, min = 1, max = 32, step = 1, big = 4, fmt = function(v) return "CH" .. v end },
+    { key = "TbValueCh",  lbl = "Adj: Value channel",   kind = "num", def = 12, min = 1, max = 32, step = 1, big = 4, fmt = function(v) return "CH" .. v end },
+    { key = "TbGvar",  lbl = "Adj editor: GVAR",        kind = "num", def = 1, min = 1, max = 15, step = 1, big = 1,
+                       fmt = function(v) return "GV" .. v end },
+    { key = "TbPulse", lbl = "Adj editor: pulse (ms)",  kind = "num", def = 150, min = 50, max = 1000, step = 10, big = 50 },
+    { key = "TbScale", lbl = "Adj value divider",       kind = "num", def = 1, min = 1, max = 1000, step = 1, big = 10 },
+    { key = "TbBert",  lbl = "Adj editor: ranges hint", kind = "bool", def = 0 },
+    { key = "TbSun",   lbl = "Toolbox sunlight mode",   kind = "bool", def = 0 },
+    { key = "TbVoice", lbl = "Announce bank (voice)",   kind = "bool", def = 1 },
+}
+
 local SETTINGS_GROUPS = {
     { name = "Display",      items = SETTINGS_DISPLAY },
     { name = "Tele Main",    items = SETTINGS_TELE_MAIN },
     { name = "Tele Details", items = SETTINGS_TELE_DETAIL },
     { name = "Battery",      items = SETTINGS_BATTERY },
     { name = "Thresholds",   items = SETTINGS_THRESHOLDS },
-    { name = "Alerts",       items = SETTINGS_ALERTS },
+    { name = "ESC load",     items = SETTINGS_ESC },
+    { name = "Volume",       items = SETTINGS_VOLUME },
+    { name = "Alerts",       submenu = ALERT_PAGES },
     { name = "Switch voice", items = SETTINGS_SWITCHES },
     { name = "General",      items = SETTINGS_GENERAL },
+    { name = "Toolbox",      items = SETTINGS_TOOLBOX },
 }
+
+-- Visit every settings item across all groups AND alert sub-pages. Used for the
+-- defaults table and the working-copy snapshot so both cover the submenu items.
+local function for_each_setting_item(fn)
+    for g = 1, #SETTINGS_GROUPS do
+        local grp = SETTINGS_GROUPS[g]
+        if grp.items then
+            for i = 1, #grp.items do fn(grp.items[i]) end
+        elseif grp.submenu then
+            for p = 1, #grp.submenu do
+                local items = grp.submenu[p].items
+                for i = 1, #items do fn(items[i]) end
+            end
+        end
+    end
+end
 
 -- defaults derived from the group tables (single source of truth now that the
 -- EdgeTX option list no longer carries these values) — handed to the settings
 -- layer so apply() can fill anything missing from the file
 local SETTINGS_DEFAULTS = {}
-for g = 1, #SETTINGS_GROUPS do
-    local items = SETTINGS_GROUPS[g].items
-    for i = 1, #items do
-        SETTINGS_DEFAULTS[items[i].key] = items[i].def
-    end
-end
+for_each_setting_item(function(it)
+    if it.key then SETTINGS_DEFAULTS[it.key] = it.def end   -- skip keyless info rows
+end)
 -- hidden key (no settings row): tracks whether the in-widget menu was opened at
 -- least once — drives the first-placement hint banner on the dashboard
 SETTINGS_DEFAULTS.SetupSeen = 0
@@ -2591,10 +3008,11 @@ local function save_pending_settings(wgt)
     wgt.settings_working = nil
 end
 
---- Close the settings page back to the settings submenu (autosaves).
+--- Close the settings page back to wherever it was opened from (autosaves). Normal
+--- group pages return to the settings submenu; alert sub-pages to the alerts submenu.
 local function close_settings(wgt)
     save_pending_settings(wgt)
-    wgt.menu_view = "settings_menu"
+    wgt.menu_view = (wgt.settings_page and wgt.settings_page.back) or "settings_menu"
     init_view_state(wgt).dirty = true
 end
 
@@ -2609,21 +3027,27 @@ end
 local function build_settings_view(wgt, zone)
     if not wgt.settings_working then
         local t = {}
-        for g = 1, #SETTINGS_GROUPS do
-            local items = SETTINGS_GROUPS[g].items
-            for i = 1, #items do
-                t[items[i].key] = wgt.options[items[i].key]
+        for_each_setting_item(function(it)
+            if it.key then
+                t[it.key] = wgt.options[it.key]
+                -- sensor slots carry a shadow key (<key>Raw = the native picker's
+                -- source index of a raw pick) so the raw field can redisplay the
+                -- pick after a restart — seed it alongside the slot itself
+                if it.kind == "sensor" then
+                    t[it.key .. "Raw"] = wgt.options[it.key .. "Raw"]
+                end
             end
-        end
+        end)
         wgt.settings_working = t
     end
     local working = wgt.settings_working
 
-    wgt.settings_group = wgt.settings_group or 1
-    local grp = SETTINGS_GROUPS[wgt.settings_group]
+    -- The page to render is a {name, items, back} spec set when it was opened
+    -- (a normal group, or one alert sub-page). Fall back to the first group.
+    local grp = wgt.settings_page or SETTINGS_GROUPS[1]
 
-    -- one group per page, opened by name from the menu's group list (no blind ‹ ›
-    -- tab cycling); the back arrow / RTN returns to that list and autosaves.
+    -- one page opened by name from the menu (no blind ‹ › tab cycling); the back
+    -- arrow / RTN returns to that list (grp.back) and autosaves.
     local pg = lvgl.page({
         title = grp.name,
         subtitle = "UltiDash settings",
@@ -2631,10 +3055,13 @@ local function build_settings_view(wgt, zone)
     })
 
     local w = zone.w
-    local sw_labels, sw_codes = build_switch_list()
-    -- sensor pick list (Off + smart-voltage + model sensors + chosen) built once
-    -- per page build and shared by every kind="sensor" row
+    -- index of the trailing ‹ Raw › display entry in the shared sensor list (same
+    -- for every row), used to show the raw state in each curated dropdown
+    local se_raw_idx = 1
+    -- sensor pick list (Off + smart-voltage + known model sensors + ‹ Raw ›) built
+    -- once per page build and shared by every kind="sensor" row
     local se_labels, se_codes = build_sensor_list(wgt)
+    for ci = 1, #se_codes do if se_codes[ci] == RAW_SENTINEL then se_raw_idx = ci; break end end
     -- row height adapts to the screen: EdgeTX toggle switches are ~40 px tall on
     -- the 800x480 TX16S and overlapped each other in 38 px rows
     local row_h = (zone.h >= 300) and 50 or 38
@@ -2649,11 +3076,17 @@ local function build_settings_view(wgt, zone)
     local _, dd_txt_h = lcd.sizeText("Ag", 0)
     local field_h = math.min(row_h - 4, dd_txt_h + 8)
     local function field_y(ry) return ry + math.floor((row_h - field_h) / 2) end
+    -- info rows wrap to ~2 lines of the small font; measure so they never overlap
+    local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
+    local info_h = sml_h * 2 + 8
     local elems = {}
 
+    -- running vertical cursor: rows have per-kind heights (info rows are taller),
+    -- so positions are accumulated rather than derived from the index
+    local ry = 2
     for i = 1, #grp.items do
         local it = grp.items[i]
-        local ry = (i - 1) * row_h + 2
+        local row_this = (it.kind == "info") and info_h or row_h
         local is_num = it.kind == "num"
 
         -- value text resolver (reactive)
@@ -2663,17 +3096,56 @@ local function build_settings_view(wgt, zone)
             if it.kind == "choice" then return it.vals[v or 1] or "?" end
             if it.kind == "sensor" then return sensor_pick_label(v) end
             if it.kind == "switch" then
-                for ci = 1, #sw_codes do
-                    if sw_codes[ci] == (v or 1) then return sw_labels[ci] end
-                end
-                return "?"
+                -- fallback-only readout (the native picker renders its own text):
+                -- signed source index -> source name, "!" marks the inverted pick
+                v = v or 0
+                if v == 0 then return "Off" end
+                local okn, n = pcall(getSourceName, math.abs(v))
+                local name = (okn and n) and n or tostring(math.abs(v))
+                return (v < 0) and ("!" .. name) or name
             end
             v = v or it.min or 0
             if it.fmt then return it.fmt(v) end
             return tostring(v)
         end
 
-        if is_num then
+        if it.kind == "info" then
+            -- non-interactive hint line: muted, small font, wraps to ~2 lines
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + 2, w = right - 10, h = info_h - 4,
+                                  text = it.lbl, font = SMLSIZE,
+                                  color = COLOR_THEME_DISABLED or COLOR_THEME_SECONDARY1 }
+        elseif it.kind == "slider" then
+            -- name + reactive % + real LVGL slider (pg:slider — verified 2.12: h is
+            -- ignored, w sets the length). Falls back to a -/+ stepper if the
+            -- firmware lacks the slider control.
+            local sl_w = math.min(300, math.floor(w * 0.40))
+            local sl_x = right - sl_w
+            local val_w2 = 66
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = sl_x - val_w2 - 16, h = 22,
+                                  text = it.lbl, color = COLOR_THEME_PRIMARY1 }
+            elems[#elems + 1] = { type = "label", x = sl_x - val_w2 - 6, y = ry + lbl_dy, w = val_w2, h = 22,
+                                  text = value_text, color = COLOR_THEME_PRIMARY1, align = RIGHT }
+            local function set_val(v)
+                if it.step and it.step > 1 then v = math.floor(v / it.step + 0.5) * it.step end
+                if v < it.min then v = it.min elseif v > it.max then v = it.max end
+                working[it.key] = v
+            end
+            local oksl = pcall(function()
+                pg:slider({ x = sl_x, y = field_y(ry), w = sl_w, min = it.min, max = it.max,
+                    get = function() return working[it.key] or it.def or it.min end,
+                    set = set_val })
+            end)
+            if not oksl then
+                local btn_x2 = right - btn_w
+                local btn_x1 = btn_x2 - btn_w - 8
+                elems[#elems + 1] = { type = "button", x = btn_x1, y = ry, w = btn_w, h = row_h - 6, text = "-",
+                                      press = function() set_val((working[it.key] or it.min) - it.step) end,
+                                      longpress = function() set_val((working[it.key] or it.min) - (it.big or it.step)) end }
+                elems[#elems + 1] = { type = "button", x = btn_x2, y = ry, w = btn_w, h = row_h - 6, text = "+",
+                                      press = function() set_val((working[it.key] or it.min) + it.step) end,
+                                      longpress = function() set_val((working[it.key] or it.min) + (it.big or it.step)) end }
+            end
+        elseif is_num then
             -- [-] [reactive value] [+]
             local btn_x2 = right - btn_w
             local btn_x1 = btn_x2 - val_w - btn_w - 8
@@ -2710,63 +3182,112 @@ local function build_settings_view(wgt, zone)
                                       press = function() working[it.key] = (working[it.key] == 1) and 0 or 1 end }
             end
         elseif it.kind == "switch" then
-            -- switch picker: dynamic list (physical + defined logical switches),
-            -- selection stored as a stable CODE (see build_switch_list)
-            local cyc_w = 120
-            local function cur_index()
-                local v = working[it.key] or 1
-                for ci = 1, #sw_codes do
-                    if sw_codes[ci] == v then return ci end
-                end
-                return 1
-            end
+            -- NATIVE switch selection: lvgl.source picker filtered to switches +
+            -- logical switches, with the popup's own inverted entries ("!SA") and
+            -- clear ("---"). Exchanges a SIGNED source index (verified on hardware:
+            -- negative = inverted, 0 = none); the control renders the current name
+            -- itself, incl. user-customized switch names, and lists ONLY switches
+            -- this radio actually has.
+            local cyc_w = 140
             elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
                                   text = it.lbl, color = COLOR_THEME_PRIMARY1 }
             local oks = pcall(function()
-                pg:choice({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
-                    title = it.lbl, values = sw_labels,
-                    get = cur_index,
-                    set = function(ci) working[it.key] = sw_codes[ci] or 1 end })
+                local filt = (lvgl.SRC_SWITCH or 0) | (lvgl.SRC_LOGICAL_SWITCH or 0)
+                    | (lvgl.SRC_INVERT or 0) | (lvgl.SRC_CLEAR or 0)
+                pg:source({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
+                    filter = filt,
+                    get = function() return working[it.key] or 0 end,
+                    set = function(v) working[it.key] = v or 0 end })
             end)
             if not oks then
-                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
-                                      text = value_text,
-                                      press = function()
-                                          local ci = cur_index() % #sw_codes + 1
-                                          working[it.key] = sw_codes[ci]
-                                      end }
+                -- pre-2.12 firmware without lvgl.source: read-only display (the
+                -- legacy hand-built list was removed with the code migration)
+                elems[#elems + 1] = { type = "label", x = right - cyc_w - 80, y = ry + lbl_dy, w = cyc_w + 80, h = 22,
+                                      text = value_text, color = COLOR_THEME_WARNING, align = RIGHT }
             end
         elseif it.kind == "sensor" then
-            -- sensor picker: dropdown of Off + smart-voltage + the model's real
-            -- sensors; selection stored as the sensor NAME (string code). Wider on the
-            -- TX15 — the value names ("Headspeed (Hspd)") need room, and at 150 px the
-            -- box looked cramped against the long label
-            local cyc_w = (w < 600) and math.floor(w * 0.44) or 170
-            local cap = math.floor(w * 0.5)
+            -- DECOUPLED two-field sensor selection, both writing the SAME slot
+            -- (stored as the sensor NAME string; downstream is unchanged):
+            --  * curated dropdown: Off + smart-voltage + ESC load + the model's
+            --    KNOWN sensors (friendly labels) + one "‹ Raw ›" state entry.
+            --  * native raw field: EdgeTX's own telemetry source popup. Picking a
+            --    source stores its NAME (getSourceName) -> the dropdown flips to
+            --    ‹ Raw › (via is_raw_sensor), the raw field shows the source.
+            -- The two never both show a value: a curated pick -> raw field "---";
+            -- a raw pick -> dropdown "‹ Raw ›". Raw names are NOT folded into the
+            -- curated list (that keeps it short — the whole point).
+            local raw_w = (w < 600) and 84 or 110
+            local cyc_w = (w < 600) and math.floor(w * 0.34) or 170
+            local cap = math.floor(w * 0.40)
             if cyc_w > cap then cyc_w = cap end
+            local cyc_x = right - raw_w - 6 - cyc_w
+            -- Shadow key <key>Raw: the raw picker's OWN source index. getSourceName
+            -- (the stored name) does NOT round-trip back through getFieldInfo to the
+            -- picker's index space, so the field cannot redisplay a pick from the
+            -- name alone. The index is persisted alongside the name and VERIFIED
+            -- against getSourceName on read (a firmware/model change that shifts
+            -- indices falls back to "---" instead of showing a wrong source).
+            local raw_key = it.key .. "Raw"
             local function cur_index()
                 local v = working[it.key] or SENSOR_OFF
+                if is_raw_sensor(v) then return se_raw_idx end   -- raw pick -> ‹ Raw ›
                 for ci = 1, #se_codes do
                     if se_codes[ci] == v then return ci end
                 end
                 return 1
             end
-            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = 22,
+            elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = cyc_x - 14, h = 22,
                                   text = it.lbl, color = COLOR_THEME_PRIMARY1 }
             local oks = pcall(function()
-                pg:choice({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
+                pg:choice({ x = cyc_x, y = field_y(ry), w = cyc_w, h = field_h,
                     title = it.lbl, values = se_labels,
                     get = cur_index,
-                    set = function(ci) working[it.key] = se_codes[ci] or SENSOR_OFF end })
+                    set = function(ci)
+                        local code = se_codes[ci] or SENSOR_OFF
+                        -- ‹ Raw › is display-only: keep the current raw pick, don't
+                        -- overwrite it (the raw sensor is chosen in the raw field)
+                        if code == RAW_SENTINEL then return end
+                        working[it.key] = code
+                    end })
             end)
             if not oks then
-                elems[#elems + 1] = { type = "button", x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
+                elems[#elems + 1] = { type = "button", x = cyc_x, y = field_y(ry), w = cyc_w, h = field_h,
                                       text = value_text,
                                       press = function()
                                           local ci = cur_index() % #se_codes + 1
-                                          working[it.key] = se_codes[ci]
+                                          local code = se_codes[ci]
+                                          if code ~= RAW_SENTINEL then working[it.key] = code end
                                       end }
             end
+            -- raw source field (2.12 lvgl.source; silently absent on older firmware —
+            -- the curated dropdown keeps working alone). Shows a source ONLY while the
+            -- slot holds a raw pick; curated picks (Off/auto/calc/known) render "---".
+            pcall(function()
+                pg:source({ x = right - raw_w, y = field_y(ry), w = raw_w, h = field_h,
+                    filter = (lvgl.SRC_TELEM or 0) | (lvgl.SRC_CLEAR or 0),
+                    get = function()
+                        local nm = working[it.key]
+                        if not is_raw_sensor(nm) then return 0 end   -- curated -> "---"
+                        local idx = working[raw_key]
+                        if type(idx) == "number" and idx ~= 0 then
+                            local okn, n = pcall(getSourceName, idx)
+                            if okn and n == nm then return idx end   -- verified
+                        end
+                        return 0   -- unknown/shifted index -> "---" (value still works)
+                    end,
+                    set = function(v)
+                        if v == nil or v == 0 then
+                            working[it.key] = SENSOR_OFF
+                            working[raw_key] = 0
+                            return
+                        end
+                        local okn, n = pcall(getSourceName, v)
+                        if okn and type(n) == "string" and n ~= "" then
+                            working[it.key] = n   -- dropdown reactively flips to ‹ Raw ›
+                            working[raw_key] = v  -- persisted; redisplay after restart
+                        end
+                    end })
+            end)
         else
             -- real dropdown (lvgl.choice popup picker, 1-based indices like our
             -- CHOICE values); width follows the longest value text
@@ -2791,20 +3312,28 @@ local function build_settings_view(wgt, zone)
                                       press = function() working[it.key] = ((working[it.key] or 1) % #it.vals) + 1 end }
             end
         end
+        ry = ry + row_this
     end
 
-    -- Per-page reset: restores ONLY this group's keys to their defaults (the settings
+    -- Per-page reset: restores ONLY this page's keys to their defaults (the settings
     -- menu's "Reset to defaults" wipes the whole model instead). Mutates the working
     -- copy; the reactive rows/toggles/pickers reflect it at once and the autosave on
     -- exit persists it. Confirmed via lvgl.confirm when available (plain reset otherwise).
     local function reset_group()
         for i = 1, #grp.items do
-            working[grp.items[i].key] = grp.items[i].def
+            if grp.items[i].key then working[grp.items[i].key] = grp.items[i].def end
         end
     end
-    local reset_y = #grp.items * row_h + 8
-    elems[#elems + 1] = { type = "button", x = 10, y = reset_y, w = math.min(260, w - 20), h = row_h - 6,
-        text = "Reset " .. grp.name .. " to defaults",
+    local reset_y = ry + 8
+    -- Width tracks the label: a fixed 260 px clipped the longer group names ("Reset Tele
+    -- Details to defaults" / "Reset Thresholds to defaults") on both sides because the
+    -- button text is centered. Measure it (project rule: never assume font widths) and grow
+    -- up to w-20, keeping 260 as a floor so short labels stay visually consistent.
+    local reset_text = "Reset " .. grp.name .. " to defaults"
+    local reset_tw = lcd.sizeText(reset_text, 0)   -- 0 = STDSIZE, the build-table button font
+    local reset_w = math.max(260, math.min(w - 20, reset_tw + 28))
+    elems[#elems + 1] = { type = "button", x = 10, y = reset_y, w = reset_w, h = row_h - 6,
+        text = reset_text,
         press = function()
             local ok = pcall(function()
                 lvgl.confirm({ title = "Reset " .. grp.name,
@@ -2871,6 +3400,32 @@ local function build_menu_view(wgt, zone)
     build_menu_grid(pg, zone.w, zone.h, {
         { txt = "Settings", act = open("settings_menu") },
         { txt = "Status",   act = open("status") },
+        { txt = "Toolbox",  act = open("toolbox") },
+    }, 1, (zone.h >= 300) and 460 or nil)
+end
+
+--- Toolbox submenu: on-demand tool pages (RF adjustment map / editor). Opened from the
+--- main menu's "Toolbox" entry; back/RTN returns there. The tool pages themselves are
+--- drawn by the modular tool modules (tb_adjmap / tb_adjed) and stay open across arming
+--- (in-flight tuning is the point), unlike the rest of the menu.
+local function build_toolbox_menu_view(wgt, zone)
+    local pg = lvgl.page({
+        title = "UltiDash",
+        subtitle = "Toolbox",
+        back = function()
+            wgt.menu_view = "menu"
+            init_view_state(wgt).dirty = true
+        end,
+    })
+    local function open(view)
+        return function()
+            wgt.menu_view = view
+            init_view_state(wgt).dirty = true
+        end
+    end
+    build_menu_grid(pg, zone.w, zone.h, {
+        { txt = "Adjust Map",  act = open("tb_adjmap") },
+        { txt = "Adjust Edit", act = open("tb_adjed") },
     }, 1, (zone.h >= 300) and 460 or nil)
 end
 
@@ -2887,12 +3442,17 @@ local function build_settings_menu_view(wgt, zone)
         end,
     })
 
-    -- one button per settings group: direct, named entry (opens that group's page;
-    -- its back arrow returns here)
+    -- one button per settings group: direct, named entry. A normal group opens its
+    -- page; a group with a submenu (Alerts) opens the alert-picker instead.
     local function open_group(gi)
         return function()
-            wgt.settings_group = gi
-            wgt.menu_view = "settings"
+            local grp = SETTINGS_GROUPS[gi]
+            if grp.submenu then
+                wgt.menu_view = "alerts_menu"
+            else
+                wgt.settings_page = { name = grp.name, items = grp.items, back = "settings_menu" }
+                wgt.menu_view = "settings"
+            end
             init_view_state(wgt).dirty = true
         end
     end
@@ -2920,6 +3480,32 @@ local function build_settings_menu_view(wgt, zone)
         items[#items + 1] = { txt = SETTINGS_GROUPS[gi].name, act = open_group(gi) }
     end
     items[#items + 1] = { txt = "Reset to defaults", act = reset_defaults }
+    build_menu_grid(pg, zone.w, zone.h, items, 2)
+end
+
+--- Alerts submenu: one button per alert sub-page ("Voice / mute" + each alert).
+--- Opened from the settings submenu's "Alerts" entry; back/RTN returns there. Each
+--- entry opens that page via build_settings_view (its back returns here).
+local function build_alerts_menu_view(wgt, zone)
+    local pg = lvgl.page({
+        title = "UltiDash",
+        subtitle = "Alerts",
+        back = function()
+            wgt.menu_view = "settings_menu"
+            init_view_state(wgt).dirty = true
+        end,
+    })
+    local function open_page(page)
+        return function()
+            wgt.settings_page = { name = page.name, items = page.items, back = "alerts_menu" }
+            wgt.menu_view = "settings"
+            init_view_state(wgt).dirty = true
+        end
+    end
+    local items = {}
+    for p = 1, #ALERT_PAGES do
+        items[#items + 1] = { txt = ALERT_PAGES[p].name, act = open_page(ALERT_PAGES[p]) }
+    end
     build_menu_grid(pg, zone.w, zone.h, items, 2)
 end
 
@@ -3099,10 +3685,21 @@ local function build_stats_ui(wgt, zone)
 
     -- one slim line: session flight time + used mAh (raw %)
     main_panel:label({ x = 0, y = y_info + 3, w = info_content_w, h = header_h,
-        text = function()
-            return wgt.values.label_flight_time .. "  " .. wgt.values.flight_time_str_formatted()
-                .. "        " .. wgt.values.label_capacity_used_short .. "  " .. wgt.values.battery_usage_summary_formatted()
-        end,
+        text = (function()
+            -- inputs are memoized; memo the concat so the stats page (the default
+            -- disconnected view) doesn't allocate this line on every frame
+            local last_ft, last_bu, last_s
+            return function()
+                local ft = wgt.values.flight_time_str_formatted()
+                local bu = wgt.values.battery_usage_summary_formatted()
+                if ft ~= last_ft or bu ~= last_bu then
+                    last_ft, last_bu = ft, bu
+                    last_s = wgt.values.label_flight_time .. "  " .. ft
+                        .. "        " .. wgt.values.label_capacity_used_short .. "  " .. bu
+                end
+                return last_s
+            end
+        end)(),
         font = header_font, color = COLOR_THEME_PRIMARY1, align = CENTER })
 
     main_panel:hline({ y = y_status - line_h, w = w - 3, h = line_h, color = COLOR_THEME_SECONDARY1 })
@@ -3143,6 +3740,7 @@ local function update(wgt, options)
         ultidash_settings.save(snap)
     end
 
+
     local mode = options.ViewMode or VIEW_MODE_DASHBOARD
 
     -- apply the chosen color palette to all modules before (re)building the UI.
@@ -3162,6 +3760,9 @@ local function update(wgt, options)
     set_palette(render_scheme)
     ultidash_functions.set_palette(render_scheme)
     ultidash_values.set_palette(render_scheme)
+    -- palette for the Toolbox tool pages: use the REAL scheme (not the forced render_scheme)
+    -- so the tools match the dashboard look (black+neon on dark, etc.)
+    wgt.tb_pal = toolbox_palette(scheme)
 
     lvgl.clear()
     -- everything lvgl is gone now — drop the cached element references so nothing
@@ -3186,6 +3787,8 @@ local function update(wgt, options)
         build_status_view(wgt, wgt.zone)
     elseif wgt.menu_view == "settings" then
         build_settings_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "alerts_menu" then
+        build_alerts_menu_view(wgt, wgt.zone)
     elseif wgt.menu_view == "settings_menu" then
         -- settings submenu: the configuration groups (one level under the hub)
         build_settings_menu_view(wgt, wgt.zone)
@@ -3197,6 +3800,12 @@ local function update(wgt, options)
     elseif wgt.menu_view == "menu" then
         -- in-widget menu hub (opened via the fullscreen menu glyph)
         build_menu_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "toolbox" then
+        build_toolbox_menu_view(wgt, wgt.zone)
+    elseif wgt.menu_view == "tb_adjmap" and tb_adjmap then
+        tb_adjmap.build(wgt, wgt.zone)
+    elseif wgt.menu_view == "tb_adjed" and tb_adjed then
+        tb_adjed.build(wgt, wgt.zone)
     elseif wgt.detail_view == "elrs" and init_view_state(wgt).current == "flight" then
         -- Dashboard's own ELRS detail page (opened by tapping the top-bar bars)
         build_elrs_view(wgt, wgt.zone, true)
@@ -3271,6 +3880,10 @@ local function refresh(wgt, event, touch_state)
         wgt.dbg_win = mnow
         local okgc, kb = pcall(collectgarbage, "count")
         wgt.dbg_lua_kb = (okgc and type(kb) == "number") and math.floor(kb) or nil
+        -- free heap headroom (getAvailableMemory, bytes) — so we can see the margin, not
+        -- just the used total (dbg_lua_kb = collectgarbage count = whole-VM used)
+        local okfm, fb = pcall(getAvailableMemory)
+        wgt.dbg_free_kb = (okfm and type(fb) == "number") and math.floor(fb / 1024) or nil
     end
     -- Rebuild ONCE after leaving fullscreen. Root cause (EdgeTX 2.12 source): lvgl.box
     -- containers keep LV_OBJ_FLAG_CLICKABLE when built while fullscreen (EdgeTX clears
@@ -3311,14 +3924,30 @@ local function refresh(wgt, event, touch_state)
     end
     if fs and wgt.menu_view ~= nil and EVT_VIRTUAL_EXIT ~= nil and event == EVT_VIRTUAL_EXIT then
         if wgt.menu_view == "settings" then
-            close_settings(wgt)                   -- autosave, back to the settings submenu
-        elseif wgt.menu_view == "settings_menu" or wgt.menu_view == "status" then
+            close_settings(wgt)                   -- autosave, back to the group/alert list
+        elseif wgt.menu_view == "alerts_menu" then
+            wgt.menu_view = "settings_menu"       -- alert picker -> settings submenu
+            init_view_state(wgt).dirty = true
+        elseif wgt.menu_view == "settings_menu" or wgt.menu_view == "status"
+            or wgt.menu_view == "toolbox" then
             wgt.menu_view = "menu"                -- submenu -> hub
+            init_view_state(wgt).dirty = true
+        elseif wgt.menu_view == "tb_adjmap" or wgt.menu_view == "tb_adjed" then
+            wgt.menu_view = "toolbox"             -- tool page -> toolbox submenu
             init_view_state(wgt).dirty = true
         else
             wgt.menu_view = nil                   -- hub -> dashboard
             init_view_state(wgt).dirty = true
         end
+    end
+    -- Toolbox tool pages: run their state/touch/pulse every cycle while open (UltiDash's
+    -- own tap zones below are gated to menu_view==nil, so no conflict). In-flight capable.
+    if wgt.menu_view == "tb_adjmap" and tb_adjmap then
+        wgt.tb_announce = ultidash_functions.tb_announce_pos
+        tb_adjmap.refresh(wgt, event, touch_state)
+    elseif wgt.menu_view == "tb_adjed" and tb_adjed then
+        wgt.tb_announce = ultidash_functions.tb_announce_pos
+        tb_adjed.refresh(wgt, event, touch_state)
     end
     if fs and is_publisher(wgt) and EVT_TOUCH_TAP ~= nil and event == EVT_TOUCH_TAP then
         local now = getTime() or 0
@@ -3338,12 +3967,29 @@ local function refresh(wgt, event, touch_state)
         if (tap_count == nil or tap_count <= 1)
             and now >= (wgt.elrs_tap_block or 0) and wgt.menu_view == nil then
             if wgt.detail_view ~= nil then
-                wgt.elrs_tap_block = now + 100
-                wgt.detail_view = nil
-                init_view_state(wgt).dirty = true
+                -- Status log scroll: taps on the ▲/▼ buttons scroll the log (short cooldown)
+                -- and do NOT close; any other tap closes the detail (long cooldown).
+                if wgt.detail_view == "estatus" and rect_hit(touch_state, wgt.estatus_scroll_up, 6) then
+                    wgt.elrs_tap_block = now + 25
+                    wgt.estatus_scroll = math.max(0, (wgt.estatus_scroll or 0) - 1)
+                    init_view_state(wgt).dirty = true
+                elseif wgt.detail_view == "estatus" and rect_hit(touch_state, wgt.estatus_scroll_down, 6) then
+                    wgt.elrs_tap_block = now + 25
+                    wgt.estatus_scroll = (wgt.estatus_scroll or 0) + 1
+                    init_view_state(wgt).dirty = true
+                else
+                    wgt.elrs_tap_block = now + 100
+                    wgt.detail_view = nil
+                    init_view_state(wgt).dirty = true
+                end
             elseif rect_hit(touch_state, wgt.settings_icon_rect, 10)
-                and not ultidash_functions.is_armed(wgt) then
-                -- menu entry (menu glyph); disarmed only — no config in flight
+                and not (ultidash_functions.is_armed(wgt)
+                    and wgt.values.rf_connection_state ~= "disconnected") then
+                -- menu entry (menu glyph): blocked only while genuinely flying (armed AND
+                -- still connected). After a main-power loss where telemetry has dropped, the
+                -- ARM sensor holds a STALE "armed" for ~30 s — but with telemetry gone the
+                -- craft is no longer flying, so the menu must open again (bug: menu was dead
+                -- while detail pages still worked). No config in flight otherwise.
                 wgt.elrs_tap_block = now + 100
                 wgt.menu_view = "menu"
                 -- acknowledge the first-placement hint banner (persisted)
@@ -3377,6 +4023,7 @@ local function refresh(wgt, event, touch_state)
             elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.estatus_rect, 6) then
                 wgt.elrs_tap_block = now + 100
                 wgt.detail_view = "estatus"
+                wgt.estatus_scroll = 0
                 init_view_state(wgt).dirty = true
             elseif wgt.options.TapDetails == 1 and rect_hit(touch_state, wgt.battery_rect, 6) then
                 wgt.elrs_tap_block = now + 100
@@ -3405,8 +4052,37 @@ local function refresh(wgt, event, touch_state)
         end
         return
     end
-    ensure_rf_service(wgt)
-    rf_service.background(wgt, handle_telemetry_state_change)
+    -- Toolbox activation switch: resolve its state (the tool pages' active gate reads
+    -- wgt.tb_switch_on) and AUTO-OPEN the configured tool on the switch's rising edge /
+    -- close on its falling edge. Works in flight (the menu glyph is disarmed-only; this is
+    -- not). Edge-triggered so it doesn't fight manual navigation while the switch is held.
+    do
+        local code = wgt.options.TbSrc or 0
+        if code ~= 0 then
+            local on = ultidash_functions.switch_is_on(code)
+            wgt.tb_switch_on = on
+            local tool = wgt.options.TbTool or 1   -- 1=Off, 2=Map, 3=Editor
+            if tool ~= 1 then
+                local target = (tool == 2) and "tb_adjmap" or "tb_adjed"
+                if on and not wgt.tb_switch_prev
+                    and (wgt.menu_view == nil or wgt.menu_view == "toolbox") then
+                    wgt.menu_view = target
+                    wgt.tb_switch_opened = true
+                    init_view_state(wgt).dirty = true
+                elseif (not on) and wgt.tb_switch_prev and wgt.tb_switch_opened then
+                    if wgt.menu_view == "tb_adjmap" or wgt.menu_view == "tb_adjed" then
+                        wgt.menu_view = nil
+                        init_view_state(wgt).dirty = true
+                    end
+                    wgt.tb_switch_opened = false
+                end
+            end
+            wgt.tb_switch_prev = on
+        else
+            wgt.tb_switch_on = nil
+            wgt.tb_switch_prev = nil
+        end
+    end
     -- THROTTLE the telemetry/alert/publish pass to 5 Hz: with a connected FC the
     -- full update (~35 sensor-name lookups) on EVERY display cycle starved the Lua
     -- scheduler enough that fullscreen taps became a lottery (RFTool works the CRSF
@@ -3415,9 +4091,18 @@ local function refresh(wgt, event, touch_state)
     -- While a menu page / the ELRS detail is up, the dashboard isn't visible at
     -- all: skip the heavy pass entirely (status page reads Shared; the detail only
     -- needs the cheap update_elrs) so page interaction stays snappy.
+    -- Idle throttle: run the heavy telemetry/alert/publish pass AND the RF-service
+    -- housekeeping at 5 Hz while a FC is linked, but back off to 2 Hz when
+    -- disconnected — with no craft every sensor read returns nil, so there is nothing
+    -- to do 5x/s and the radio CPU can idle more (lower battery drain). State CHANGES
+    -- still arrive immediately via the rf2 onStateChanged callback (independent of this
+    -- cadence), so a connecting FC is picked up without extra delay.
     local tnow = getTime() or 0
-    if (tnow - (wgt.telem_gate or 0)) >= 20 then
+    local gate_cs = (wgt.values.rf_connection_state ~= "disconnected") and 20 or 50
+    if (tnow - (wgt.telem_gate or 0)) >= gate_cs then
         wgt.telem_gate = tnow
+        ensure_rf_service(wgt)
+        rf_service.background(wgt, handle_telemetry_state_change)
         -- FULL pass even while the detail/menu pages are up: all dashboard
         -- functions (alerts, stats, callouts) keep running in the background —
         -- the ELRS detail may now stay open in flight. The 5 Hz throttle keeps
@@ -3426,18 +4111,36 @@ local function refresh(wgt, event, touch_state)
         ultidash_functions.refresh(wgt)
         update_user_sensors(wgt)
         ultidash_functions.publish_shared(wgt)
+        ultidash_functions.refresh_volume_override(wgt)   -- adaptive master volume via GVAR (off unless configured)
         wgt.dbg_pass_cs = (getTime() or 0) - pass_t0
         -- cache the armed state for reactive closures (they run per LVGL frame;
         -- calling is_armed there would be a sensor name-lookup at ~20 Hz)
         wgt.armed_now = ultidash_functions.is_armed(wgt)
         -- diagnostics: perf snapshot + buffered SD flush (no-op unless DebugLog is on)
         if ultidash_functions.dbg then ultidash_functions.dbg.tick(wgt) end
-        if wgt.armed_now then
-            -- arming starts a fresh stats episode (manual dismiss forgotten)
+        -- "arming forgets the manual stats dismiss" — cleared ONLY on a genuine rising
+        -- edge of the ARM telemetry sensor (a real new flight). The EdgeTX logs prove the
+        -- ARM sensor is clean (1 -> 0, no flicker) even through a main-power-lost, whereas
+        -- the connection sub-state is flaky; a level check or a connection-driven reset kept
+        -- reopening the stats page after such an event. A telemetry dropout reads as "not
+        -- armed" (arm_sensor_on -> false), so it can never be mistaken for an arm.
+        local arm_on = ultidash_functions.arm_sensor_on(wgt)
+        if arm_on and not wgt.was_armed_sensor then
             wgt.stats_dismissed = false
-            -- menu/settings/status always close on arm (no configuring in flight;
-            -- pending settings edits are autosaved)
-            if wgt.menu_view ~= nil then
+            if ultidash_functions.dbg then ultidash_functions.dbg.logf("STATS", "dismiss cleared (arm rising edge)") end
+        end
+        wgt.was_armed_sensor = arm_on
+        if wgt.armed_now and wgt.values.rf_connection_state ~= "disconnected" then
+            -- menu/settings/status close on arm (no configuring in flight; pending edits
+            -- autosaved) — EXCEPT the Toolbox tool pages, which are meant for in-flight
+            -- tuning (RF2 adjustment functions) and deliberately stay open while armed.
+            -- The condition mirrors the menu-glyph OPEN gate (armed AND connected =
+            -- genuinely flying): after a main-power loss with telemetry gone, the ARM
+            -- sensor holds a stale "armed" for ~30 s — the open gate let the menu open
+            -- in that window, but this close-on-arm then shut it again 200 ms later
+            -- ("menu opens but won't stay open"). Disconnected = not flying -> keep it.
+            local tb = (wgt.menu_view == "tb_adjmap" or wgt.menu_view == "tb_adjed")
+            if wgt.menu_view ~= nil and not tb then
                 save_pending_settings(wgt)
                 wgt.menu_view = nil
                 init_view_state(wgt).dirty = true

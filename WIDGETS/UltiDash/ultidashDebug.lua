@@ -7,12 +7,16 @@
 -- cost is ~zero: every entry point early-returns on the ENABLED flag and nothing touches
 -- the SD or grows the heap.
 --
--- COST DISCIPLINE: file IO every frame would itself cause lag. So log() only appends to a
--- RAM ring buffer (cheap); the whole buffer is rewritten to SD at most every FLUSH_CS
--- ("w" only, EdgeTX-io-safe, like ultidashSettings). The ring is CAPPED at MAX_LINES, so
--- the heap/file are bounded no matter how long it runs — a very long armed flight simply
--- keeps the most recent MAX_LINES (older lines roll off). To avoid an in-flight SD hitch,
--- tick() does NOT flush while armed; the buffer is flushed on disarm/disconnect instead.
+-- COST DISCIPLINE: file IO every frame would itself cause lag. So log() only appends to
+-- a RAM ring buffer (cheap); flush() writes INCREMENTALLY — only the lines added since
+-- the last flush are APPENDED ("a") to the session file, a `flushed` watermark tracks
+-- what is already on SD. The session file is created fresh ("w") in start_session (the
+-- rotated slot may hold an old session). Because appends are tiny (a handful of lines,
+-- not the whole ring), flushing now also runs WHILE ARMED — at the slower ARMED_FLUSH_CS
+-- cadence — so a crash / power loss in flight loses at most the last few seconds instead
+-- of the whole flight. The ring is CAPPED at MAX_LINES (bounds heap); the per-session
+-- FILE is capped at MAX_FILE_LINES (bounds SD growth on very long sessions — a marker
+-- line is written when the cap is hit, then appends stop for that session).
 -- =====================================================================================
 
 local M = {}
@@ -20,8 +24,16 @@ local M = {}
 local DIR          = "/WIDGETS/UltiDash/"
 local SEQ_PATH     = DIR .. "debug_seq.txt"   -- persisted round-robin session counter
 local MAX_SESSIONS = 20           -- keep this many session files (debug_01..debug_20.log)
-local FLUSH_CS     = 300          -- write to SD at most every 3 s (centiseconds)
-local MAX_LINES    = 500          -- ring-buffer cap (bounds heap + per-file size)
+local FLUSH_CS     = 300          -- disarmed: append to SD at most every 3 s (centisec)
+local ARMED_FLUSH_CS = 1000       -- armed: slower cadence (10 s) — small append writes,
+                                  -- but keep the in-flight SD touch rate conservative
+local FORCE_MIN_CS = 50           -- even a FORCED flush appends no more than every
+                                  -- 0.5 s. handle_telemetry_state_change force-flushes
+                                  -- on every state transition; a dying backup buffer
+                                  -- bounces the link many times/second — the rate limit
+                                  -- keeps that from becoming an SD-write storm.
+local MAX_LINES    = 500          -- ring-buffer cap (bounds heap)
+local MAX_FILE_LINES = 5000       -- per-session file cap (~450 kB worst case)
 local PERF_CS      = 100          -- emit a PERF snapshot at most every 1 s
 
 local ENABLED    = false
@@ -30,6 +42,9 @@ local lines      = {}
 local last_flush = -100000
 local last_perf  = -100000
 local dirty      = false
+local flushed    = 0              -- watermark: lines[1..flushed] are already on SD
+local dropped    = 0              -- unflushed lines lost to ring overflow (marker on next flush)
+local file_lines = 0              -- lines written to the session file (MAX_FILE_LINES cap)
 
 local function now_ms()
     local t = getTime() or 0     -- EdgeTX ticks are centiseconds
@@ -40,7 +55,12 @@ end
 function M.log(tag, msg)
     if not ENABLED then return end
     lines[#lines + 1] = string.format("[%dms][%s] %s", now_ms(), tostring(tag or "UD"), tostring(msg or ""))
-    if #lines > MAX_LINES then table.remove(lines, 1) end
+    if #lines > MAX_LINES then
+        table.remove(lines, 1)
+        -- keep the SD watermark aligned with the shifted ring; trimming a line that
+        -- never made it to SD is real data loss -> counted, marker on the next flush
+        if flushed > 0 then flushed = flushed - 1 else dropped = dropped + 1 end
+    end
     dirty = true
 end
 
@@ -51,20 +71,41 @@ function M.logf(tag, fmt, ...)
     M.log(tag, ok and s or fmt)
 end
 
--- Write the buffer to SD. Throttled unless `force`. Uses ONLY "w" (EdgeTX-io-safe).
-function M.flush(force)
+-- Write NEW lines (past the `flushed` watermark) to SD, appended ("a") to the session
+-- file. Throttled: FORCE_MIN_CS when forced, ARMED_FLUSH_CS while armed (in-flight
+-- flushing — small appends, conservative cadence), else FLUSH_CS. The per-session file
+-- cap (MAX_FILE_LINES) stops appends once hit (one marker line, then silence).
+function M.flush(force, armed)
     if not ENABLED or not dirty then return end
+    if file_lines >= MAX_FILE_LINES then dirty = false; return end
     local t = getTime() or 0
-    if not force and (t - last_flush) < FLUSH_CS then return end
+    local min_gap = force and FORCE_MIN_CS or (armed and ARMED_FLUSH_CS or FLUSH_CS)
+    if (t - last_flush) < min_gap then return end
     last_flush = t
     pcall(function()
-        local f = io.open(log_path, "w")
+        local f = io.open(log_path, "a")
         if not f then return end
-        for i = 1, #lines do
+        if dropped > 0 then
+            io.write(f, string.format("[---] %d line(s) lost (ring overflow before flush)", dropped))
+            io.write(f, "\n")
+            file_lines = file_lines + 1
+            dropped = 0
+        end
+        for i = flushed + 1, #lines do
             io.write(f, lines[i])
             io.write(f, "\n")
+            file_lines = file_lines + 1
+            if file_lines >= MAX_FILE_LINES then
+                io.write(f, "[---] session file cap reached, logging to SD stopped")
+                io.write(f, "\n")
+                flushed = i
+                io.close(f)
+                dirty = false
+                return
+            end
         end
         io.close(f)
+        flushed = #lines
         dirty = false
     end)
 end
@@ -102,7 +143,14 @@ local function start_session()
     log_path = string.format("%sdebug_%02d.log", DIR, slot)
     write_seq(seq)
     lines = {}
+    flushed, dropped, file_lines = 0, 0, 0
     last_flush, last_perf, dirty = -100000, -100000, false
+    -- the rotated slot may hold an OLD session — truncate it now ("w"), because
+    -- flush() only ever appends from here on
+    pcall(function()
+        local f = io.open(log_path, "w")
+        if f then io.close(f) end
+    end)
     local t = getDateTime()
     local stamp = t and string.format("%04d-%02d-%02d %02d:%02d:%02d",
         t.year, t.mon, t.day, t.hour, t.min, t.sec) or "?"
@@ -133,19 +181,21 @@ function M.perf(wgt)
     if (t - last_perf) < PERF_CS then return end
     last_perf = t
     local v = wgt.values or {}
-    M.logf("PERF", "hz=%s heap=%skB pass=%sms state=%s armed=%s view=%s menu=%s detail=%s",
+    M.logf("PERF", "hz=%s heap=%skB pass=%sms state=%s armed=%s pl=%s view=%s menu=%s detail=%s vol=%s",
         tostring(wgt.dbg_hz), tostring(wgt.dbg_lua_kb),
         tostring(wgt.dbg_pass_cs and (wgt.dbg_pass_cs * 10) or nil),
-        tostring(v.rf_connection_state), tostring(wgt.armed_now),
-        tostring(wgt.view and wgt.view.current), tostring(wgt.menu_view), tostring(wgt.detail_view))
+        tostring(v.rf_connection_state), tostring(wgt.armed_now), tostring(wgt.power_lost),
+        tostring(wgt.view and wgt.view.current), tostring(wgt.menu_view), tostring(wgt.detail_view),
+        tostring(wgt.vol_gvar_last))
 end
 
--- Convenience for the 5 Hz pass: snapshot perf + flush (flush skipped while armed to
--- avoid an in-flight SD hitch; the disarm/disconnect transition force-flushes instead).
+-- Convenience for the 5 Hz pass: snapshot perf + flush. Armed flushes run at the slower
+-- ARMED_FLUSH_CS cadence (small incremental appends), so an in-flight crash / power
+-- loss loses at most the last few seconds of log instead of the whole flight.
 function M.tick(wgt)
     if not ENABLED then return end
     M.perf(wgt)
-    if not (wgt and wgt.armed_now) then M.flush(false) end
+    M.flush(false, wgt and wgt.armed_now)
 end
 
 return M
