@@ -9,6 +9,7 @@ local function ensure_rf_state(wgt)
         msp_allowed = false,
         battery_profile = nil,
         battery_config = nil,
+        governor_config = nil,
         flight_stats = nil,
         callback_installed = false,
         read_pending = nil          -- debounced MSP read request (see read_rf_data/background)
@@ -79,6 +80,42 @@ local function on_battery_config_received(wgt, config)
     wgt.rf_data_dirty = true
 end
 
+-- Governor config (MSP 142) — read once per connect/disarm alongside the battery
+-- reads. Only gov_mode matters to the widget: in gov_mode OFF/LIMIT the firmware
+-- never updates gov.state (the Gov sensor stays constant 0), so the stats extrema
+-- need to know whether the governor state machine runs at all (rf_gov_has_state).
+local function on_governor_config_received(wgt, config)
+    ensure_rf_state(wgt).governor_config = config
+    local mode = config and config.gov_mode and config.gov_mode.value
+    wgt.values.rf_gov_mode = mode
+    -- version-aware enum label straight from the API's own table
+    -- (>=12.09: OFF/LIMIT/DIRECT/ELECTRIC/NITRO; older: OFF/PASSTHROUGH/...)
+    local tbl = config and config.gov_mode and config.gov_mode.table
+    local name = (mode ~= nil and tbl ~= nil) and tbl[mode] or nil
+    wgt.values.rf_gov_mode_name = name
+    -- does the gov state machine run (= does the Gov sensor carry real states)?
+    -- RF 2.3 (API >= 12.09): OFF(0)/LIMIT(1) never update gov.state -> false.
+    -- Older API (RF 2.2 enum): only OFF(0) is dead; PASSTHROUGH+ run the state machine.
+    if mode == nil then
+        wgt.values.rf_gov_has_state = nil
+    elseif type(rf2.apiVersion) == "number" and rf2.apiVersion < 12.09 then
+        wgt.values.rf_gov_has_state = mode >= 1
+    else
+        wgt.values.rf_gov_has_state = mode >= 2
+    end
+    -- precomputed display label ("Gov. Off"/"Gov. Limit") for the dashboard's governor
+    -- slot when the state machine is off — computed HERE (once per read), because
+    -- gov_state_formatted is a reactive getter running per LVGL frame
+    if wgt.values.rf_gov_has_state == false and name ~= nil then
+        wgt.values.rf_gov_mode_label = "Gov. " ..
+            string.upper(string.sub(name, 1, 1)) .. string.lower(string.sub(name, 2))
+    else
+        wgt.values.rf_gov_mode_label = nil
+    end
+
+    wgt.rf_data_dirty = true
+end
+
 local function on_flight_stats_received(wgt, stats)
     ensure_rf_state(wgt).flight_stats = stats
     wgt.values.rf_total_flights = stats and stats.stats_total_flights and stats.stats_total_flights.value
@@ -99,6 +136,13 @@ local function read_rf_data(wgt)
         rf2.useApi("mspBatteryConfig").read(on_battery_config_received, wgt)
     end
     rf2.useApi("mspFlightStats").read(on_flight_stats_received, wgt)
+    -- governor config: gated on apiVersion like mspBatteryConfig (its getDefaults
+    -- compares rf2.apiVersion) and pcall'd (new read in a bugfix release — an RFTool
+    -- without the API must not break the established reads); a failure just leaves
+    -- rf_gov_* nil = the previous strict gov-state gating
+    if rf2.apiVersion ~= nil then
+        pcall(function() rf2.useApi("mspGovernorConfig").read(on_governor_config_received, wgt) end)
+    end
 end
 
 function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
@@ -117,6 +161,10 @@ function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
         wgt.values.rf_cell_warning_voltage = nil
         wgt.values.rf_cell_alarm_voltage = nil
         wgt.values.rf_cell_full_voltage = nil
+        wgt.values.rf_gov_mode = nil
+        wgt.values.rf_gov_mode_name = nil
+        wgt.values.rf_gov_mode_label = nil
+        wgt.values.rf_gov_has_state = nil
     end
 
     if on_telemetry_state_changed then

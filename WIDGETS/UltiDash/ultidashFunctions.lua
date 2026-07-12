@@ -521,12 +521,28 @@ local function is_operating(wgt)
     return wgt.values.rf_connection_state == "armed"
 end
 
-local function should_track_governor_run_extrema(wgt)
-    return wgt.values.gov_state ~= nil and wgt.values.gov_state > 2 and wgt.values.gov_state ~= 5
-end
-
--- headspeed (rpm) above which the rotor counts as "spinning" for flight time
+-- headspeed (rpm) above which the rotor counts as "spinning" (flight time + the
+-- extrema fallback gate below)
 local FLIGHT_TIME_MIN_HEADSPEED = 100
+
+-- gov_state enum: 0 off, 1 idle, 2 spooling, 3 recovery, 4 active, 5 throttle-hold,
+-- 6 fallback, 7 autorotation, 8 bailout. "running" = >2 and not 5. In gov_mode
+-- OFF/LIMIT the firmware never updates gov.state -> the sensor stays constant 0 ->
+-- the state gate never engages there. When the FC EXPLICITLY reports such a mode
+-- (rf_gov_has_state == false, read from mspGovernorConfig on connect/disarm), fall
+-- back to the flight-time pattern: operating (RFTool armed) + rotor spinning;
+-- without an Hspd sensor, operating-only. Unknown mode (no FC / old RFTool /
+-- failed read) keeps the strict state gate.
+local function should_track_governor_run_extrema(wgt)
+    local g = wgt.values.gov_state
+    if g ~= nil and g > 2 and g ~= 5 then return true end
+    if wgt.values.rf_gov_has_state == false and is_operating(wgt) then
+        local hs = wgt.values.headspeed       -- cached by update_headspeed (same 5 Hz pass)
+        if hs == nil then return true end     -- no Hspd sensor -> operating-only
+        return hs > FLIGHT_TIME_MIN_HEADSPEED
+    end
+    return false
+end
 
 -- Flight-time tracking: count only while ARMED *and* the rotor is spinning (both in
 -- combination). Sensors are read DIRECTLY here (getSourceValue), independent of the

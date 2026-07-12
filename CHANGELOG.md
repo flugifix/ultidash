@@ -2,6 +2,21 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.5.2 — 2026-07-12
+
+Maintenance release on top of v0.5.1 (backport from the 0.6.0 line).
+
+### Added
+- **Governor-mode aware statistics.** UltiDash now reads the FC's governor mode at
+  connect (`mspGovernorConfig`, MSP — connect/disarm only). In governor modes
+  **OFF / LIMIT** the firmware never updates the `Gov` state sensor, which used to keep
+  the headspeed/current min-max tracking from ever engaging; in those modes the tracking
+  now falls back to **armed + rotor spinning** (`Hspd > 100 rpm`; armed-only without an
+  `Hspd` sensor) and the governor slot shows **Gov. Off / Gov. Limit** instead of the
+  misleading *Throttle off*. Setups with a running governor (DIRECT / ELECTRIC / NITRO)
+  are unchanged; without a readable governor config (old RFTool) the previous strict
+  gating remains.
+
 ## v0.5.1 — 2026-07-03
 
 Bugfix release.

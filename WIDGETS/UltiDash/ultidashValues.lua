@@ -532,6 +532,10 @@ function M.createValues(wgt)
 
         gov_state = nil,
         gov_state_formatted = function()
+            -- FC explicitly runs gov_mode OFF/LIMIT: the Gov sensor is a constant 0,
+            -- so "Throttle off" would be misleading -> show the mode instead. The
+            -- label is precomputed in ultidashRf (this getter runs per LVGL frame).
+            if wgt.values.rf_gov_mode_label ~= nil then return wgt.values.rf_gov_mode_label end
             if wgt.values.gov_state == nil then return "-" end
             return GOV_STATE_LABELS[wgt.values.gov_state] or "Gov. Disabled"
         end,

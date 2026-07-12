@@ -403,7 +403,10 @@ disconnect, so fixed rows — not a switchable one — keep every profile visibl
 
 #### Min/Max integrity
 - **Headspeed** is tracked only while the **governor is running** (no 0 from a stopped
-  rotor), per profile.
+  rotor), per profile. In governor modes **OFF / LIMIT** the `Gov` sensor never changes,
+  so the widget reads the governor mode from the FC at connect and falls back to
+  **armed + rotor spinning** (`Hspd > 100 rpm`; armed-only without an `Hspd` sensor).
+  The same gate applies to the **current** min/max.
 - **Voltages (`Vbat`/`Vcel`/`Vbec`)** are tracked **only while armed** and latched against
   implausible (≤ 1 V) readings, so the post-landing buffer decay (4.x → 0 V, e.g. a stray
   2.89 V) never pollutes Min, and "Latest" doesn't freeze at 0 V. The BEC value is held
@@ -669,6 +672,13 @@ to the Status detail's event log.
 | 2 | Spooling up | 7 | Autorotation |
 | 3 | Recovery | 8 | Bailing Out |
 | 4 | Gov. Active | unknown / none | Gov. Disabled / `-` |
+
+- In governor modes **OFF** and **LIMIT** the firmware never updates the state (the sensor
+  stays a constant `0`). UltiDash reads the governor mode from the FC at connect
+  (`mspGovernorConfig`): in those modes the governor slot shows **Gov. Off / Gov. Limit**
+  instead of the misleading *Throttle off*, and the run min/max tracking (headspeed /
+  current) falls back to **armed + rotor spinning** instead of the governor state. With no
+  FC config available (old RFTool, read failed) the strict governor-state gating remains.
 
 ### Throttle
 | State | Display |
