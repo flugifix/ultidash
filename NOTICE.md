@@ -13,7 +13,7 @@ visual concepts from several EdgeTX widgets. All credit to their respective auth
 | **eStatus** | Rob 'bob00' Gayle — etx-widgets | GPLv3 | Throttle %, multi-vendor ESC status/fault decoder, arming-disable reasons |
 | **BattAnalog** | Offer Shmuely — [edgetx-x10-widgets](https://github.com/offer-shmuely/edgetx-x10-widgets) | GPLv2 (file header) | Only the **style** of the compact top-bar battery icon (not a verbatim code copy) |
 
-## Licensing status (updated June 2026)
+## Licensing status (updated July 2026)
 
 - **HeliWidget / HeliDash** (gismo2004) — the **base**, i.e. the bulk of the code — is
   now licensed **GPL-3.0 (or later)**. This resolves the earlier blocker (the repo

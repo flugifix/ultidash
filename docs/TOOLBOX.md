@@ -4,16 +4,19 @@
 > widgets into UltiDash as on-demand **Toolbox** pages. Under active hardware testing;
 > details (appearance, configurable sources, recommended-value hints) may still change.
 
-The Toolbox hosts two full-screen tool pages for Rotorflight's **trim-based adjustment
-functions**:
+The Toolbox hosts full-screen tool pages. This document covers the two pages for
+Rotorflight's **trim-based adjustment functions**:
 
 - **Adjust Map** — *read-only*. Shows which adjustment function each trim maps to (per the
   6-position selector) plus the last value the FC reported.
 - **Adjust Edit** — the same table with touch **`[-]` / `[+]`** buttons that perform an
   adjustment step (by pulsing a GVAR). Meant for **in-flight tuning**.
 
-Open them from the fullscreen menu (**☰ → Toolbox**, disarmed only) **or** via an
-**activation switch** that works any time, including in flight (see §5).
+Open them from the fullscreen menu (**☰ → Toolbox**, disarmed only) **or** via a
+**shortcut switch** that works any time, including in flight (see §5).
+
+Three further, zero-config pages live in the same Toolbox submenu — the **Log Viewer**,
+**RF2 Config** and the **Flight Log** — described briefly in §8.
 
 ---
 
@@ -138,9 +141,10 @@ One-time mixer line **on the value channel** (e.g. `CH12`):
 **dedicated** (used only in this mixer line) — pulsing it in flight then only drives the
 adjustment, never control.
 
-**Example (working model):** `MAX / weight = GV1 / ADD`, additionally **gated on the
-Toolbox activation switch** — the pulse can only reach the value channel while the tools
-are actually active (a cheap extra safety on top of the dedicated GVAR).
+**Example (working model):** `MAX / weight = GV1 / ADD`, additionally **gated on a
+dedicated switch** in the mixer — the pulse can only reach the value channel while that
+switch is on (a cheap extra safety on top of the dedicated GVAR). You can reuse the same
+switch you bind to open the editor under *Settings ▸ Shortcuts* (§5).
 
 ## 4. Telemetry (optional but recommended)
 
@@ -152,33 +156,31 @@ are actually active (a cheap extra safety on top of the dedicated GVAR).
 Connection is taken from **UltiDash's own link state** (no separate heartbeat sensor
 needed): the reported value (`AdjV`) is only latched while the FC is connected.
 
-## 5. Opening the tools — menu or activation switch
+## 5. Opening the tools — menu or a shortcut switch
 
 - **Menu:** ☰ menu glyph (disarmed) → **Toolbox** → **Adjust Map** / **Adjust Edit**. Back =
   **RTN**.
-- **Activation switch (recommended for flight):** set **`Activation switch`** (`TbSrc`)
-  and **`Switch opens`** (`TbTool` = *Adjust Map* / *Adjust Edit*). Flipping the switch **on**
-  auto-opens the configured tool — **also while armed / in flight** (the menu glyph itself
-  is disarmed-only); flipping it **off** returns to the dashboard.
+- **Shortcut switch (recommended for flight):** under *Settings ▸ Shortcuts* (REFERENCE §2.7c)
+  bind a switch position — or a toggle step — to *Adjust Map* / *Adjust Edit* (or any other
+  page). A **position slot** opens the tool while the switch is held there and closes it when
+  you leave the position — **also while armed / in flight** (the menu glyph itself is
+  disarmed-only). The pickers use **EdgeTX's native switch picker** (physical + logical
+  switches, incl. the `!…` inverted variants), so they show exactly the switches your radio
+  has, with their custom names.
 
-  The same switch also gates **active** state: while it is off (or you open a tool from the
-  menu with the switch off), the page is greyed and shows **"CONFIG INACTIVE"** — a guard
-  against accidental changes.
-
-  The row uses **EdgeTX's native switch picker** (physical + logical switches, incl. the
-  `!…` inverted variants) — it shows exactly the switches your radio has, with their
-  custom names.
+  The tool page is **active whenever it is open** (there is no separate switch-gated
+  "CONFIG INACTIVE" mode any more — the earlier Toolbox activation switch was folded into
+  the Shortcuts group). Keep the value channel's mixer gated on a switch (§3) if you want an
+  extra guard against unintended pulses.
 
 ## 6. Settings reference (Settings ▸ Toolbox)
 
 | Setting | Key | Notes |
 |---------|-----|-------|
-| Activation switch | `TbSrc` | gates active + (with *Switch opens*) auto-opens a tool (native switch picker) |
-| Switch opens | `TbTool` | Off / Adjust Map / Adjust Edit |
 | Adj: Config channel | `TbConfigCh` | the 6-position selector channel (default CH11) |
 | Adj: Value channel | `TbValueCh` | the trim-magnitude channel (default CH12) |
 | Adj editor: GVAR | `TbGvar` | the GVAR pulsed by the editor (GV1…GV15) |
-| Adj editor: pulse (ms) | `TbPulse` | pulse length per step |
+| Adj editor: pulse (ms) | `TbPulse` | pulse length per step; the editor's `[-]`/`[+]` tap lockout follows it (a new tap is accepted ~0.1 s after the pulse ends) |
 | Adj value divider | `TbScale` | divides the displayed `AdjV` |
 | Adj editor: ranges hint | `TbBert` | show recommended value ranges next to each name |
 | Toolbox sunlight mode | `TbSun` | high-contrast light scheme for bright sun |
@@ -198,13 +200,97 @@ from the default in §2 (it may be *completely* your own), copy
 the editor's `[-]`/`[+]` there). Overrides are **partial** (set only what differs), apply
 to **both** the Map and the Editor, and `labels.lua` is never touched by updates.
 
+The same file may carry a **`ranges` block** to override the editor's recommended-value
+hints (`TbBert`) for your own setup: same shape as the table — `ranges = { [row 1…6] =
+{ [pos 1…6] = "text" } }`, partial, strings only, `""` blanks a hint. Example:
+
+```lua
+return {
+  rows   = { [5] = { [1] = "Gov TTA" } },          -- rename a cell
+  ranges = { [5] = { [1] = "0-50" } },             -- give it a range hint
+}
+```
+
 ## 7. Known limitations / WIP
 
 - The telemetry sensor names are fixed to the Rotorflight standard (`AdjV` / `PID#`);
   the two channels are configurable (§6).
-- The **recommended value ranges** (`TbBert`) are hard-coded defaults and still under
-  review.
+- The **recommended value ranges** (`TbBert`) ship as defaults that are still under
+  review; a `labels.lua` `ranges` block overrides them per setup (§6).
 - Appearance (fonts, column widths) is not final.
+- **GVAR residual risk (theoretical):** if the radio's Lua state dies *exactly* inside
+  the ~150 ms editor pulse window (power-off at that instant), the GVAR could stay at a
+  trim code. The editor defensively zeroes the GVAR every time it is opened, and closing
+  the page (RTN, switch, arming, fullscreen exit) always ends an in-flight pulse — the
+  switch-gated mixer line (§3.3 example) covers the remaining window.
 - Safety model: the tools use only `getValue` + `model.setGlobalVariable` — **no MSP** — so
   the "no MSP while armed" rule is untouched; the FC's adjustment functions (your model
   setup) perform the actual change.
+
+## 8. The other Toolbox pages: Log Viewer, RF2 Config & Flight Log
+
+All three need **no model setup and no settings** and are **disarmed-only** (an armed tap
+is refused with a hint; they close automatically on arming). They are **lazy-loaded**:
+the modules are read from the SD card only when the page is opened and released again on
+close, so they cost no memory while flying.
+
+- **Log Viewer** *(WIP)* — graphs EdgeTX telemetry logs (`/LOGS/*.csv`) directly on the
+  radio, no PC needed. Uses no MSP at all. Still under hardware testing.
+
+  **Workflow:**
+  1. **Browse** — the file list shows only real telemetry logs (`<model>-YYYY-MM-DD…csv`),
+     newest first, for **all models by default**. The header button (top-right) shows the
+     active filter and opens the **Filter by model** page: every model name found in
+     `/LOGS` with its log count, plus *All models* — tap one to filter the list. Scroll
+     by **swiping** or dragging the list (the scrollbar on the right is a position
+     indicator). The list keeps the **newest 600** logs; with more files in `/LOGS` the
+     oldest are dropped and the footer appends *"(list truncated)"*. *(The hardware wheel
+     does not scroll here yet — EdgeTX only delivers wheel events to a focused LVGL
+     object, and this page has none.)*
+  2. **Open** a log (tap). A progress bar shows the parse (all file work is chunked, so the
+     radio stays responsive); **RTN** cancels.
+  3. **Pick what to display.** If the log has several recording **sessions** (gaps > 30 s),
+     you choose one first. Then the **"What to display?"** page shows a **two-column card
+     grid** with a card for each built-in set — **Power / Battery / RF link / Governor** —
+     (each showing how many of its sensors the log contains; a set with none is
+     dimmed), plus a **Custom sensors** card. Custom opens a sensor
+     picker that groups every column in the log **exactly like the Rotorflight
+     Configurator's Telemetry Sensors dialog** (Battery, Voltage, Current, Temperature,
+     ESC #1 / ESC #2, RPM, Barometer, Gyro, GPS, Status, Profile, Control, System, Debug —
+     plus RF-link, stick, switch and channel groups for the radio-side columns). Groups
+     start **collapsed**, each with a *selected / available* count; tap a group header to
+     fold it open. Each sensor row has an **on/off toggle switch** — tap to select, up to
+     **4**. A **List / Grid** toggle (top-right, like the configurator's Sort/Select) swaps
+     the roomy one-sensor-per-row layout for a compact multi-column grid. Tap **Show** to
+     graph the set.
+  4. **Chart.** Up to 4 min/max envelope curves, a scaled time axis, and a **time cursor**
+     you drag with a finger (the footer reads out each curve's value there). Zoom with the
+     **− / +** buttons — **100 %** resets to the whole session in one tap — and pan with
+     **< / >**; a thin bar along the chart's top edge shows re-loading while a new zoom/pan
+     window is extracted (the old curves stay up meanwhile). The template and session
+     selectors are bordered **header chips**: tap the template chip to re-pick the display,
+     the session chip to switch session. **RTN** steps back: chart → picker/browser →
+     Toolbox.
+
+  **Own templates** (optional): copy `toolbox/logtemplates.example.lua` to
+  `…/toolbox/logtemplates.lua` and edit — each template is just a name plus up to 4 sensor
+  names as written in the log header (`Vbat`, `Curr`, `Hspd`, `EscT`, `1RSS`, …). Restart
+  the radio to pick up changes. The file survives updates (only the `.example` is replaced).
+- **RF2 Config** — runs the **original rotorflight-lua-scripts configuration tool**
+  (main menu, all config pages, Save, the Reload/Reboot popup) with its original look,
+  navigation and key handling, inside UltiDash's fullscreen. Nothing is copied: the
+  stock scripts load from `/SCRIPTS/RF2/` on the SD card, so updating the Rotorflight
+  Lua suite updates this page too. Requirements: the **RF Tool widget** must be placed
+  and connected (it provides the `rf2` runtime), and the RF2 scripts must be present /
+  compiled (RF Tool does that on its first run) — otherwise the page shows what is
+  missing. RTN walks back exactly like the original (page → main menu → Toolbox).
+  If the FC disconnects **while a config page is open**, the stock tool falls back to its
+  original "waiting for connection" screen, which does not process RTN — leave fullscreen
+  or reconnect the FC to get out.
+  Unlike the standalone tool it is blocked while armed (UltiDash's
+  no-MSP-while-armed rule).
+- **Flight Log** — browses the flight history UltiDash records on the SD card: three
+  tabs, **Flights** (date / model / battery / duration per flight), **Models** (flights +
+  total time per model) and **Batteries** (per-pack cycle counts from `batteries.cfg`).
+  The data files, the optional PC-maintained battery registry and the related
+  settings are described in **REFERENCE §12** (Flight log & battery management).

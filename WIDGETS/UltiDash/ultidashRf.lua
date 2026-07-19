@@ -26,11 +26,39 @@ end
 -- directly and are not debounced.
 local RF_READ_SETTLE_CS = 40        -- 0.4 s (EdgeTX centiseconds)
 
+-- ARM-sensor gate for the MSP reads: msp_allowed alone hangs on the RFTool
+-- state, and a disconnected->connected->armed handshake with a >settle "connected"
+-- window would fire the 4 connect reads WHILE THE MODEL FLIES. The host hands in its
+-- is_armed predicate (the shared ARM-sensor read incl. per-tick cache) via M.init;
+-- the getValue fallback covers a host that never did (bit 0 / 1024 = armed, exactly
+-- like is_craft_armed). Module-local: the RF service runs on the publisher only.
+local armed_check = nil
+local function craft_armed(wgt)
+    if armed_check then return armed_check(wgt) end
+    if type(getValue) ~= "function" then return false end
+    local ok, arm = pcall(getValue, "ARM")
+    if not ok or type(arm) ~= "number" then return false end
+    arm = math.floor(arm)
+    return (arm % 2) == 1 or arm == 1024
+end
+
 local function format_seconds(seconds)
+    -- pcall the load AND the call: an RFTool update that renamed/removed the F/formatSeconds
+    -- helper must degrade to the fallback string, not crash the widget Lua state.
     if rf2 and rf2.executeScript then
-        return rf2.executeScript("F/formatSeconds")(seconds or 0)
+        local ok, s = pcall(function() return rf2.executeScript("F/formatSeconds")(seconds or 0) end)
+        if ok and s ~= nil then return s end
     end
     return tostring(seconds or 0) .. "s"
+end
+
+-- Report an rf2 API failure ONCE per session (goes to the console + the file log when
+-- DebugLog is on); a mismatch would otherwise repeat on every read.
+local function log_api_err(state)
+    if not state.api_err_logged then
+        state.api_err_logged = true
+        print("[UltiDash] rf2 API call failed (RFTool version mismatch?)")
+    end
 end
 
 local function sync_active_battery_capacity(wgt)
@@ -130,23 +158,42 @@ local function read_rf_data(wgt)
 
     local state = ensure_rf_state(wgt)
     if not state.msp_allowed then return end
+    -- defense-in-depth (NEVER issue MSP while armed): whatever the
+    -- RFTool state claims, an armed ARM sensor blocks the reads. Callers park their
+    -- pending flags (nothing is lost — the read fires on the disarm transition).
+    if craft_armed(wgt) then return end
 
-    rf2.useApi("mspBatteryProfile").read(on_battery_profile_received, wgt)
+    -- Each read in its OWN pcall: one missing/renamed API (RFTool update, or an older RFTool
+    -- without mspFlightStats) must not block the other reads or crash the widget. Failed reads
+    -- simply leave their wgt.values.rf_* fields nil (all consumers are already nil-guarded).
+    local ok1 = pcall(function() rf2.useApi("mspBatteryProfile").read(on_battery_profile_received, wgt) end)
+    local ok2 = true
     if rf2.apiVersion ~= nil then
-        rf2.useApi("mspBatteryConfig").read(on_battery_config_received, wgt)
+        ok2 = pcall(function() rf2.useApi("mspBatteryConfig").read(on_battery_config_received, wgt) end)
     end
-    rf2.useApi("mspFlightStats").read(on_flight_stats_received, wgt)
+    local ok3 = pcall(function() rf2.useApi("mspFlightStats").read(on_flight_stats_received, wgt) end)
     -- governor config: gated on apiVersion like mspBatteryConfig (its getDefaults
-    -- compares rf2.apiVersion) and pcall'd (new read in a bugfix release — an RFTool
-    -- without the API must not break the established reads); a failure just leaves
-    -- rf_gov_* nil = the previous strict gov-state gating
+    -- compares rf2.apiVersion); a failure just leaves rf_gov_* nil = legacy behavior
+    local ok4 = true
     if rf2.apiVersion ~= nil then
-        pcall(function() rf2.useApi("mspGovernorConfig").read(on_governor_config_received, wgt) end)
+        ok4 = pcall(function() rf2.useApi("mspGovernorConfig").read(on_governor_config_received, wgt) end)
     end
+    if not (ok1 and ok2 and ok3 and ok4) then log_api_err(state) end
 end
 
 function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
     ensure_rf_state(wgt)
+    -- Normalize: the RFTool callback can deliver transient handshake
+    -- states ("initializing", ...). Map "ready" like the poll path and
+    -- DROP everything outside the four known states — the follow-up
+    -- connected/disarmed of the same handshake lands moments later.
+    -- Keeps rf_connection_state consumer-safe (formatters/gates know
+    -- only these four).
+    if new_state == "ready" then new_state = "connected" end
+    if new_state ~= "armed" and new_state ~= "disarmed"
+        and new_state ~= "connected" and new_state ~= "disconnected" then
+        return
+    end
     local previous_state = wgt.rf.last_state
     if wgt.rf.last_state == new_state then return end
     wgt.rf.last_state = new_state
@@ -154,7 +201,17 @@ function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
 
     wgt.values.rf_connection_state = new_state
 
-    if previous_state == "disconnected" and new_state == "connected" then
+    -- FC-config caches (battery thresholds/capacity/cell count, governor mode)
+    -- survive an ARMED disconnect: the FC config cannot change mid-flight,
+    -- and after a telemetry blip the re-read parks until disarm (msp_allowed) — the
+    -- old on-reconnect clear dropped the alert thresholds to defaults, lost the fuel
+    -- basis and degenerated the OFF/LIMIT gov gate for the rest of the flight. Clear
+    -- only on a real session end: the craft was DISARMED (or never seen) when the
+    -- link dropped, so a model change / unplug still wipes immediately. The
+    -- reconnect path only schedules the re-read (read_pending below);
+    -- rf_battery_profile seeds -1 (not nil) so the battery-profile picker shows
+    -- "unknown" until that read lands.
+    if new_state == "disconnected" and previous_state ~= "armed" then
         wgt.values.rf_battery_profile = -1
         wgt.values.rf_battery_capacity_mah = nil
         wgt.values.rf_battery_cell_count = nil
@@ -181,8 +238,9 @@ function M.on_state_changed(wgt, new_state, on_telemetry_state_changed)
     end
 end
 
-function M.init(wgt, on_telemetry_state_changed)
+function M.init(wgt, on_telemetry_state_changed, is_armed)
     ensure_rf_state(wgt)
+    if is_armed ~= nil then armed_check = is_armed end
     if not wgt.rf.callback_installed then
         wgt.onStateChanged = function(widget, new_state)
             M.on_state_changed(widget, new_state, on_telemetry_state_changed)
@@ -218,8 +276,14 @@ function M.background(wgt, on_telemetry_state_changed)
     end
 
     if not state.is_registered then
-        rf2.registerWidget(wgt)
-        state.is_registered = true
+        -- pcall'd: an RFTool-version mismatch here crashed the widget Lua
+        -- state. On failure stay unregistered (retried next pass, the pcall is cheap)
+        -- and log once.
+        if pcall(rf2.registerWidget, wgt) then
+            state.is_registered = true
+        else
+            log_api_err(state)
+        end
     end
 
     local current_state = rf2.rfToolState
@@ -236,8 +300,14 @@ function M.background(wgt, on_telemetry_state_changed)
     if state.read_pending and state.msp_allowed then
         local now = getTime() or 0
         if (now - state.read_pending) >= RF_READ_SETTLE_CS then
-            state.read_pending = nil
-            read_rf_data(wgt)
+            -- ARM-sensor gate: a mid-flight blip's handshake can pass
+            -- through a >settle "connected" window — never fire the connect reads
+            -- while the ARM sensor still reports armed. PARK the request (don't
+            -- clear it), so it fires on the first disarmed pass.
+            if not craft_armed(wgt) then
+                state.read_pending = nil
+                read_rf_data(wgt)
+            end
         end
     end
 end

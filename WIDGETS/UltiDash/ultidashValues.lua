@@ -1,6 +1,7 @@
 local M = {}
 
--- color palette shadows (see ultidash.lua); swapped via M.set_palette
+-- color palette shadows (see ultidash.lua, the single source of the palette tables);
+-- the resolved 8-slot palette is HANDED IN via M.set_palette(scheme, p).
 local COLOR_THEME_PRIMARY1   = COLOR_THEME_PRIMARY1
 local COLOR_THEME_PRIMARY2   = COLOR_THEME_PRIMARY2
 local COLOR_THEME_SECONDARY1 = COLOR_THEME_SECONDARY1
@@ -9,24 +10,38 @@ local COLOR_THEME_SECONDARY3 = COLOR_THEME_SECONDARY3
 local COLOR_THEME_FOCUS      = COLOR_THEME_FOCUS
 local COLOR_THEME_WARNING    = COLOR_THEME_WARNING
 local COLOR_THEME_DISABLED   = COLOR_THEME_DISABLED
-local THEME_PALETTE = {
-    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2,
-    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED,
-}
-local CLEAN_PALETTE = {
-    lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
-    lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
-}
-local DARK_PALETTE = {
-    lcd.RGB(0xFF, 0xFF, 0xFF), lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0xF0, 0xF4, 0xF8), lcd.RGB(0x39, 0xFF, 0x14),
-    lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0x00, 0xE5, 0xFF), lcd.RGB(0xFF, 0x1A, 0x40), lcd.RGB(0xFF, 0xC4, 0x00),
-}
 
--- scheme: 1 = UltiDash (clean), 2 = EdgeTX theme, 3 = UltiDash dark (high contrast)
-function M.set_palette(scheme)
-    local p = (scheme == 3) and DARK_PALETTE or ((scheme == 1) and CLEAN_PALETTE or THEME_PALETTE)
+-- Semantic yellow/green shadows (theme-aware, set per scheme in set_palette from the handed-in
+-- `sem`). Replace the naked built-in yellow (voltage-warn text) and dark-green (armed/connected
+-- text), which ignored the palette and were hard to read on some surfaces. Initialised to the
+-- muted (scheme-1) semantics as a fallback for the window before the first set_palette.
+local sem_yell  = lcd.RGB(0xF0, 0xC0, 0x00)
+local sem_green = lcd.RGB(0x20, 0xB0, 0x20)
+
+-- TX-battery icon fill colours (per-scheme configurable since the Colors settings pages,
+-- arrive as sem.vtx_* in set_palette). FALLBACK COPIES: the authoritative source
+-- is the `batt` table in ultidash.lua's resolve_builtins (vtx_ok/vtx_low) — these literals
+-- only cover the window before the first set_palette. Change them THERE.
+local vtx_col_hi = lcd.RGB(0x30, 0xc0, 0x30)
+local vtx_col_lo = lcd.RGB(0xff, 0x33, 0x33)
+
+-- Statusbar arm-state text colours (dedicated "Status text" roles, arrive as
+-- sem.st_armed/st_disarmed). Fallback copies for the window before the first
+-- set_palette only — the authoritative resolve is in ultidash.lua's set_palette.
+local st_armed    = lcd.RGB(0x20, 0xB0, 0x20)
+local st_disarmed = COLOR_THEME_WARNING
+
+-- scheme kept for future use; colours come from the handed-in `p` and `sem` (see ultidash.lua).
+function M.set_palette(scheme, p, sem)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
+    if sem then
+        sem_yell, sem_green = sem.yell, sem.green
+        vtx_col_hi = sem.vtx_ok  or vtx_col_hi
+        vtx_col_lo = sem.vtx_low or vtx_col_lo
+        st_armed    = sem.st_armed    or st_armed
+        st_disarmed = sem.st_disarmed or st_disarmed
+    end
 end
 
 -- Battery cell-voltage thresholds come from the Rotorflight FC (mspBatteryConfig:
@@ -45,7 +60,8 @@ local GOV_STATE_LABELS = {
     [5] = "Throttle Hold",
     [6] = "Gov. Fallback",
     [7] = "Autorotation",
-    [8] = "Bailing Out"
+    [8] = "Bailing Out",
+    [9] = "Gov. Bypass"      -- RF 2.3: GOVBYPASS box active, rotor runs on the bypass throttle curve
 }
 
 local function normalize_cell_voltage(raw_value, fallback)
@@ -101,7 +117,7 @@ local function get_cell_voltage_color_for_value(wgt, voltage)
     local warning_voltage = math.max(alarm_voltage, get_cell_warning_threshold(wgt))
 
     if voltage <= alarm_voltage then return COLOR_THEME_WARNING end
-    if voltage <= warning_voltage then return YELLOW end
+    if voltage <= warning_voltage then return sem_yell end
     return COLOR_THEME_PRIMARY1
 end
 
@@ -115,12 +131,18 @@ local function get_display_voltage_color_for_value(wgt, voltage)
     warning_voltage = math.max(alarm_voltage, warning_voltage)
 
     if voltage <= alarm_voltage then return COLOR_THEME_WARNING end
-    if voltage <= warning_voltage then return YELLOW end
+    if voltage <= warning_voltage then return sem_yell end
     return COLOR_THEME_PRIMARY1
 end
 
 -- Built ONCE at module load: this is read on the status-bar hot path (every frame
 -- while arming is disabled), and rebuilding the whole table per call churned the GC.
+-- bit order = armingDisableFlags_e, rotorflight-firmware release/4.6.0
+-- src/main/fc/runtime_config.h; names follow RFTool (SCRIPTS/RF2/PAGES/status.lua). Do NOT
+-- copy from the firmware's armingDisableFlagNames[] (CLI table, still carries the Betaflight
+-- legacy RUNAWAY/CRASH at bits 5/6). Keep in sync with ARM_DISABLE_DESCS in
+-- ultidashFunctions.lua (compact-form counterpart; bits 25/26 patched per API version there
+-- exactly as get_arming_disable_flag_names() does here).
 local ARM_DISABLE_FLAG_NAMES = {
     [0] = "No Gyro",
     [1] = "Fail Safe",
@@ -365,15 +387,19 @@ function M.createValues(wgt)
             return s
         end,
         -- short voltage label without the cell-count suffix (cell count is shown
-        -- inside the battery gauge instead, so the right-panel label never wraps)
+        -- inside the battery gauge instead, so the right-panel label never wraps).
+        -- ON BUFFER: while main power is lost the slot flips to an explicit
+        -- buffer readout — label "Buffer", value = live BEC voltage in the warn color —
+        -- instead of the old bare "--" (the buffer voltage IS the interesting value).
         display_voltage_label_short = function()
+            if wgt.power_lost then return "Buffer" end
             if use_total_voltage_display(wgt) then return wgt.values.label_battery_voltage end
             return wgt.values.label_cell_v
         end,
         display_voltage_formatted = function()
-            -- main power lost: the main pack is gone; show "--" instead of the frozen
-            -- last-good value (the BEC/buffer voltage is the interesting one now)
-            if wgt.power_lost then return "--" end
+            if wgt.power_lost then
+                return sfmt(wgt, "dv_buf", wgt.values.vbec, "%.2f", "--")
+            end
             if use_total_voltage_display(wgt) then return wgt.values.vbat_formatted() end
             return wgt.values.vcel_formatted()
         end,
@@ -392,7 +418,7 @@ function M.createValues(wgt)
             return get_display_voltage_threshold(wgt, get_cell_alarm_threshold(wgt))
         end,
         display_voltage_actual_color = function()
-            if wgt.power_lost then return COLOR_THEME_PRIMARY1 end   -- "--" shown neutral
+            if wgt.power_lost then return COLOR_THEME_WARNING end   -- buffer readout in warn red
             if use_total_voltage_display(wgt) then return get_display_voltage_color_for_value(wgt, wgt.values.vbat) end
             return get_display_voltage_color_for_value(wgt, wgt.values.vcel)
         end,
@@ -427,6 +453,11 @@ function M.createValues(wgt)
         batt_check_progress = 0,
         capa_formatted = function() return sfmt(wgt, "capa", wgt.values.capa, "%.0f") end,
         capa_percent_formatted = function() return sfmt(wgt, "capa_percent", wgt.values.capa_percent, "%.0f%%") end,
+        -- session extrema (EdgeTX Capa+ / Bat%-), used by the stats-page footer
+        capa_max = nil,
+        capa_percent_min = nil,
+        capa_max_formatted = function() return sfmt(wgt, "capa_max", wgt.values.capa_max, "%.0f") end,
+        capa_percent_min_formatted = function() return sfmt(wgt, "capa_percent_min", wgt.values.capa_percent_min, "%.0f%%") end,
         -- effective fill level for the gauge: startup-check progress while checking,
         -- else the reserve-adjusted fuel %, clamped to 0..100 (ePowerbar)
         gauge_fill_percent = function()
@@ -503,11 +534,17 @@ function M.createValues(wgt)
             if not (wgt.rf and wgt.rf.available) then return true end
             return wgt.values.arm_disable_flags_list() ~= nil
         end,
+        -- statusbar centre: with no FC connected "Disarmed" was misleading (the craft
+        -- state is simply unknown) and disconnected was only recognisable indirectly
+        -- (empty values, the 2 Hz throttle looking "frozen") -> say it explicitly,
+        -- muted (DISABLED = the dim slot, same as the status line's "No telemetry")
         arm_state_text = function()
+            if wgt.values.rf_connection_state == "disconnected" then return "No FC connected" end
             return wgt.values.rf_connection_state == "armed" and wgt.values.label_armed or wgt.values.label_disarmed
         end,
         arm_state_color = function()
-            return wgt.values.rf_connection_state == "armed" and DARKGREEN or COLOR_THEME_WARNING
+            if wgt.values.rf_connection_state == "disconnected" then return COLOR_THEME_DISABLED end
+            return wgt.values.rf_connection_state == "armed" and st_armed or st_disarmed
         end,
         arm_flags_text_formatted = function()
             if not (wgt.rf and wgt.rf.available) then return "RFTools widget missing" end
@@ -525,7 +562,7 @@ function M.createValues(wgt)
             return wgt.values.label_disconnected
         end,
         rf_connection_state_color = function()
-            if wgt.values.rf_connection_state == "armed" then return DARKGREEN end
+            if wgt.values.rf_connection_state == "armed" then return st_armed end
             if wgt.values.rf_connection_state == "disconnected" then return COLOR_THEME_WARNING end
             return COLOR_THEME_PRIMARY1
         end,
@@ -563,13 +600,10 @@ function M.createValues(wgt)
             if p == nil then return 0 end
             return math.max(0, math.min(100, p)) / 100
         end,
+        -- module-locals (set per scheme in set_palette), NOT a wgt.fmt_cache memo — a cached
+        -- lcd.RGB would go stale on a palette/override change
         vtx_fill_color = function()
-            local c = wgt.fmt_cache; if c == nil then c = {}; wgt.fmt_cache = c end
-            if c.vtx_col_lo == nil then
-                c.vtx_col_lo = lcd.RGB(0xff, 0x33, 0x33)
-                c.vtx_col_hi = lcd.RGB(0x30, 0xc0, 0x30)
-            end
-            return wgt.values.vtx_low and c.vtx_col_lo or c.vtx_col_hi
+            return wgt.values.vtx_low and vtx_col_lo or vtx_col_hi
         end,
 
         -- date / time for the top bar (getDateTime is always available)
@@ -644,8 +678,10 @@ function M.createValues(wgt)
             return sfmt(wgt, "rf_prof_compact", p, "%d")
         end,
         battery_usage_summary_formatted = function()
-            local used_value = wgt.values.capa_formatted()            -- memoized
-            local percent_value = wgt.values.capa_percent_formatted() -- memoized
+            -- stats page = session summary: use EdgeTX' tracked max mAh used and the
+            -- lowest fuel % reached, not the live values (which read 0 after link loss)
+            local used_value = wgt.values.capa_max_formatted()            -- memoized
+            local percent_value = wgt.values.capa_percent_min_formatted() -- memoized
             if used_value == "-" and percent_value == "-" then return "-" end
             if used_value == "-" then return percent_value end
             if percent_value == "-" then return used_value end

@@ -1,8 +1,12 @@
 -- =====================================================================================
 -- UltiDash file debug logger.
 -- =====================================================================================
--- Optional diagnostics: writes /WIDGETS/UltiDash/debug.log on the SD card so a runtime
--- problem can be inspected afterwards (read it from the PC at E:\WIDGETS\UltiDash\debug.log).
+-- Optional diagnostics: writes rotating session files to /WIDGETS/UltiDash/logs/ on the
+-- SD card so a runtime problem can be inspected afterwards (read them from the PC at
+-- E:\WIDGETS\UltiDash\logs\debug_NN.log). The logs/ subdir keeps the widget root tidy;
+-- it SHIPS with the widget (folder in the repo). On first enable the widget only
+-- detects it and moves old root-level debug files over; if it's missing, logging
+-- falls back to the widget root exactly as before.
 -- Driven by the per-model "Debug log" setting (DebugLog) — OFF by default. When off the
 -- cost is ~zero: every entry point early-returns on the ENABLED flag and nothing touches
 -- the SD or grows the heap.
@@ -21,8 +25,10 @@
 
 local M = {}
 
-local DIR          = "/WIDGETS/UltiDash/"
-local SEQ_PATH     = DIR .. "debug_seq.txt"   -- persisted round-robin session counter
+local ROOT         = "/WIDGETS/UltiDash/"
+local DIR          = ROOT                     -- resolved on first enable: logs/ subdir
+local SEQ_NAME     = "debug_seq.txt"
+local SEQ_PATH     = DIR .. SEQ_NAME          -- persisted round-robin session counter
 local MAX_SESSIONS = 20           -- keep this many session files (debug_01..debug_20.log)
 local FLUSH_CS     = 300          -- disarmed: append to SD at most every 3 s (centisec)
 local ARMED_FLUSH_CS = 1000       -- armed: slower cadence (10 s) — small append writes,
@@ -110,11 +116,46 @@ function M.flush(force, armed)
     end)
 end
 
+-- Resolve the log directory ONCE (first enable, so the off-by-default path costs
+-- nothing): the logs/ folder ships with the widget, so we just detect it (fstat) and
+-- move old root-level session files + the seq counter into it. Everything pcall'd;
+-- when the folder is missing we keep logging to the widget root exactly as before.
+local dir_resolved = false
+local function resolve_dir()
+    if dir_resolved then return end
+    dir_resolved = true
+    pcall(function()
+        if fstat(ROOT .. "logs") ~= nil then    -- ships with the widget; no mkdir
+            DIR = ROOT .. "logs/"
+            SEQ_PATH = DIR .. SEQ_NAME
+        end
+    end)
+    if DIR ~= ROOT then
+        pcall(function()                        -- one-time sweep, best-effort
+            -- COLLECT first, then rename (moving files out of ROOT while iterating
+            -- dir(ROOT) can make FatFS f_readdir skip entries)
+            local move = {}
+            for fname in dir(ROOT) do
+                if fname == SEQ_NAME or fname == "debug.log"
+                    or string.match(fname, "^debug_%d+%.log$") ~= nil then
+                    move[#move + 1] = fname
+                end
+            end
+            for i = 1, #move do
+                local fname = move[i]
+                if fstat(DIR .. fname) == nil then
+                    rename(ROOT .. fname, DIR .. fname)
+                end
+            end
+        end)
+    end
+end
+
 -- Round-robin session rotation: each enable picks the next slot debug_NN.log (1..N),
 -- so a new logging session no longer overwrites the previous one — the last
--- MAX_SESSIONS sessions are kept. A tiny persisted counter (debug_seq.txt) drives it;
--- no directory listing needed (EdgeTX widgets have none). The session header carries
--- the global sequence number + timestamp so the newest file is identifiable.
+-- MAX_SESSIONS sessions are kept. A tiny persisted counter (debug_seq.txt) drives it
+-- (cheaper than a directory scan). The session header carries the global sequence
+-- number + timestamp so the newest file is identifiable.
 local function read_seq()
     local n = 0
     pcall(function()
@@ -154,7 +195,8 @@ local function start_session()
     local t = getDateTime()
     local stamp = t and string.format("%04d-%02d-%02d %02d:%02d:%02d",
         t.year, t.mon, t.day, t.hour, t.min, t.sec) or "?"
-    M.log("INIT", string.format("session #%d  %s  (slot %d/%d)", seq, stamp, slot, MAX_SESSIONS))
+    M.log("INIT", string.format("session #%d  %s  (slot %d/%d, dir %s)",
+        seq, stamp, slot, MAX_SESSIONS, DIR))
     M.flush(true)
 end
 
@@ -168,7 +210,10 @@ function M.set_enabled(on, keep)
     on = on and true or false
     if on == ENABLED then return end
     ENABLED = on
-    if on then start_session() end
+    if on then
+        resolve_dir()
+        start_session()
+    end
 end
 
 function M.is_enabled() return ENABLED end

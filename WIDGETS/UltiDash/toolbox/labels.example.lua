@@ -23,6 +23,8 @@
 --  Aufbau:
 --    rows[ZeilenNr] = { [1] = "...", ... [6] = "..." }  -- Funktionsname je Pos
 --    sub = { "P","I","D","F","O","B" }                  -- optional: Spalten-Kuerzel
+--    ranges[ZeilenNr] = { [1] = "...", ... [6] = "..." }-- optional: Bereichs-Hinweise
+--                                                       --   des Editors (TbBert)
 --
 --  ZeilenNr:  1=Pitch  2=Roll  3=Yaw  4=Throttle  5=Trim 5  6=Trim 6
 --  Position:  1..6  entspricht den Spalten P / I / D / F / O / B
@@ -49,4 +51,12 @@ return {
     -- [6] = { "Yaw CW Gain",  "Yaw Col FF",   "Res Hover Col","",             "",             ""              },
 
   },
+
+  -- Bereichs-Hinweise des Editors (Option "Adj editor: ranges hint" / TbBert):
+  -- gleiche Struktur wie rows, nur Strings; "" blendet einen Hinweis aus.
+  -- Nicht gesetzte Zellen behalten die eingebauten Default-Hinweise.
+  -- ranges = {
+  --   [1] = { [1] = "90-150" },                -- Pitch / Pos 1
+  --   [5] = { [1] = "0-50" },                  -- eigener Hinweis fuer eine eigene Zelle
+  -- },
 }
