@@ -202,6 +202,7 @@ leaving the settings (autosave as usual).
 | **Fuel: coarse step (%)** | num | 10 | callout spacing above the dense zone |
 | **Fuel: dense below (%)** | num | 15 | below this level the fine step applies |
 | **Fuel: fine step (%)** | num | 5 | callout spacing in the dense zone |
+| **Fuel callout says** | choice | Percent | what the descending %-step callouts speak: **Percent** / **Battery V** (pack, PREC1) / **Cell V** (per-cell, PREC2) / **% + Battery V** / **% + Cell V** — the %-interval *triggering* is unchanged |
 | **Cell thresholds from** | choice | FC config | FC config (`mspBatteryConfig`) / Manual |
 | **Full cell (manual)** | num | 4.12 V | only used when *Manual* |
 | **Low cell (manual)** | num | 3.45 V | only used when *Manual* |
@@ -228,6 +229,14 @@ quiet up high, denser near the end. The defaults reproduce the historical cadenc
 interval*** (§2.6a) plays a double role: besides spacing the repeats it also sets the
 **minimum gap between two step callouts** — a fast-falling fuel level can't machine-gun
 the 1 %-steps closer together than that interval.
+
+**Fuel callout says** changes *what* those descending step callouts announce without
+touching *when* they fire: the remaining **percent** (default), the **battery/pack
+voltage** (PREC1), the **per-cell voltage** (PREC2), or the percent followed by one of the
+two. It reads the latched, collapse-filtered voltage and is independent of *Announce
+voltage as* (which scopes only the voltage alert and the startup cell check); a
+voltage-only choice with no plausible reading falls back to the percent (never silent).
+The critical (below-critical) nag is unaffected — it keeps speaking the percent.
 
 With **FC config** the thresholds come from the Rotorflight FC
 (`vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`), read on
@@ -804,7 +813,7 @@ The *vib* column shows the **default** — vibration is per-alert configurable n
 | # | Trigger | Condition | Output | Active key | Background |
 |---|----------|-----------|---------|--------|-----------|
 | 1 | **Startup cell-check** | after the delay, if cell < FC full-cell | `batlow` + voltage | `SndCellChk` | yes |
-| 2 | **Fuel callout** | connected + armed, by fuel level | `battry`/`batlow`/`batcrt` + % (+vib) | `SndFuel` | yes |
+| 2 | **Fuel callout** | connected + armed, by fuel level | `battry`/`batlow`/`batcrt` + % **or voltage** (step callouts follow *Fuel callout says*, §2.4) (+vib) | `SndFuel` | yes |
 | 3 | **Voltage alert** | connected + armed, cell ≤ FC warn/min | `batlow`/`batcrt` + voltage (+vib) | `SndVolt` | yes |
 | 4 | **Armed / disarm** | arm state change | `armed` / `disarm` | `SndArm` | yes |
 | 4a | **Gov state** (§2.7-gov) | armed, on a state change held ~0.3 s (opt-in master, per-state toggles) | `gs_*` (spoken state name) | `GovVoice` | yes |
@@ -828,6 +837,10 @@ Notes:
   critical" as the level moves), not just the critical level.
 - **Spoken voltage (rows 1 & 3)** follows *Battery → Announce voltage as* — total pack
   voltage (default) or per-cell voltage (§2.5); the latched, collapse-filtered value.
+- **Fuel step callouts (row 2)** speak the percent by default, but *Battery → Fuel callout
+  says* (§2.4) can switch them to the pack voltage, the per-cell voltage, or the percent
+  plus one of the two. The %-interval triggering is unchanged; the critical nag keeps the
+  percent.
 - **Escalation volume:** while any alert with *Escalation volume = on* is active, the
   GVAR master volume (§5.4) is raised to *Escalation volume (%)* — the repeats get
   louder; back to *Normal volume (%)* once cleared. The boost acts on the **repeats**:

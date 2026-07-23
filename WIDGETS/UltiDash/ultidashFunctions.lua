@@ -408,6 +408,31 @@ local function announce_voltage(wgt)
     if vbat then play_number(math.floor(vbat * 10 + 0.5), UNIT_VOLTS, PREC1) end
 end
 
+-- Speak the descending %-step fuel callout value per the FuelSay setting: the remaining
+-- percent (1, default), the battery/pack voltage (2, PREC1), the per-cell voltage (3, PREC2),
+-- or the percent followed by one of those two (4 = +battery, 5 = +cell). Independent of
+-- VoltVoice (which scopes only the voltage alert / cell check). Reads the LATCHED vbat/vcel so
+-- the collapse filtering applies to the voice too. Never goes silent: a voltage-only choice
+-- whose value isn't plausibly available falls back to the percent.
+local function play_fuel_value(wgt, capa)
+    local say = wgt.options.FuelSay or 1
+    local said = false
+    if say == 1 or say == 4 or say == 5 then
+        if capa and capa >= 0 then play_number(capa, UNIT_PERCENT); said = true end
+    end
+    if say == 2 or say == 4 then
+        local vbat = wgt.values.vbat
+        if vbat then play_number(math.floor(vbat * 10 + 0.5), UNIT_VOLTS, PREC1); said = true end
+    elseif say == 3 or say == 5 then
+        local v = wgt.values.vcel
+        if v and v > MIN_PLAUSIBLE_CELL_V then
+            play_number(math.floor(v * 100 + 0.5), UNIT_VOLTS, PREC2); said = true
+        end
+    end
+    -- voltage-only choice with no plausible reading -> don't stay silent, speak the percent
+    if not said and capa and capa >= 0 then play_number(capa, UNIT_PERCENT) end
+end
+
 -- Toolbox bank announcement: speak the active EnCh position (1..6) via the EdgeTX voice
 -- pack (honors master mute + the widget volume). Used by the adjustment tool pages.
 function ultidash_functions.tb_announce_pos(pos)
@@ -611,11 +636,25 @@ end
 -- value (incl. a cached nil). No per-tick table allocation (epoch-tagged entries). Shared
 -- by every update_*/alert reader so a pass does ONE lookup per sensor, not several -- ~35
 -- name lookups per pass once starved the Lua scheduler (fullscreen taps became a lottery).
+-- Negative-result hold while DISCONNECTED (centiseconds): with no craft every read
+-- returns nil, and re-probing an unresolvable NAME is the most expensive lookup kind
+-- (full source-table scan without a hit). Idle passes re-probe each nil name only
+-- every SRC_NEG_TTL instead of every pass — measurably lifts the idle UI Hz while
+-- menus/tools are used. The guard tests the LIVE connection state, so the instant
+-- RFTool reports anything but "disconnected" (onStateChanged) the hold is void and
+-- the next pass reads fresh — no pickup delay on connect, no effect while flying.
+local SRC_NEG_TTL = 300
+
 local function read_src(wgt, name)
     local now = getTime() or 0
     local c = wgt.src_cache
     if c == nil then c = { e = {}, v = {} }; wgt.src_cache = c end
-    if c.e[name] == now then return c.v[name] end
+    local e = c.e[name]
+    if e == now then return c.v[name] end
+    if e ~= nil and c.v[name] == nil and (now - e) < SRC_NEG_TTL
+        and wgt.values ~= nil and wgt.values.rf_connection_state == "disconnected" then
+        return nil
+    end
     c.e[name] = now
     -- app-id resolver: if the resolver (ultidash.lua) mapped this curated name to a VERIFIED
     -- telemetry index, read BY INDEX so a same-named native CRSF sensor (duplicate) or a user
@@ -2078,7 +2117,7 @@ local function crank_fuel_calls(wgt)
             -- after arming (callout_next_capa == 0)
             if wgt.callout_next_capa ~= 0 and fuel <= (wgt.options.FuelStart or 100) then
                 if fuel > critical + FUEL_VLOW then play_audio("battry") else play_audio("batlow") end
-                if capa >= 0 then play_number(capa, UNIT_PERCENT) end
+                play_fuel_value(wgt, capa)
             end
             wgt.callout_last_capa = capa
             wgt.callout_next_capa = now + interval

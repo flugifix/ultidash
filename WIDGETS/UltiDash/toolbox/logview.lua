@@ -47,6 +47,11 @@ local MAX_FILES      = 600       -- ring-capped: on overflow the OLDEST seen ent
                                  -- so the newest logs always survive the cap
 local DAY_CS         = 8640000   -- centiseconds per day
 local MIN_SPAN_CS    = 200       -- minimum zoom window: 2 s
+local BASE_MULT      = 4         -- base RAM cache resolution = nbuckets x BASE_MULT
+                                 -- (the whole session held once at this res; any
+                                 -- window coarser than it is served from RAM). Heap
+                                 -- scales with this: 4 curves x nbuckets*MULT x 2.
+local CACHE_MAX      = 4         -- unified cache entries: base + finer zoom levels
 local HUGE           = math.huge
 local EMPTY_PTS      = { { 0, 0 }, { 0, 0 } }  -- lvgl.line needs >= 2 pts
 local N_GRID         = 6         -- max vertical grid lines (round steps)
@@ -426,11 +431,12 @@ local function extract_on_line(lv, line, off)
     lv.cur_date = date
   end
   local t = lv.day * DAY_CS + tcs
-  if t < lv.win_t0 then return end
-  if t > lv.win_t1 then return false end   -- past the window -> stop pump
-  -- bucket index; float math on purpose (int32 would overflow on long spans)
-  local bi = math.floor(((t - lv.win_t0) / lv.win_span) * (lv.nbuckets - 1)) + 1
-  if bi < 1 then bi = 1 elseif bi > lv.nbuckets then bi = lv.nbuckets end
+  if t < lv.ext_t0 then return end
+  if t > (lv.extract_stop_t or (lv.ext_t0 + lv.ext_span)) then return false end  -- past edge
+  -- bucket index into the EXTRACTION window/resolution (may be the hi-res base);
+  -- float math on purpose (int32 would overflow on long spans)
+  local bi = math.floor(((t - lv.ext_t0) / lv.ext_span) * (lv.ext_nb - 1)) + 1
+  if bi < 1 then bi = 1 elseif bi > lv.ext_nb then bi = lv.ext_nb end
   -- captures arrive in want_cols order (ascending column index)
   if s1 ~= nil then extract_acc(lv, 1, bi, s1) end
   if s2 ~= nil then extract_acc(lv, 2, bi, s2) end
@@ -460,29 +466,106 @@ local function fmt_mmss(cs)
   return string.format("%d:%02d", math.floor(s / 60), s % 60)
 end
 
--- start a (re-)extraction of window [t0, t1]; actual work runs chunked in
--- loader_tick. Full-session windows use the cached full arrays when ready.
+-- ---------------------------------------------------------------------
+-- unified RAM window cache: the whole session held once at hi-res (base) plus a
+-- few finer zoom windows. Any request a cached entry CONTAINS at >= display
+-- resolution is served by re-bucketing in RAM (no SD read) — this is what makes
+-- zoom-out and coarse pan instant. Only a window finer than every cached entry
+-- reads the file, and that result is cached too.
+-- ---------------------------------------------------------------------
+-- allocate an empty cache entry (min = HUGE, max = -HUGE) for all curves at nb
+local function cache_alloc(lv, t0, t1, nb)
+  local e = { t0 = t0, t1 = t1, nb = nb,
+              span = (t1 - t0 > 0) and (t1 - t0) or 1, min = {}, max = {} }
+  for k = 1, #lv.curves do e.min[k] = {}; e.max[k] = {} end
+  return e
+end
+
+-- coarsest cached entry that fully contains [t0,t1] and is at least as fine as
+-- the display (bucket width <= display's), so re-bucketing never upsamples/loses
+-- peaks. "Coarsest that qualifies" = fewest source buckets to scan. nil if none.
+local function cache_find(lv, t0, t1)
+  local dbw = (t1 - t0) / (lv.nbuckets - 1)     -- display bucket width
+  if dbw <= 0 then dbw = 1 end
+  local best, bestbw
+  for i = 1, #lv.cache do
+    local e = lv.cache[i]
+    if e.t0 <= t0 and e.t1 >= t1 then
+      local ebw = e.span / (e.nb - 1)
+      if ebw <= dbw and (best == nil or ebw > bestbw) then best, bestbw = e, ebw end
+    end
+  end
+  return best
+end
+
+-- register an entry: the base (full session, base_nb) sits at slot 1 and is never
+-- evicted; finer windows ring at CACHE_MAX (drop the oldest finer one)
+local function cache_add(lv, e)
+  if e.nb == lv.base_nb then
+    lv.cache[1] = e
+  else
+    lv.cache[#lv.cache + 1] = e
+    while #lv.cache > CACHE_MAX do table.remove(lv.cache, 2) end
+  end
+end
+
+-- re-bucket one curve from a source cache entry into the display scratch
+-- (scr_min/scr_max at nbuckets over the current window). RAM only.
+local function rebucket_curve(lv, src, k)
+  local nb = lv.nbuckets
+  local dmn, dmx = lv.scr_min[k], lv.scr_max[k]
+  local smn, smx = src.min[k], src.max[k]
+  local wt0, wsp = lv.win_t0, lv.win_span
+  local snb, st0, ssp = src.nb, src.t0, src.span
+  for i = 1, nb do
+    local ta = wt0 + (i - 1) / (nb - 1) * wsp
+    local tb = wt0 + i       / (nb - 1) * wsp
+    local ja = math.floor((ta - st0) / ssp * (snb - 1)) + 1
+    local jb = math.floor((tb - st0) / ssp * (snb - 1)) + 1
+    if ja < 1 then ja = 1 end
+    if jb > snb then jb = snb end
+    if jb < ja then jb = ja end
+    local mn, mx = HUGE, -HUGE
+    for j = ja, jb do
+      local a, b = smn[j], smx[j]
+      if a < mn then mn = a end
+      if b > mx then mx = b end
+    end
+    dmn[i], dmx[i] = mn, mx
+  end
+end
+
+-- start a (re-)extraction of window [t0, t1]; work runs chunked in loader_tick.
+-- Served from the RAM cache when possible; otherwise the session base (hi-res) is
+-- built once, or a finer window is read and cached.
 local function begin_extract(lv, t0, t1)
   local s = lv.sessions[lv.session_i]
-  local full = (t0 <= s.t0 and t1 >= s.t1)
   lv.win_t0, lv.win_t1 = t0, t1
   lv.win_span = t1 - t0
   if lv.win_span < 1 then lv.win_span = 1 end
-  if full and lv.full_ready then
-    lv.tgt_min, lv.tgt_max = lv.full_min, lv.full_max   -- cache hit: pts only
-    lv.pts_k = 1
-    lv.load_phase = "pts"
+  lv.extract_stop_t = t1
+  lv.ext_entry = nil
+  local src = cache_find(lv, t0, t1)
+  if src ~= nil then                            -- RAM hit: re-bucket only
+    lv.rb_src, lv.rb_k = src, 1
+    lv.load_phase = "rebkt"
+    lv.progress = 0
     return
   end
-  if full then
-    lv.tgt_min, lv.tgt_max = lv.full_min, lv.full_max
-    lv.fill_full = true
-  else
-    lv.tgt_min, lv.tgt_max = lv.scr_min, lv.scr_max
-    lv.fill_full = false
-  end
-  lv.seek_to = index_before(lv, t0)
+  -- miss: full window -> build the hi-res base once; else a finer window at
+  -- display resolution. Extract straight into a fresh cache entry.
+  local full = (t0 <= s.t0 and t1 >= s.t1)
+  local e0, e1, nb
+  if full then e0, e1, nb = s.t0, s.t1, lv.base_nb
+  else         e0, e1, nb = t0, t1, lv.nbuckets end
+  local e = cache_alloc(lv, e0, e1, nb)
+  lv.ext_entry = e
+  lv.tgt_min, lv.tgt_max = e.min, e.max
+  lv.ext_t0, lv.ext_span, lv.ext_nb = e0, (e1 - e0 > 0) and (e1 - e0) or 1, nb
+  lv.extract_stop_t = e1
+  lv.seek_to = index_before(lv, e0)
   lv.prog_base = lv.seek_to.off
+  lv.reset_k = 1
   lv.load_phase = "reset"
   lv.progress = 0
 end
@@ -614,9 +697,10 @@ local function init_geometry(wgt, lv)
   local _, th = lcd.sizeText("Ag", (H >= 300) and MIDSIZE or SMLSIZE)
   local _, sh = lcd.sizeText("Ag", SMLSIZE)
   lv.head_h  = th + 8
-  -- 3 rows live below the chart: grid time labels, the readout row, the
-  -- window/cursor line (2 rows overflowed the bottom edge on the TX15)
-  lv.foot_h  = sh * 3 + 12
+  -- 2 rows live below the chart: grid time labels + the window/cursor line
+  -- (the cursor readouts moved into the in-chart legend box, 2026-07-22 —
+  -- frees one row, the chart gets taller)
+  lv.foot_h  = sh * 2 + 10
   lv.chart_x = 8
   lv.chart_y = lv.head_h + 4
   lv.chart_w = W - 16
@@ -626,6 +710,7 @@ local function init_geometry(wgt, lv)
   -- reads fine at this resolution
   lv.px_per_bucket = 4
   lv.nbuckets = math.floor(lv.chart_w / lv.px_per_bucket)
+  lv.base_nb = lv.nbuckets * BASE_MULT          -- hi-res full-session base cache
   -- curve colors from the host palette (tb_pal.dark: host toolbox_palette)
   local P = wgt.tb_pal
   lv.colors = (P ~= nil and P.dark) and CURVE_COLORS_DARK or CURVE_COLORS_LIGHT
@@ -638,18 +723,16 @@ local function apply_curves(wgt, lv, curves, name)
   lv.curves = curves
   lv.tpl_name = name
   prepare_wanted(lv)
-  lv.full_min, lv.full_max = {}, {}
   lv.scr_min, lv.scr_max = {}, {}
   lv.pts_cache, lv.win_lo, lv.win_hi = {}, {}, {}
   lv.curve_empty, lv.readout = {}, {}
   lv.grid_pts, lv.grid_lbl, lv.grid_lx, lv.grid_on = {}, {}, {}, {}
   for k = 1, #curves do
-    lv.full_min[k], lv.full_max[k] = {}, {}
     lv.scr_min[k], lv.scr_max[k] = {}, {}
     lv.pts_cache[k] = EMPTY_PTS
     lv.curve_empty[k] = true
   end
-  lv.full_ready = false
+  lv.cache, lv.ext_entry = {}, nil              -- unified RAM window cache (reset)
 end
 
 -- pick a template (explicit index or auto: last used, else first matching)
@@ -762,15 +845,13 @@ local function loader_tick(wgt, lv)
       return
     end
   elseif ph == "reset" then
-    -- all curves in ONE tick (4 x ~200 buckets x 2 assignments ~ 3k instr)
-    for k = 1, #lv.curves do
-      local bmin, bmax = lv.tgt_min[k], lv.tgt_max[k]
-      for i = 1, lv.nbuckets do
-        bmin[i] = HUGE
-        bmax[i] = -HUGE
-      end
-    end
-    lv.load_phase = "seek"
+    -- clear the extraction target one curve per tick (the hi-res base is
+    -- BASE_MULT x the display bucket count, too heavy to clear all-in-one)
+    local k = lv.reset_k or 1
+    local bmin, bmax = lv.tgt_min[k], lv.tgt_max[k]
+    for i = 1, lv.ext_nb do bmin[i] = HUGE; bmax[i] = -HUGE end
+    if k >= #lv.curves then lv.reset_k = nil; lv.load_phase = "seek"
+    else lv.reset_k = k + 1 end
   elseif ph == "seek" then
     local e = lv.seek_to
     io.seek(lv.fh, e.off)
@@ -785,9 +866,25 @@ local function loader_tick(wgt, lv)
                                / (lv.fsize - lv.prog_base))
     end
     if r == "eof" or r == "stop" then
-      if lv.fill_full then lv.full_ready = true end
+      if lv.ext_entry ~= nil then               -- extracted into a cache entry
+        cache_add(lv, lv.ext_entry)             -- keep for future RAM reuse
+        lv.rb_src, lv.rb_k, lv.ext_entry = lv.ext_entry, 1, nil
+        lv.load_phase = "rebkt"                 -- entry -> display buckets
+      else                                      -- pan filled scr directly
+        lv.pts_k = 1
+        lv.load_phase = "pts"
+      end
+    end
+  elseif ph == "rebkt" then
+    -- re-bucket the source entry into the display scratch, one curve per tick
+    local k = lv.rb_k
+    if k > #lv.curves then
+      lv.tgt_min, lv.tgt_max = lv.scr_min, lv.scr_max
       lv.pts_k = 1
       lv.load_phase = "pts"
+    else
+      rebucket_curve(lv, lv.rb_src, k)
+      lv.rb_k = k + 1
     end
   elseif ph == "pts" then
     local k = lv.pts_k
@@ -1034,6 +1131,61 @@ local function zoom_reset(wgt, lv)
   begin_extract(lv, s.t0, s.t1)
 end
 
+-- Pan by ~half a screen while REUSING the overlapping scratch buckets: shift the
+-- scr_min/scr_max arrays by a whole-bucket count (so old bucket i+nsh maps exactly
+-- onto new bucket i) and re-extract ONLY the newly exposed edge from the SD file —
+-- a fraction of a full window read. Returns false (caller re-extracts normally)
+-- when there is no usable overlap: at the session edge or degenerate geometry.
+local function begin_pan(lv, dir)
+  local s   = lv.sessions[lv.session_i]
+  local span = lv.win_span
+  local nb  = lv.nbuckets
+  local bw  = span / (nb - 1)                 -- time per bucket (float, cs)
+  if bw <= 0 or nb < 4 then return false end
+  local half = math.floor((nb - 1) / 2)       -- shift ~half the screen
+  local avail = (dir > 0) and math.floor((s.t1 - lv.win_t1) / bw)
+                          or  math.floor((lv.win_t0 - s.t0) / bw)
+  local nsh = (half < avail) and half or avail
+  if nsh < 1 or nsh >= nb then return false end   -- at edge / no overlap
+
+  local new_t0 = lv.win_t0 + dir * math.floor(nsh * bw + 0.5)
+  if new_t0 < s.t0 then new_t0 = s.t0 end
+  local new_t1 = new_t0 + span
+  if new_t1 > s.t1 then new_t1 = s.t1; new_t0 = new_t1 - span end
+
+  -- shift the scratch buckets in place; clear only the exposed edge buckets
+  for k = 1, #lv.curves do
+    local mn, mx = lv.scr_min[k], lv.scr_max[k]
+    if dir > 0 then
+      for i = 1, nb - nsh do mn[i] = mn[i + nsh]; mx[i] = mx[i + nsh] end
+      for i = nb - nsh + 1, nb do mn[i] = HUGE; mx[i] = -HUGE end
+    else
+      for i = nb, nsh + 1, -1 do mn[i] = mn[i - nsh]; mx[i] = mx[i - nsh] end
+      for i = 1, nsh do mn[i] = HUGE; mx[i] = -HUGE end
+    end
+  end
+
+  lv.win_t0, lv.win_t1, lv.win_span = new_t0, new_t1, span
+  lv.tgt_min, lv.tgt_max = lv.scr_min, lv.scr_max
+  -- pan extracts into the display scratch at the display window/res; no entry ->
+  -- the extract-complete step goes straight to pts (not the cache/rebucket path)
+  lv.ext_t0, lv.ext_span, lv.ext_nb, lv.ext_entry = new_t0, span, nb, nil
+  local seek_t, stop_t
+  if dir > 0 then                              -- exposed edge = right side
+    seek_t = new_t0 + (nb - nsh - 1) * bw      -- one bucket before the seam
+    stop_t = new_t1
+  else                                         -- exposed edge = left side
+    seek_t = new_t0
+    stop_t = new_t0 + (nsh + 1) * bw           -- one bucket into the reused region
+  end
+  lv.extract_stop_t = math.floor(stop_t)
+  lv.seek_to  = index_before(lv, math.floor(seek_t))
+  lv.prog_base = lv.seek_to.off
+  lv.load_phase = "seek"                        -- partial reset already done inline
+  lv.progress = 0
+  return true
+end
+
 local function pan_step(wgt, lv, dir)
   if lv.load_phase ~= nil then return end
   local s = lv.sessions[lv.session_i]
@@ -1042,11 +1194,10 @@ local function pan_step(wgt, lv, dir)
   local n0 = lv.win_t0 + math.floor(span / 2) * dir
   if n0 < s.t0 then n0 = s.t0 end
   local n1 = n0 + span
-  if n1 > s.t1 then
-    n1 = s.t1
-    n0 = n1 - span
-  end
-  begin_extract(lv, n0, n1)
+  if n1 > s.t1 then n1 = s.t1; n0 = n1 - span end
+  if cache_find(lv, n0, n1) ~= nil then begin_extract(lv, n0, n1); return end  -- RAM hit
+  if begin_pan(lv, dir) then return end        -- finer than base: reuse + edge re-extract
+  begin_extract(lv, n0, n1)                    -- last resort: full re-extract
 end
 
 local function chart_tap(wgt, lv, ts)
@@ -1423,7 +1574,7 @@ local function build_sessions(wgt, zone, lv, P)
     end,
     function(wgt2, lv2, i)
       lv2.session_i = i
-      lv2.full_ready = false
+      lv2.cache = {}
       lv2.cursor_t = nil
       if lv2.curves ~= nil and #lv2.curves > 0 then
         -- mid-view session switch (chart header): curves already chosen
@@ -1537,7 +1688,7 @@ local function build_templates(wgt, zone, lv, P)
                 return
               end
               if not setup_template(wgt2, lv2, ti) then return end
-              lv2.full_ready = false
+              lv2.cache = {}
               lv2.cursor_t = nil
               local s = lv2.sessions[lv2.session_i]
               lv2.mode = "load"
@@ -1646,7 +1797,7 @@ local function build_sensors(wgt, zone, lv, P)
       local curves = custom_curves(lv2)
       if #curves == 0 then return end
       apply_curves(wgt2, lv2, curves, CUSTOM_NAME)
-      lv2.full_ready = false
+      lv2.cache = {}
       lv2.cursor_t = nil
       local s = lv2.sessions[lv2.session_i]
       lv2.mode = "load"
@@ -1939,22 +2090,57 @@ local function build_chart(wgt, zone, lv, P)
       return w, 4
     end }
 
-  -- footer: readout row + pan buttons + window range + busy progress
-  local fy = cy + ch + sh + 4
-  local colw = math.floor((W - 2 * zb - 24) / MAX_CURVES)
+  -- in-chart legend box: curve name + cursor value, one line per curve, in
+  -- curve color. FOLLOWS THE CURSOR via reactive pos= (pcallUpdate2Int — the
+  -- same protected two-int path as the cursor rect; on LABELS it is
+  -- unverified -- VERIFY on hardware). Flips to whichever side of the cursor
+  -- has room. Semi-transparent fill (opacity, HW-proven on the TX-battery
+  -- pill) lets the curves show through; drawn after curves + cursor.
+  local lw = 0
+  for k = 1, #lv.curves do
+    local c = lv.curves[k]
+    local w1 = lcd.sizeText(c.name .. " 99999.9" .. c.unit, SMLSIZE)
+    if w1 > lw then lw = w1 end
+  end
+  lw = lw + 12
+  local lh = #lv.curves * sh + 6
+  local ly0 = cy + 8
+  local function legend_x()
+    local cur = lv.cursor_x or cx
+    local x
+    if cur < cx + cw / 2 then x = cur + 12       -- cursor left -> box right
+    else x = cur - 12 - lw end                    -- cursor right -> box left
+    if x < cx + 2 then x = cx + 2 end
+    if x + lw > cx + cw - 2 then x = cx + cw - 2 - lw end
+    return x
+  end
+  local lx0 = legend_x()
+  layout[#layout + 1] = { type = "rectangle", filled = true,
+    x = lx0, y = ly0, w = lw, h = lh, color = P.bg, opacity = 170,
+    rounded = 4,
+    pos = function() return legend_x(), ly0 end }
+  layout[#layout + 1] = { type = "rectangle", x = lx0, y = ly0, w = lw, h = lh,
+    thickness = 1, rounded = 4, color = P.line,
+    pos = function() return legend_x(), ly0 end }
   for k = 1, #lv.curves do
     local kk = k
-    layout[#layout + 1] = { type = "label", x = zb + 12 + (k - 1) * colw,
-      y = fy, w = colw - 4, h = sh, font = SMLSIZE, color = lv.colors[kk],
-      text = function() return lv.readout[kk] or "" end }
+    local lyk = ly0 + 3 + (k - 1) * sh
+    layout[#layout + 1] = { type = "label", x = lx0 + 6, y = lyk,
+      w = lw - 10, h = sh, font = SMLSIZE, color = lv.colors[kk],
+      text = function() return lv.readout[kk] or "" end,
+      pos = function() return legend_x() + 6, lyk end }
   end
+
+  -- footer: pan buttons flanking the window range / cursor line
+  local fy = cy + ch + sh + 4
   -- ASCII "<"/">" — the ◀▶ glyphs are missing from the EdgeTX fonts
   -- (HW-verified 2026-07-08: buttons rendered empty)
   button(lv, layout, P, 4, fy - 2, zb, sh + 6, "<", SMLSIZE,
     function(wgt2, lv2) pan_step(wgt2, lv2, -1) end, busy)
   button(lv, layout, P, W - zb - 4, fy - 2, zb, sh + 6, ">", SMLSIZE,
     function(wgt2, lv2) pan_step(wgt2, lv2, 1) end, busy)
-  layout[#layout + 1] = { type = "label", x = 0, y = fy + sh + 2, w = W,
+  layout[#layout + 1] = { type = "label", x = zb + 8, y = fy,
+    w = W - 2 * zb - 16,
     h = sh, font = SMLSIZE, align = CENTER, color = P.textDim,
     text = function()
       local s = lv.sessions[lv.session_i]

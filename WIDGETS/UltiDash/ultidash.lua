@@ -3751,6 +3751,12 @@ local SETTINGS_BATTERY = {
     { key = "FuelStep",     lbl = "Fuel: coarse step (%)",  kind = "num", def = 10, min = 1, max = 50, step = 1, big = 5, fmt = fmt_pctval },
     { key = "FuelDense",    lbl = "Fuel: dense below (%)",   kind = "num", def = 15, min = 0, max = 100, step = 5, big = 10, fmt = fmt_pctval },
     { key = "FuelStepFine", lbl = "Fuel: fine step (%)",    kind = "num", def = 5,  min = 1, max = 50, step = 1, big = 5, fmt = fmt_pctval },
+    -- What the descending %-step callouts SPEAK (the %-interval triggering is unchanged):
+    -- the remaining percent (default), the battery/pack voltage, the per-cell voltage, or the
+    -- percent followed by one of the two. Independent of "Announce voltage as" (VoltVoice),
+    -- which scopes only the voltage alert / startup cell check.
+    { key = "FuelSay",      lbl = "Fuel callout says",      kind = "choice", def = 1,
+                            vals = { "Percent", "Battery V", "Cell V", "% + Battery V", "% + Cell V" } },
     { kind = "section", lbl = "Cell thresholds" },
     { key = "CellSource",   lbl = "Cell thresholds from",   kind = "choice", def = 1, vals = { "FC config", "Manual" } },
     { key = "CellFull",     lbl = "Full cell (manual)",     kind = "num", def = 412, min = 300, max = 480, step = 1, big = 10, fmt = fmt_centivolt, dim = function(w) return w.CellSource ~= 2 end },

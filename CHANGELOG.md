@@ -2,6 +2,31 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.6.1 — 2026-07-23
+
+Maintenance release on top of v0.6.0: one small battery-callout option plus Log Viewer
+performance and a smoother disconnected idle. Existing behaviour is unchanged by default.
+
+### Added
+
+- **Fuel callout can speak voltage.** A new *Settings ▸ Battery ▸ Fuel callout says* choice
+  (**Percent** / **Battery V** / **Cell V** / **% + Battery V** / **% + Cell V**) picks what
+  the descending %-step callouts announce. The %-interval triggering is unchanged — only the
+  spoken value changes; it reads the latched, collapse-filtered voltage, is independent of
+  *Announce voltage as*, and falls back to the percent when a requested voltage isn't
+  available (never silent). The critical nag keeps speaking the percent. Default *Percent*
+  = unchanged behaviour.
+
+### Changed
+- **Faster Log Viewer pan/zoom.** Panning now shifts the existing scratch buckets and only
+  re-reads the newly exposed edge, and a unified RAM window cache (a hi-res base plus finer
+  zoom levels) backs the view, so zooming and panning stay fluid even on large logs.
+- **Cursor readouts follow the chart.** The Log Viewer's value readouts moved into a
+  compact legend that tracks the chart line instead of sitting in a fixed corner.
+- **Snappier idle UI while disconnected.** `read_src` holds a nil telemetry result for 3 s
+  instead of re-hitting the source every cycle, keeping the dashboard responsive when no
+  flight controller is connected.
+
 ## v0.6.0 — 2026-07-19
 
 Maintenance + feature release on top of v0.5.1. **Experimental — still shaking out in the

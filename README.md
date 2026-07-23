@@ -2,7 +2,7 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.6.0 (2026-07-19) — experimental`
+`Status: v0.6.1 (2026-07-23) — experimental`
 
 > 🚀 **New to UltiDash?** See it first in the **[Illustrated Walkthrough](docs/WALKTHROUGH.md)**,
 > then get it running with the **[Quick Start guide](docs/QUICKSTART.md)** — the shortest path
@@ -112,8 +112,10 @@ here, I will of course respect that.
   and edit everything with real toggle switches, dropdowns and +/− steppers, grouped into
   named pages. Settings are **saved per EdgeTX model slot** on the SD card — shared by every
   Rotorflight craft flown on that slot, with an optional *per craft* split (see below).
-- **Voice & vibration callouts, configurable per alert** — fuel %, cell/pack voltage
-  (announce as cell **or** pack, independent of the display), armed/disarm, ELRS
+- **Voice & vibration callouts, configurable per alert** — fuel % (or the pack / cell
+  voltage — the descending %-step callouts can speak voltage instead of, or alongside, the
+  percent), cell/pack voltage (announce as cell **or** pack, independent of the display),
+  armed/disarm, ELRS
   link-quality, RSSI/signal, telemetry-lost, main-power-loss, **BEC-drop**, **ESC-load**,
   **ESC/MCU over-temperature** and skipped-packet warnings, plus optional **switch
   announcements** (motor / rescue / governor / profile) and **governor-state callouts**
@@ -230,7 +232,7 @@ The **Settings** submenu — a 3-column grid in four themed sections:
 | *Appearance* | **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, TPWR bar max, detail-page behaviour, quiet bars |
 | | **Colors** | **per-scheme color overrides**: one page per scheme — palette slots, traffic-light status colors, UI chrome and the battery-bar / TX-battery fills, each with a native color picker + per-color *Def* reset |
 | | **Telemetry** | submenu: **Tele Main** — the 5 right-hand dashboard value slots (curated sensors, *Voltage (auto)*, *ESC Load (calc)* — or **any raw sensor** via the native picker); **Tele Details** — the 12 sensor slots of the Telemetry detail page (same hybrid pickers) |
-| *Battery & limits* | **Battery** | reserve %, fuel-callout density, cell-threshold source (FC config / manual cell voltages), startup cell-check delay, **current sensor**, **announce voltage as cell/pack** |
+| *Battery & limits* | **Battery** | reserve %, fuel-callout density, **fuel callout value (percent / pack / cell voltage)**, cell-threshold source (FC config / manual cell voltages), startup cell-check delay, **current sensor**, **announce voltage as cell/pack** |
 | | **Thresholds** | link (RQly) warn/crit, RSSI warn/crit/hold, skipped-packet limit, power-warn voltage, BEC warn/crit, **ESC/MCU temperature warn/crit** |
 | | **ESC load** | the ESC continuous-current load monitor: master switch, limit GVAR, warn/critical %, alarm hold time, load-bar placement (Current row / vertical in the battery gauge) |
 | *Sound & callouts* | **Volume** | fixed callout volume + when it applies, the optional **master-volume bridge via GVAR** with normal / escalation percentages, and a **Test/Play** preview row |
