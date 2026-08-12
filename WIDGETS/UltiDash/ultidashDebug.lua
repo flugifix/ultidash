@@ -197,6 +197,14 @@ local function start_session()
         t.year, t.mon, t.day, t.hour, t.min, t.sec) or "?"
     M.log("INIT", string.format("session #%d  %s  (slot %d/%d, dir %s)",
         seq, stamp, slot, MAX_SESSIONS, DIR))
+    -- Which radio wrote this file: screen size + firmware. With a TX16S (800x480) and a
+    -- TX15 (480x320) in use, a log without this is ambiguous — and layout bugs are almost
+    -- always resolution bugs. getVersion(): version, radio name, maj/minor/rev, osname.
+    local ok, ver, radio, maj, minor, rev, osname = pcall(getVersion)
+    M.log("INIT", string.format("lcd=%sx%s  radio=%s  fw=%s %s",
+        tostring(LCD_W), tostring(LCD_H),
+        ok and tostring(radio) or "?",
+        ok and tostring(osname or "EdgeTX") or "?", ok and tostring(ver) or "?"))
     M.flush(true)
 end
 

@@ -1,7 +1,7 @@
 --[[
 #########################################################################
 #                                                                       #
-#  UltiDash v0.6.1 - Rotorflight LVGL dashboard widget for EdgeTX       #
+#  UltiDash v0.7.0 - Rotorflight LVGL dashboard widget for EdgeTX       #
 #  Tested on RadioMaster TX15 and TX16S MK3 (EdgeTX 2.12).              #
 #  Runs in principle on the TX16S MK2 (480x272) too, but that radio is  #
 #  not actively tested and its aspect ratio is less ideal for the UI.   #
@@ -60,7 +60,12 @@
 ]]
 
 local app_name = "UltiDash"
-local app_ver = "0.6.1"
+-- The TARGET release of the branch being worked on, set once when that branch opens -- not
+-- per WIP commit, and not left at the last release either: since menu -> Status shows this,
+-- leaving it behind would make every development build claim to be the previous version.
+-- Shown as "0.7.0" plus the card's short commit on a dev build; see version_text() in
+-- ultidash.lua.
+local app_ver = "0.7.0"
 local widg_dir = "/WIDGETS/UltiDash/"
 
 local ultidash = nil
@@ -69,7 +74,13 @@ local ultidash_options = loadScript(widg_dir .. "ultidashOptions.lua", "btd")()
 local widget_options = ultidash_options.options
 
 local function get_ulti_dash()
-    ultidash = ultidash or assert(loadScript(widg_dir .. "ultidash.lua", "btd"))()
+    if ultidash == nil then
+        ultidash = assert(loadScript(widg_dir .. "ultidash.lua", "btd"))()
+        -- this file is the ONE place the version lives (bumped at release); hand it over
+        -- so menu -> Status can show which build the card carries. A dev build's commit
+        -- comes from a card-side build.lua, see version_text() there.
+        ultidash.set_version(app_ver)
+    end
     return ultidash
 end
 

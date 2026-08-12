@@ -22,7 +22,9 @@ writes flight data here:
                    id       unique id, any string (1, 2, ... or an id
                             from an external system, e.g. 96dded9b2f4b43f0)
                    name     display name shown on the radio
-                   cap      capacity in mAh (display only)
+                   cap      capacity in mAh. Shown on the query page - and
+                            with "Battery sets FC profile" on it is what
+                            picks the FC profile (see profile= below)
                    models   comma list of model names this battery is
                             offered for (the FC-set model name, case-
                             insensitive); '*' or empty = all models

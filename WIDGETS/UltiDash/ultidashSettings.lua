@@ -2,19 +2,37 @@
 --
 -- EdgeTX gives widgets NO API to write their own options, so values edited via the
 -- in-widget settings page live in a file and OVERLAY the EdgeTX options at runtime
--- (file wins for every key it contains; `ViewMode` stays EdgeTX-only because it
--- identifies the placed instance).
+-- (file wins for every key it contains).
 --
--- FILE KEYING: the default store is keyed by the model SLOT (model.getInfo().filename,
--- e.g. "model23" — stable forever), NOT by the model name: Rotorflight's "set model
--- name on TX" renames the EdgeTX model to the connected craft's name at runtime,
--- which used to spawn one cfg file per craft unintentionally. The `CfgPerCraft`
--- setting (stored in the slot file itself) opts back into name-keyed files — then
--- each craft flown from this slot keeps its own configuration; the slot file holds
--- the mode flag plus a fallback copy for crafts without their own file yet.
+-- FILE KEYING: the store is keyed by the EdgeTX MODEL NAME (model.getInfo().name,
+-- sanitized), LATCHED when the active model changes. It is NOT keyed by the model
+-- file (model.getInfo().filename, "model7.yml"): EdgeTX hands out MODELS/modelN.yml
+-- by LOWEST FREE index (createModel -> findNextFileIndex), so rewriting the model
+-- list — Companion does exactly that when models are added or deleted — renumbers the
+-- surviving models and orphans every cfg file at once. The name survives that.
 --
--- Files: /WIDGETS/UltiDash/cfg/cfg_m_<slot>.cfg (per model slot, default)
---        /WIDGETS/UltiDash/cfg/cfg_m_<slot>_<craft>.cfg (per craft, optional)
+-- What the name does not survive on its own is Rotorflight's "set model name on TX",
+-- which renames the EdgeTX model to the connected craft. That rename is TEMPORARY —
+-- RF2's SCRIPTS/RF2/background_init.lua remembers the previous name and restores it on
+-- disconnect — so the stored name is the stable one and the LATCH covers the single
+-- case that is not: the widget (re)loading WHILE a craft is connected. filename is
+-- still read, but only to notice that the active model changed.
+--
+-- Two models with the SAME name deliberately share one file. There is no stable
+-- per-model identifier in EdgeTX (no UUID), so uniqueness is the user's: a copied
+-- model needs its own name when it needs its own configuration.
+--
+-- ONE FILE PER MODEL, no second level. The `CfgPerCraft` option ("Config file per
+-- craft", cfg_m_<model>_<craft>.cfg) was REMOVED in 0.7.0: its <craft> half was the
+-- UNLATCHED model name, so it only ever split anything while Rotorflight was actively
+-- renaming the model — with "set model name on TX" off, both halves of the file name
+-- were identical and the option did nothing at all. Upgrading loses nothing: per-craft
+-- mode always wrote the model file too, with the same content, so the last saved
+-- configuration is in it. Old cfg_m_*_*.cfg files are left on the card, unread; the
+-- CfgPerCraft key is swept out of the model file by save()'s unknown-key rule.
+--
+-- Files: /WIDGETS/UltiDash/cfg/cfg_m_<model>.cfg (the store)
+--        cfg_m_<model file>.cfg (pre-0.7.0 slot scheme, adopted once)
 --        cfg_<model name>.cfg (pre-slot legacy scheme, adopted once)
 -- Plain "key=value" lines (values are integers, or strings e.g. sensor names).
 -- The cfg/ SUBDIR keeps the widget root tidy. It SHIPS with the widget (the repo
@@ -32,12 +50,22 @@
 
 local M = {}
 
+-- Set by the host once skin discovery has finished, true when any discovered skin failed
+-- to load. While it is true M.save skips the unknown-key sweep -- see the comment there.
+M.sweep_hold = false
+
+-- The skin ids found on this card, comma-separated, also set by the host once discovery
+-- has finished. nil = nobody reported (an older host, or a harness), and the sweep then
+-- behaves exactly as it did before. M.save stores it in the file and holds the sweep when
+-- a skin the file was written with is not on the card -- see the comment there.
+M.skin_roster = nil
+
 local cache = nil
 local cache_loaded = false
-local per_craft = false        -- CfgPerCraft flag (from the slot file)
-local loaded_slot_path = nil   -- which slot file the cache came from (model-switch reload check)
-local loaded_craft_path = nil  -- which craft file the cache came from (reload check)
+local loaded_model_path = nil  -- which model file the cache came from (model-switch reload check)
 local defaults = {}
+local migrators = nil          -- skin-supplied M.migrate functions, nil while none registered
+local sealed = false           -- true once every skin has been offered the chance to register
 
 -- Schema version stamped into every file we write (key ClrSchemeV). Bumps here trigger a
 -- one-time in-place migration of older cfg files (see migrate_schema). A file that already
@@ -45,7 +73,7 @@ local defaults = {}
 local SCHEMA_VER = 1
 
 -- Defaults are handed in by ultidash.lua (derived from the settings-page group
--- tables — the single source of truth; the EdgeTX option list only has ViewMode).
+-- tables — the single source of truth; the EdgeTX option list is empty).
 function M.set_defaults(t)
     defaults = t or {}
 end
@@ -68,6 +96,48 @@ local function migrate_schema(t)
     return true   -- always persist, to stamp the version even when ColorScheme was absent
 end
 
+-- A skin's optional M.migrate, handed over by the host while it discovers the skins
+-- (docs/SKINS.md §7c). Appended in discovery order; no skin may depend on another's.
+function M.add_migrator(fn)
+    migrators = migrators or {}
+    migrators[#migrators + 1] = fn
+end
+
+-- Called by the host once EVERY discovered skin has been loaded, i.e. once the migrator list
+-- is complete. Until then run_migrators refuses: running half a list on a cfg would let the
+-- skins loaded in a later slice miss their own keys.
+--
+-- IT DROPS THE CACHE, and that is what buys the migration its ordering for FREE. Anything
+-- loaded before the list was complete has not been offered the migrators, so the next load
+-- has to be a real one -- and the cold path is the only place run_migrators is called from.
+-- The alternative, a per-load "has this model been migrated yet" test, was measured: it costs
+-- ~6 instructions in EVERY phase of EVERY session, including the overwhelming majority in
+-- which no skin declares a migration at all. This costs one cfg re-read, once, and only in a
+-- session that read the store before discovery finished (in the staged startup, none does).
+-- Nothing here is a "done" flag: what stops a second run is the cache, which is keyed on the
+-- MODEL PATH already (see M.load) -- so a model switch throws it away and the model switched
+-- TO gets its own migration, which a boolean would never have done.
+function M.seal()
+    sealed = true
+    cache_loaded = false
+end
+
+-- Run every registered skin migrator over the RAW cfg table, once per cfg load.
+-- Same contract as migrate_schema above -- in memory, idempotent, never forcing a write --
+-- with one difference: the transform belongs to the SKIN, because only the skin knows what
+-- its own stored values used to mean and through which frozen table an old one decodes.
+-- Mapping a value through a live list here would be the host guessing at a skin's history,
+-- and it would overwrite the evidence with the guess.
+-- Persistence is opportunistic and needs no write of its own: `t` IS the cache (M.load
+-- assigns it), so apply() hands the migrated value to every build from here on, and the
+-- next M.save/flush_adoption writes the migrated form out.
+-- A raising migrator is skipped rather than allowed to take the dashboard down -- the rule
+-- this whole module is written to (see the header): settings never crash the widget.
+local function run_migrators(t)
+    if not sealed or migrators == nil or type(t) ~= "table" then return end
+    for i = 1, #migrators do pcall(migrators[i], t) end
+end
+
 local function sanitize(s)
     return string.gsub(tostring(s or ""), "[^%w%-_]", "_")
 end
@@ -80,23 +150,41 @@ local function model_info()
     return nil
 end
 
-local function slot_base()
+-- The latched key and the model file it was latched for. Module-local: the active
+-- model is global, so one latch serves every instance (same as the cache below).
+local latched_file = nil
+local latched_key = nil
+
+-- The cfg key: the model name as it stood when this model became active. Re-latched
+-- ONLY when model.getInfo().filename changes, i.e. on a real model switch — never when
+-- a connecting craft renames the model underneath us. What the latch buys is that the
+-- cfg file cannot MOVE mid-session; it cannot recover the stored name if the rename
+-- already happened before the first load (boot with the craft powered and connected).
+-- In practice the first load lands in refresh #1, seconds before RF's MSP handshake.
+local function model_key()
     local info = model_info()
-    local base = nil
-    if info and type(info.filename) == "string" and info.filename ~= "" then
-        base = string.gsub(sanitize(info.filename), "_yml$", "")
+    local fname = ""
+    if info and type(info.filename) == "string" then fname = info.filename end
+    if latched_key == nil or fname ~= latched_file then
+        latched_file = fname
+        latched_key = sanitize(info and info.name or "")
+        if latched_key == "" then latched_key = "model" end
     end
-    if not base or base == "" then
-        base = sanitize(info and info.name or "model")
-    end
-    return base
+    return latched_key
 end
 
-local function craft_name()
+-- The pre-0.7.0 key: the model FILE ("model7.yml" -> "model7"). Only used to ADOPT a
+-- cfg written before the key moved to the model name. nil when EdgeTX gives no
+-- filename — there is nothing to adopt then.
+local function old_slot_base()
     local info = model_info()
-    local name = sanitize(info and info.name or "model")
-    if name == "" then name = "model" end
-    return name
+    if info and type(info.filename) == "string" and info.filename ~= "" then
+        -- single-value: gsub also returns a count, which must not leak into a
+        -- concatenation or a table constructor further up
+        local base = string.gsub(sanitize(info.filename), "_yml$", "")
+        return base
+    end
+    return nil
 end
 
 local ROOT = "/WIDGETS/UltiDash/"
@@ -135,25 +223,22 @@ local function cfg_prefix()
     return cfg_dir
 end
 
-local function slot_file()
-    return "cfg_m_" .. slot_base() .. ".cfg"
-end
-
--- per-craft files are NAMESPACED by the slot too (cfg_m_<slot>_<craft>.cfg): the
--- same craft flown from two different model slots keeps separate configurations,
--- and the files group visibly per slot on the SD card
-local function craft_file()
-    return "cfg_m_" .. slot_base() .. "_" .. craft_name() .. ".cfg"
+local function model_file()
+    return "cfg_m_" .. model_key() .. ".cfg"
 end
 
 -- the pre-slot scheme (cfg_<model name>.cfg) — read once for adoption
 local function legacy_file()
-    return "cfg_" .. craft_name() .. ".cfg"
+    return "cfg_" .. model_key() .. ".cfg"
 end
 
-local function slot_path()   return cfg_prefix() .. slot_file()   end
-local function craft_path()  return cfg_prefix() .. craft_file()  end
-local function legacy_path() return cfg_prefix() .. legacy_file() end
+-- the pre-0.7.0 slot scheme — read once for adoption, nil when unavailable
+local function old_slot_file()
+    local base = old_slot_base()
+    return base and ("cfg_m_" .. base .. ".cfg") or nil
+end
+
+local function model_path()  return cfg_prefix() .. model_file()  end
 
 local function read_table(path)
     local f = io.open(path, "r")
@@ -176,12 +261,20 @@ local function read_table(path)
     -- values may be integers (legacy) OR strings (e.g. telemetry sensor names like
     -- "Hspd", "Bat%", "~volt"). Capture the rest of the line, trim trailing space,
     -- and keep it numeric only when it looks like a plain integer.
-    for k, v in string.gmatch(data, "([%w_]+)%s*=%s*([^\r\n]+)") do
-        v = string.gsub(v, "%s+$", "")
-        if string.match(v, "^%-?%d+$") then
-            t[k] = tonumber(v)
-        else
-            t[k] = v
+    -- SPLIT INTO LINES FIRST, then anchor the match to the line. One gmatch over the
+    -- whole blob could not see a line end: on an EMPTY value ("Key=", which write_table
+    -- emits for an empty string) the `%s*` after the `=` ate the newline and the value
+    -- pattern then swallowed the WHOLE NEXT LINE -- two settings lost per empty one. The
+    -- anchor also stops a comment line ("# note=x") from being read as a setting.
+    for line in string.gmatch(data, "[^\r\n]+") do
+        local k, v = string.match(line, "^%s*([%w_]+)%s*=%s*(.*)$")
+        if k then
+            v = string.gsub(v, "%s+$", "")
+            if string.match(v, "^%-?%d+$") then
+                t[k] = tonumber(v)
+            else
+                t[k] = v
+            end
         end
     end
     return t
@@ -210,6 +303,30 @@ local function write_table(path, t)
     return true
 end
 
+-- The ADOPTION write, atomically: the proven .new -> verify -> rename sequence.
+-- write_table above opens the TARGET and truncates it, which is right for a save (the file
+-- it overwrites is the very source of what it writes) and wrong here. A short write would
+-- leave a stub cfg_m_<model>.cfg on the card, and do_load only reaches the legacy file
+-- while the new-scheme one is ABSENT -- so the stub would shadow the intact original
+-- permanently, and the user would see the upgrade eat their settings. Every failure exit
+-- leaves the target where it was; the legacy source is only ever read, never removed, so
+-- the next session simply tries the adoption again.
+local function write_table_atomic(path, t)
+    local newp = path .. ".new"
+    if not write_table(newp, t) then
+        if del ~= nil then pcall(del, newp) end
+        return false
+    end
+    if rename == nil then return false end
+    if fstat ~= nil and fstat(path) ~= nil then
+        -- FatFS rename refuses an existing target. What can be sitting there is the
+        -- empty/unreadable file that made this an adoption in the first place.
+        if del == nil then return false end
+        pcall(del, path)
+    end
+    return rename(newp, path) == 0
+end
+
 -- read a cfg by FILE NAME: prefer the cfg/ copy, else adopt a root-level file
 -- left by the old flat layout (or an interrupted sweep) and move it over,
 -- best-effort — a failed rename still returns the data; the next save writes
@@ -233,39 +350,31 @@ end
 -- refresh cycle of its own (same pattern as the cfg-snapshot deferral).
 local adopt_pending = nil
 
-local function do_load()
-    local slot = read_cfg(slot_file())
-    if slot == nil then
-        -- one-time adoption of a legacy name-keyed file (the pre-slot scheme): the
-        -- file matching the CURRENT model name carries the user's tuning
-        local legacy = read_cfg(legacy_file())
-        if legacy ~= nil then
-            adopt_pending = adopt_pending or {}
-            adopt_pending[slot_path()] = legacy
-            slot = legacy
-        end
-    end
-    per_craft = (slot ~= nil and slot.CfgPerCraft == 1) or false
-    if per_craft then
-        loaded_craft_path = craft_path()
-        local craft = read_cfg(craft_file())
-        if craft == nil then
-            -- adopt a legacy name-keyed file as this craft's config (it held the
-            -- per-craft tuning from the pre-slot era)
-            craft = read_cfg(legacy_file())
-            if craft ~= nil then
+-- read the first cfg that exists, in order, and record it for adoption under `into`.
+-- `names` may contain nils (a scheme with nothing to offer on this radio).
+local function read_or_adopt(into, names)
+    for i = 1, #names do
+        local n = names[i]
+        if n ~= nil then
+            local t = read_cfg(n)
+            if t ~= nil then
                 adopt_pending = adopt_pending or {}
-                adopt_pending[loaded_craft_path] = craft
+                adopt_pending[into] = t
+                return t
             end
         end
-        if craft ~= nil then
-            craft.CfgPerCraft = 1
-            return craft
-        end
-        return slot   -- craft has no own file yet: use the slot copy
     end
-    loaded_craft_path = nil
-    return slot
+    return nil
+end
+
+local function do_load()
+    local main = read_cfg(model_file())
+    if main == nil then
+        -- One-time adoption, newest scheme first: the slot-keyed file this model wrote
+        -- before the key moved to the model name, then the pre-slot name-keyed file.
+        main = read_or_adopt(model_path(), { old_slot_file(), legacy_file() })
+    end
+    return main
 end
 
 -- Persist any adoption recorded by do_load. Called by the host in its OWN refresh
@@ -277,35 +386,35 @@ function M.flush_adoption()
     -- pcall'd: an io error mid-write must not crash the widget Lua state.
     -- Worst case the adoption is lost for this session; the next session's load
     -- records it again (the legacy file is only read, never removed).
-    pcall(function() for path, t in pairs(p) do write_table(path, t) end end)
+    pcall(function() for path, t in pairs(p) do write_table_atomic(path, t) end end)
     return true
 end
 
--- The file a save would land in RIGHT NOW (per-craft aware). build_settings_view
--- stamps this when a page opens; save_pending_settings discards the working copy
--- when it has moved since: a model switch / craft rename mid-edit must
--- not write model A's edits into model B's cfg file.
+-- The file a save would land in RIGHT NOW. build_settings_view stamps this when a page
+-- opens; save_pending_settings discards the working copy when it has moved since: a
+-- model switch mid-edit must not write model A's edits into model B's cfg file.
 function M.target_path()
-    return per_craft and craft_path() or slot_path()
+    return model_path()
 end
 
 -- Load (once) and return the saved settings, or nil when nothing is stored.
 function M.load()
     if cache_loaded then
-        -- Reload when the ACTIVE MODEL changed: the slot file is keyed by the model slot
-        -- (model.getInfo().filename), so switching models must re-read the target model's
-        -- cfg (the cache is module-wide / shared across instances). In per-craft mode the
-        -- model NAME also changes at runtime when a craft connects (Rotorflight renames
-        -- the TX model) -> reload when that target file moved too.
-        if loaded_slot_path ~= slot_path()
-            or (per_craft and loaded_craft_path ~= craft_path()) then
+        -- Reload when the ACTIVE MODEL changed: model_key() re-latches on a model switch,
+        -- so the path moves and the target model's cfg must be re-read (the cache is
+        -- module-wide / shared across instances). A craft connecting does NOT move it —
+        -- that is what the latch is for.
+        if loaded_model_path ~= model_path() then
             cache_loaded = false
         else
+            -- Deliberately NOTHING here for the skin migrations: this is the hot path (every
+            -- update() comes through it) and M.seal drops the cache instead, so the cold path
+            -- below is the only one that ever has to run them.
             return cache
         end
     end
     cache_loaded = true
-    loaded_slot_path = slot_path()
+    loaded_model_path = model_path()
     local ok, t = pcall(do_load)
     if ok then
         -- one-time schema migration, IN MEMORY ONLY -- never write here: M.load runs inside
@@ -314,6 +423,10 @@ function M.load()
         -- idempotent across loads; permanence comes on the next M.save/M.reset, which stamp
         -- ClrSchemeV (after which migrate_schema is a no-op).
         if t ~= nil then migrate_schema(t) end
+        -- ...and the skins' own migrations, on the same table and under the same rules
+        -- (in memory, once per load, no write of its own). This is the ONLY call site: a
+        -- model switch and M.seal both come back through here, and nothing else has to.
+        run_migrators(t)
         cache = t
     end
     return cache
@@ -323,7 +436,7 @@ end
 function M.save(values)
     local t = M.load() or {}
     for k, v in pairs(values) do
-        if k ~= "ViewMode" and (type(v) == "number" or type(v) == "string") then
+        if type(v) == "number" or type(v) == "string" then
             -- "unset" colour roles (default -1 -> follow the scheme built-in) are NOT persisted:
             -- the autosave/snapshot hands us all ~57 Clr* keys, and writing them as -1 into every
             -- model cfg (~0.7 kB) rebuilds exactly the cfg-parse load that caused the CPU-limit
@@ -335,31 +448,63 @@ function M.save(values)
             end
         end
     end
-    t.ClrSchemeV = SCHEMA_VER   -- stamp so a fresh file is never mistaken for a pre-v1 one
+    -- stamp so a fresh file is never mistaken for a pre-v1 one -- but NEVER BACKWARDS. An
+    -- older widget saving a newer file used to write its own lower number over the higher
+    -- one, and the migration that had already run would then run a second time on the next
+    -- upgrade. The file's own stamp wins whenever it is ahead of us.
+    t.ClrSchemeV = math.max(tonumber(t.ClrSchemeV) or 0, SCHEMA_VER)
     -- Drop keys no current version knows: orphans (removed features, renamed keys)
     -- otherwise accumulate in the file forever AND flow back into every instance's
     -- options via apply()'s passthrough. Valid = every defaults key (settings rows
-    -- incl. the synthesised Clr* roles, SetupSeen, CfgPerCraft, ColorScheme), the
-    -- <key>Raw picker shadow of a defaults key, and the ClrSchemeV schema stamp.
+    -- incl. the synthesised Clr* roles, SetupSeen, ColorScheme), the <key>Raw picker
+    -- shadow of a defaults key, and the ClrSchemeV schema stamp.
     -- Deliberately DOWNGRADE-HOSTILE: an older version's keys are
     -- removed on this version's first save. (Clearing a key during pairs() is legal.)
-    for k in pairs(t) do
-        if defaults[k] == nil and k ~= "ClrSchemeV" and k ~= "CfgPerCraft"
-            and not (string.sub(k, -3) == "Raw" and defaults[string.sub(k, 1, -4)] ~= nil) then
-            t[k] = nil
+    -- This is also what retires the removed `CfgPerCraft` flag from an upgraded file.
+    -- HELD while a discovered skin failed to load (M.sweep_hold, set by the host once
+    -- discovery finishes): a failed skin never registered its own option keys, so the
+    -- sweep's premise -- "defaults hold every valid key" -- is false for that session and
+    -- the sweep would delete the user's settings for a skin that is merely half-copied.
+    -- Everything else here, the -1 colour drop and the ClrSchemeV stamp included, runs
+    -- unchanged; the stamp and the CfgPerCraft retirement resume the next session in
+    -- which every skin loads.
+    -- The hold is NOT free, contrary to what its spec assumed: the orphans it preserves
+    -- are then written, so the cfg write grows with their number. Measured in the budget
+    -- harness, whose fixture carries 300 deliberately-orphaned keys, the write goes
+    -- 13125 -> 18489 of 20000 -- still inside the radio's limit, but past the harness's
+    -- own 16000 warn line. A real file's orphan set is the handful of retired keys plus
+    -- the broken skin's own rows, so this is a worst case by construction; it only ever
+    -- applies in a session that already has a broken skin.
+    -- HELD A SECOND WAY, for the skin that is not on the card AT ALL. To the sweep's test
+    -- an absent skin's keys look exactly like a broken one's -- nobody declared them -- but
+    -- sweep_hold only ever saw skins that were discovered and then failed. Since the four
+    -- layouts moved to their own repo, "deploy without the skins pass, then save once" is
+    -- one command away from deleting a cockpit configuration nobody touched. So the file
+    -- remembers which skins it was written with: a roster that is missing an entry now
+    -- holds the sweep. The roster only ever GROWS here -- a shrink is the thing being
+    -- detected, so it is never recorded, and the protection stays until the skin is back.
+    local hold = M.sweep_hold
+    if not hold and type(M.skin_roster) == "string" then
+        local have = {}
+        for id in string.gmatch(M.skin_roster, "[^,]+") do have[id] = true end
+        local seen = t.SkinsSeen
+        if type(seen) == "string" then
+            for id in string.gmatch(seen, "[^,]+") do
+                if not have[id] then hold = true break end
+            end
+        end
+        if not hold then t.SkinsSeen = M.skin_roster end
+    end
+    if not hold then
+        for k in pairs(t) do
+            if defaults[k] == nil and k ~= "ClrSchemeV" and k ~= "SkinsSeen"
+                and not (string.sub(k, -3) == "Raw" and defaults[string.sub(k, 1, -4)] ~= nil) then
+                t[k] = nil
+            end
         end
     end
-    per_craft = t.CfgPerCraft == 1
     local ok, written = pcall(function()
-        if per_craft then
-            -- settings live in the craft file; the slot file keeps the mode flag
-            -- plus a full fallback copy for crafts without their own file yet
-            loaded_craft_path = craft_path()
-            if not write_table(loaded_craft_path, t) then return false end
-            return write_table(slot_path(), t)
-        end
-        loaded_craft_path = nil
-        return write_table(slot_path(), t)
+        return write_table(model_path(), t)
     end)
     if not ok or written ~= true then return false end
     -- a full save just persisted the merged state (which includes any adopted
@@ -367,28 +512,44 @@ function M.save(values)
     adopt_pending = nil
     cache = t
     cache_loaded = true
-    loaded_slot_path = slot_path()
+    loaded_model_path = model_path()
     return true
 end
 
--- Replace the saved settings with the defaults (keeps the storage mode flag).
+-- Replace the saved settings with the defaults.
 function M.reset()
     local t = {}
-    for k, v in pairs(defaults) do t[k] = v end
+    for k, v in pairs(defaults) do
+        -- Same rule as M.save: "unset" colour roles (default -1 = follow the scheme
+        -- built-in) are NOT persisted. Writing all ~57 Clr* roles per scheme as -1 is
+        -- what save() deliberately avoids -- it inflates every model cfg and rebuilds
+        -- exactly the cfg-parse load that once caused the CPU-limit crashes. Skipping
+        -- them also brings the reset WRITE back under budget (measured 17.0k -> 8.5k)
+        -- and makes a reset file identical in shape to a saved one.
+        if v ~= -1 then t[k] = v end
+    end
     t.ClrSchemeV = SCHEMA_VER   -- reset produces a current-version file (no re-migration)
-    if per_craft then t.CfgPerCraft = 1 end
     local ok, written = pcall(function()
-        if per_craft then
-            if not write_table(craft_path(), t) then return false end
-            return write_table(slot_path(), t)
-        end
-        return write_table(slot_path(), t)
+        return write_table(model_path(), t)
     end)
     if not ok or written ~= true then return false end
     cache = t
     cache_loaded = true
-    loaded_slot_path = slot_path()
+    loaded_model_path = model_path()
     return true
+end
+
+-- The LIVE counterpart of M.reset, called by the host on the same stage: put every "unset"
+-- colour role back to its default on an instance's options. Those keys are deliberately not
+-- written by reset (see there), and apply() never downgrades a key the file does not carry
+-- -- so the file was correct after a reset and the screen was not, until the next boot. That
+-- reads as "Reset to defaults does not reset the colours", and it was reported as exactly
+-- that. Cheap: one walk of the defaults, once per reset.
+function M.reset_options(wgt)
+    if wgt == nil or wgt.options == nil then return end
+    for k, def in pairs(defaults) do
+        if def == -1 then wgt.options[k] = -1 end
+    end
 end
 
 -- Resolve this instance's effective options: file value > existing option value >
@@ -413,7 +574,7 @@ function M.apply(wgt)
     end
     if t then
         for k, v in pairs(t) do
-            if k ~= "ViewMode" and defaults[k] == nil then wgt.options[k] = v end
+            if defaults[k] == nil then wgt.options[k] = v end
         end
     end
 end

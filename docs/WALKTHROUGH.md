@@ -8,6 +8,12 @@ detail pages, the menu and the Toolbox, in both the light and the dark colour sc
 > **[REFERENCE.md](REFERENCE.md)**. *(Screens below are 480×320 grabs; your radio's
 > resolution differs but the layout is the same.)*
 
+> 📷 **The screenshots are from a build before 0.7.0** and have not been retaken yet, so
+> three of this release's additions are missing from them: the **Skin** settings group (the
+> settings grid below still shows the pre-0.7.0 grouping), the Toolbox's **Battery profile**
+> entry, and the **Version** row at the top of the Status page. Everything else looks as
+> shown. The text on this page describes 0.7.0.
+
 ---
 
 ## The flight dashboard
@@ -68,7 +74,7 @@ Tap the **☰ glyph** (disarmed) to open the menu hub.
 
 ### Settings
 A themed grid — *Appearance*, *Battery & limits*, *Sound & callouts*, *System* — each group
-opens its own page of real toggles, dropdowns and steppers. Saved per EdgeTX model slot.
+opens its own page of real toggles, dropdowns and steppers. Saved per EdgeTX model.
 
 ![Settings](../images/walkthrough/08-settings.png)
 
@@ -117,7 +123,8 @@ the radio) and the **RF Adjustment** Map / Editor — see [TOOLBOX.md](TOOLBOX.m
 ## Dark theme
 
 Every screen also comes in the high-contrast **UltiDash dark** palette (and an EdgeTX-theme
-option). Switch it under *Settings ▸ Display ▸ Color scheme*.
+option). Switch it under *Settings ▸ Skin ▸ Color scheme* — the colour scheme belongs to the
+active skin since 0.7.0.
 
 | | |
 |---|---|

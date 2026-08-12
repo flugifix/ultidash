@@ -15,8 +15,9 @@ Rotorflight's **trim-based adjustment functions**:
 Open them from the fullscreen menu (**☰ → Toolbox**, disarmed only) **or** via a
 **shortcut switch** that works any time, including in flight (see §5).
 
-Three further, zero-config pages live in the same Toolbox submenu — the **Log Viewer**,
-**RF2 Config** and the **Flight Log** — described briefly in §8.
+Four further, zero-config pages live in the same Toolbox submenu — the **Log Viewer**,
+**RF2 Config**, the **Flight Log** and the **FC battery profile** picker — described
+briefly in §8.
 
 ---
 
@@ -186,9 +187,9 @@ needed): the reported value (`AdjV`) is only latched while the FC is connected.
 | Toolbox sunlight mode | `TbSun` | high-contrast light scheme for bright sun |
 | Announce bank (voice) | `TbVoice` | speak "Bank N" (the active Config-channel position) on open + on change |
 
-The tool pages follow the **UltiDash color scheme** (Display ▸ Color scheme: UltiDash /
-EdgeTX theme / UltiDash dark); the sunlight option overrides to a high-contrast light
-scheme. The
+The tool pages follow the **active skin's colour scheme** (*Settings ▸ Skin ▸ Color
+scheme* — for the built-in UltiDash look: *UltiDash* / *UltiDash dark* / *EdgeTX theme*);
+the sunlight option overrides to a high-contrast light scheme. The
 per-session values shown in the tools are **cleared on every fresh (re)connect** so they
 start empty again.
 
@@ -227,12 +228,12 @@ return {
   the "no MSP while armed" rule is untouched; the FC's adjustment functions (your model
   setup) perform the actual change.
 
-## 8. The other Toolbox pages: Log Viewer, RF2 Config & Flight Log
+## 8. The other Toolbox pages: Log Viewer, RF2 Config, Flight Log & Battery profile
 
-All three need **no model setup and no settings** and are **disarmed-only** (an armed tap
-is refused with a hint; they close automatically on arming). They are **lazy-loaded**:
-the modules are read from the SD card only when the page is opened and released again on
-close, so they cost no memory while flying.
+All need **no model setup and no settings** and are **disarmed-only** (an armed tap
+is refused with a hint; they close automatically on arming). The first three are
+**lazy-loaded**: the modules are read from the SD card only when the page is opened and
+released again on close, so they cost no memory while flying.
 
 - **Log Viewer** *(WIP)* — graphs EdgeTX telemetry logs (`/LOGS/*.csv`) directly on the
   radio, no PC needed. Uses no MSP at all. Still under hardware testing.
@@ -272,10 +273,34 @@ close, so they cost no memory while flying.
      the session chip to switch session. **RTN** steps back: chart → picker/browser →
      Toolbox.
 
-  **Own templates** (optional): copy `toolbox/logtemplates.example.lua` to
-  `…/toolbox/logtemplates.lua` and edit — each template is just a name plus up to 4 sensor
-  names as written in the log header (`Vbat`, `Curr`, `Hspd`, `EscT`, `1RSS`, …). Restart
-  the radio to pick up changes. The file survives updates (only the `.example` is replaced).
+  **Own templates — made on the radio.** The card page is also the manager. Tap **Edit**
+  (top-right) and a card tap opens its actions instead of applying it:
+
+  | | built-in card | own card |
+  |---|---|---|
+  | Rename | – | ✓ |
+  | Duplicate | ✓ | ✓ |
+  | Delete | – | ✓ (asks first) |
+  | Move forward / Move back | – | ✓, one position at a time in **list** order |
+
+  Create one in the **sensor picker**: pick your set and tap **Save** (next to *Show*) — it
+  saves *and* displays. The name is proposed from the picked sensors and can be typed over;
+  saving under a name that already exists asks **"Replace X?"**, and that overwrite *is* how
+  you change a template. Names are capped at **16 characters**, which is the longest a card
+  can show on the smallest radio whatever the name is made of. At most **24** own templates.
+
+  The four built-ins (*Power / Battery / RF link / Governor*) are part of the program: they
+  cannot be renamed or deleted. Two ways round that — **Duplicate** one and edit the copy, or
+  switch **Hide built-ins** on in Edit mode to take all four off the page.
+
+  **Where it lives:** `WIDGETS/UltiDash/cfg/logtemplates.lua`. The widget owns that file and
+  rewrites it whole, so hand-written comments in it do not survive a save. Deploying UltiDash
+  never touches it. An older `toolbox/logtemplates.lua` from before 0.7.0 is **adopted once**
+  into the new location on the next open and then ignored; the old file is left where it is.
+  You can still stock the new file from a PC — the format is unchanged — but the radio is the
+  maintainer from then on.
+
+  **No restart is needed** to pick up template changes: close and reopen the Log Viewer.
 - **RF2 Config** — runs the **original rotorflight-lua-scripts configuration tool**
   (main menu, all config pages, Save, the Reload/Reboot popup) with its original look,
   navigation and key handling, inside UltiDash's fullscreen. Nothing is copied: the
@@ -294,3 +319,15 @@ close, so they cost no memory while flying.
   total time per model) and **Batteries** (per-pack cycle counts from `batteries.cfg`).
   The data files, the optional PC-maintained battery registry and the related
   settings are described in **REFERENCE §12** (Flight log & battery management).
+- **Battery profile** — switches the **flight controller's** active battery profile (1…6),
+  showing each profile's configured capacity where the FC reports one. This is the one page
+  in UltiDash that *writes* to the flight controller, so it is gated twice: **disarmed** and
+  **MSP connected**. Unavailable in either state the tile is dimmed and does not open.
+
+  It is also reachable by tapping the **B-Profile** field on the dashboard — but only if the
+  active layout offers that tap zone, which is why the entry exists here as well: a layout
+  must not be able to remove a host feature. A **switch shortcut** can open it too
+  (REFERENCE §2.7c). Whichever route is used, the profile is re-read from the FC on open, so
+  the list never shows a value cached at connect time. The back arrow returns to the Toolbox
+  when it was opened from here, and to the dashboard otherwise; picking a profile always
+  closes to the dashboard.

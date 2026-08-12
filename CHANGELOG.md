@@ -2,6 +2,532 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.7.0 — 2026-08-12
+
+### Added
+
+- **Log Viewer templates are made on the radio.** The *"What to display?"* card page is now
+  also their manager: an **Edit** chip turns it into one, and a card tap then opens that
+  card's actions — **Rename**, **Duplicate**, **Delete** (with a confirmation) and
+  **Move forward / Move back**, one position at a time in list order. New ones are created in
+  the **sensor picker**: pick your set and tap **Save**, next to *Show* — it saves *and*
+  displays. The name is proposed from the picked sensors, can be typed over, and saving under
+  a name that already exists asks *"Replace X?"* — that overwrite **is** how you change a
+  template, so there is no separate edit function. Names are capped at 16 characters (the
+  longest a card can show on the smallest radio, whatever the name is made of) and at most 24
+  own templates are kept.
+  The four built-ins — *Power / Battery / RF link / Governor* — stay part of the program and
+  can be neither renamed nor deleted. Two ways round that: **Duplicate** one and edit the
+  copy, or switch **Hide built-ins** on to take all four off the page.
+  **Migration:** the file the widget writes is `WIDGETS/UltiDash/cfg/logtemplates.lua`, not
+  the old PC-edited `toolbox/logtemplates.lua`. A file at the old path is **adopted once**
+  into the new one on the next Log Viewer open and then ignored — it is copied, not moved, so
+  nothing of yours is deleted. The move matters: deploying UltiDash overwrites `toolbox\*.lua`
+  wholesale, and that directory is now the wrong place for a file the radio writes into.
+  Stocking it from a PC still works (the format is unchanged, and
+  `toolbox/logtemplates.example.lua` documents it), but the widget rewrites the file whole, so
+  comments in it do not survive a change made on the radio. Picking up a change needs no
+  restart, only closing and reopening the page — the old *"restart the radio"* note was wrong.
+
+- **Fixed-voltage orientation callouts.** Two new *Settings ▸ Battery ▸ Volt callout 1 / 2
+  (V/cell)* thresholds add a second, voltage-triggered gate **alongside** the %-step fuel
+  callouts: set a per-cell voltage (e.g. 3.80 / 3.75 V) and UltiDash speaks that voltage
+  **once per flight** the first time the cell voltage settles at/below it. A *Volt callout
+  delay (s)* setting requires the voltage to hold in-band that long before firing, so a
+  brief load sag doesn't trigger it early (0 = immediate). Announced per *Announce voltage
+  as*; both thresholds default to *off*; they re-arm each flight and are suppressed during
+  MAIN-POWER-LOST. Independent of the low/critical *Voltage* alert.
+- **The first tap after the radio has been sitting is no longer lost.** A new
+  *Settings ▸ Display ▸ Keep backlight on (full screen)* (default **on**) keeps the screen
+  awake while UltiDash owns the whole display. Once the backlight has timed out, EdgeTX spends
+  the next press on waking the screen and no widget ever sees it — on the bench that is exactly
+  the tap meant to open a detail page, and nothing on screen says why. Your own *Backlight off
+  after* setting is deferred rather than overridden, and only in full screen: in a layout zone
+  the radio's normal power saving is untouched. Turn it off in one row.
+
+- **The Status page says which build the radio is running.** *menu ▸ Status* gained a
+  **Version** row at the top. Until now the version existed only inside the widget's code and
+  was drawn nowhere, so the question could not be answered without pulling the card. A
+  development build also shows a short commit — written onto the card by the deploy script,
+  since a Lua script cannot know its own commit; a trailing `+` means it was built from an
+  uncommitted working tree. Release cards show the version alone.
+
+- **The FC battery profile can be reached without a tap zone.** Switching the flight
+  controller's battery profile used to have exactly one way in: tapping the *B-Profile* field
+  on the dashboard. Whether that field exists at all is up to the active layout — so a layout
+  that does not offer the zone removed a whole feature, with nothing on screen to say so. It
+  is now also a **Toolbox** entry (*menu ▸ Toolbox ▸ Battery profile*) and a **switch
+  shortcut** target (*Settings ▸ Shortcuts*, as *FC battery profile*). All three routes are
+  the same page behind the same gate — **disarmed only, and only with an MSP connection** —
+  and each re-reads the profile from the flight controller before opening, so the picker never
+  shows a value cached at connect time. The tap zone is unchanged. Opened from the Toolbox,
+  the back arrow returns to the Toolbox; opened by a tap or a switch it returns to the
+  dashboard.
+
+### Added — skin system (the substructure; the layouts are in development)
+
+> ⚠️ **The skin system is in development, and this release carries its substructure rather
+> than its skins.** The engine, the skin API, the discovery of `skins/*.lua`, the *Skin*
+> settings group and the per-skin colour schemes are all here, and the built-in **UltiDash**
+> look is now a skin like any other. The **additional layouts are deliberately held back** —
+> they are still being reworked, and holding them back is what keeps the API free to change
+> while they settle. Expect the skin API, its cfg keys and its colour-override storage to
+> move again: a skin written against this release may need changes on the next one. See
+> **[docs/SKINS.md](docs/SKINS.md)**, which describes the contract and says the same thing
+> at the top.
+
+- **The flight/stats layout is a swappable module.** A new **Dashboard skin** choice
+  (*Settings ▸ Display*) picks the look; the choice lists every skin found on the card.
+  The built-in **UltiDash** layout — the original three-panel dashboard (status / battery
+  gauge / values + top bar + status bar) — is the default and is unchanged on screen.
+- **Skins are self-contained, discovered files.** A skin module in
+  `WIDGETS/UltiDash/skins/*.lua` carries everything that makes it up: the layout code
+  **and** its manifest — display name, colour schemes, own settings rows, scheme
+  persistence. Skins are **discovered automatically** (the file name is the id) —
+  dropping the file in is the install; nothing is registered in the host, which only
+  requires `skins/default.lua` (the fallback look). A new authoring guide,
+  **[docs/SKINS.md](docs/SKINS.md)**, documents the skin API, the value catalog and the
+  rules. A broken or missing skin falls back to the built-in look (never a blank screen).
+- **Colours and options belong to the skin.** Each skin owns its **colour schemes** and
+  its **own settings**, both shown in a new **Skin** settings group:
+  - the **Color scheme** choice moved from *Display* into the **Skin** group and now
+    lists the *active skin's* schemes. The UltiDash skin keeps its three (UltiDash /
+    UltiDash dark / EdgeTX theme, existing keys — nothing to re-pick). Each skin
+    remembers its own pick and starts in its own default scheme. *Settings ▸ Colors*
+    shows one page per scheme of the active skin, with the usual per-colour picker +
+    *Def* reset.
+  - the top-bar / left-panel options (**Top-left shows**, **Top bar clock**, **Timer**,
+    the **RQ / TQ / RSSI / TX-voltage** toggles and **Link bars quiet**) moved from
+    *Display* into the **UltiDash** skin's own options (they describe *its* layout).
+  - stored keys are unchanged — **no cfg migration**, and an inactive skin's options and
+    colour overrides are preserved when you switch skins.
+- **Skin API additions** (all additive — the built-in look and the cfg format are
+  untouched):
+  - **Sensor slots carry more.** `env.sensor_slot()` now also returns `.label_short` (the
+    catalog's new compact caption per sensor — "BEC Voltage" → "BEC" — for card layouts),
+    `.unit_raw` (the unit *regardless* of *Display ▸ Units beside values*, for skins that
+    put it in a caption row where it costs the value no font size) and
+    `.min_formatted` / `.max_formatted` (the sensor's EdgeTX **session extrema**). The
+    extrema cost two extra source reads per slot per pass, so a skin opts in with
+    **`M.wants_extrema = true`**; without it the 5 Hz pass is unchanged.
+  - **The settings-menu tap zone is placeable:** `set_tap(wgt, "menu", rect)` — a skin that
+    draws its own header can put the menu button where it likes. Unregistered, the host's
+    fixed top-left region stays the fallback, as before.
+  - **Contrast helpers** `env.is_dark(color)` / `env.ink_on(color)`: a skin cannot judge a
+    colour's luminance itself (it is an opaque RGB565 value), so it could not decide black
+    or white ink on a theme-driven fill.
+  - **The two *Volt callout* thresholds are published to the skin API**, so a skin drawing
+    a cell-voltage scale can mark them on it beside the alarm and warning ticks.
+  - **A skin that cannot load now says so, instead of quietly looking like the default.**
+    Every rejection path — a chunk error, a wrong `api`, a missing build function, an error
+    in `init`, a stored skin id with no file on the card, a `skins/` folder that cannot be
+    read, a file dropped by the 16-skin limit — logs one line **naming the reason**. If the
+    skin *you picked* is the one that failed, the dashboard carries a
+    **"Skin '&lt;id&gt;' failed - using default"** notice, and the *Dashboard skin* choice marks
+    the row **"&lt;name&gt; (error)"**. Your pick still stores the plain id, so repairing the
+    file needs no re-pick.
+  - **A half-copied skin no longer costs you its settings.** The config's unknown-key sweep
+    (which retires keys no current version knows) is **suspended for any session in which a
+    skin failed to load** — a failed skin never declares its settings rows, so the sweep
+    would have deleted every one of its stored values on the next save. The sweep resumes
+    once the file is fixed.
+  - **The four detail pages are skinnable.** A skin can declare
+    `M.build_detail_elrs` / `_estatus` / `_battery` / `_telem` — one, some or none — and draw
+    that page itself; anything it leaves out keeps the built-in page. The host keeps opening
+    and closing the pages, the taps that get there, the data gating and the arming gates. If a
+    skin's page raises, the built-in one is drawn instead, the reason is logged, and a notice
+    appears along the bottom **of that page** while it is open; the skin's page is retried the
+    next time you open it. The builders themselves moved into a separate file with no visible
+    change — verified pixel-identical to the previous release on all four pages.
+  - **Thresholds come from the host now: `env.threshold_for(wgt, name)`.** A skin asks for a
+    sensor name and gets back a ready bundle — live value, fill percent against the right
+    scale, the colour rule, tick positions, and whether the threshold is configured at all.
+    Eleven names are served (ESC load, ESC and MCU temperature, cell and pack voltage, fuel,
+    RQly, TQly, RSSI, TX power — plus the *Voltage (auto)* sentinel `~volt`, so a slot can be
+    asked for by the name that is actually stored in the config). The same warn/crit
+    arithmetic used to be written out in
+    every layout that drew a bar, and the cell-voltage scale existed twice in code — one
+    renamed settings key and they would have drifted apart. A name the host does not fetch
+    on its own (MCU temperature) is picked up by the 5 Hz pass **only while a skin asks for
+    it**, so nothing costs anything unused.
+  - **Sensor slots carry their raw number:** `slot.num()` beside `slot.value`, for a bar or
+    ring that needs the value numerically instead of as text.
+  - *Fixed in passing:* the top bar's link bars fell back to link-quality and RSSI warning
+    levels that matched no setting's declared default (RSSI would have warned permanently
+    against a 15 % default). Unreachable in practice — the real defaults are always loaded
+    first — but the host may not carry two answers to the same question.
+  - **Tap zones report their two silent failures.** `set_tap` stores one rect per zone and
+    the last writer wins; it now logs a zone claimed twice in the same build, and a zone
+    name it does not know (a typo used to make a dead zone with no evidence at all).
+    `docs/SKINS.md` §8 states the contract and the register-the-important-one-last idiom.
+  - **A skin can migrate its own config keys: `M.migrate(t)`.** Until now a skin that renamed
+    a key, or changed what one of its values *means*, silently reset that setting for everyone
+    who had configured it — the host defaults every declared key before a skin ever sees the
+    file, and the next save deletes the old key. The new optional manifest function is handed
+    the **raw per-model config table** once per model, immediately after it is read and before
+    anything is defaulted or drawn, and converts the skin's own keys in place. It has to be
+    idempotent and must touch only its own prefixed keys; nothing is written to the SD card
+    for it, so the conversion is simply redone on every load until the user next saves. Also
+    documented at last: the `choice` row's **`ids`** field, which stores a name instead of a
+    list position and is the thing a format migration usually exists for. `docs/SKINS.md`
+    §7c, §7 and the §12 box.
+
+### Changed
+
+- **A spoken battery voltage is now the value the callout actually decided on.** The voltage
+  alert, the fixed voltage callouts (`VSay1` / `VSay2`) and the startup cell check all trigger
+  on the **per-cell** voltage, but the total voltage they announced came from the separately
+  read pack voltage. The two are independent sensors, each held by its own filter, so under
+  load they can be a moment apart — measured once as a callout that fired at 3.75 V per cell
+  and announced a pack voltage a third of a volt higher. The announced total is now derived
+  from the same per-cell reading that triggered the callout. Nothing changes while the two
+  agree, which is the normal case.
+- **The warn/critical boundary is the same everywhere — a value exactly ON a threshold now
+  reads the way it sounds.** The top-bar link bars used `value < critical` and the ELRS detail
+  page used `value >= warning`, while the voice callouts have always used
+  `value <= critical` / `value <= warning`. At a link quality of exactly the configured
+  warning threshold the radio said "link warning" while the bar was still green; at exactly
+  the critical threshold it said "link critical" while the bar was amber. Both displays now
+  follow the callout engine, so the picture and the voice change at the same value. Only
+  values *exactly equal* to a threshold are affected — everything else looked and sounded the
+  same before.
+- **The sensor-check page calls `Esc#` what it is: the ESC *signature*, not the ESC status.**
+  The status word is the row below it (`EscF`). What a missing `Esc#` costs is unchanged and
+  the hint still says it: without the signature the fault decoder cannot pick a vendor and
+  stays blank.
+- **Removed: the `ViewMode` second-screen views — the widget now has no EdgeTX options.**
+  The passive *ELRS details* / *Status info* instances (a second UltiDash on another
+  screen mirroring the dashboard) are gone; the feedback round found no real use, and
+  the same data lives on as the dashboard's own detail pages (tap the link bars / the
+  status line) and the menu's **Status** entry. The `ViewMode` option went with them, so
+  the EdgeTX option list is now empty — every setting lives in the in-widget menu.
+  - ⚠️ **Upgrade note:** EdgeTX drops the stored option with the update, so a second
+    instance that was set to *ELRS details* or *Status info* silently becomes a **full
+    dashboard**. Two dashboards double the callouts and show a **"2 Dashboard instances
+    active!"** banner — **delete the second instance** and the banner clears. Nothing
+    else changes; per-model cfg files are untouched.
+- **Per-model settings are keyed by the model NAME, not by the model file number.** Adding
+  or deleting models — above all from **EdgeTX Companion**, which rewrites the whole model
+  list — renumbers the surviving `MODELS/modelN.yml` files (EdgeTX hands them out by lowest
+  free index), and every UltiDash config was orphaned in one go: the affected models came up
+  with defaults and the first-run install hint. The key is now `model.getInfo().name`,
+  **latched** when the model becomes active, so Rotorflight's *"set model name on TX"* — which
+  renames the EdgeTX model to the connected craft and restores the stored name on disconnect
+  — cannot move the file mid-session either. The file is now `cfg/cfg_m_<model-name>.cfg`,
+  and it is the only one: the second level (*Config file per craft*) is removed in this same
+  release, see below.
+  - **Upgrading keeps everything.** A model with no name-keyed file yet reads its old
+    `cfg_m_model7.cfg` (and, further back, the flat `cfg_<name>.cfg`) and rewrites it under
+    the name on the next save. Nothing is deleted; the old file stays where it is. Config
+    lost to a Companion run *before* this version is gone, though — it was already
+    unreferenced.
+  - **Two models with the same name now share one config file.** EdgeTX has no stable
+    per-model identifier, so uniqueness is the user's: a copied model (`Rotorflight`,
+    `Rotorflight Test`, …) needs its own name if it needs its own configuration.
+- **Removed: *General ▸ Config file per craft*.** The `<craft>` half of
+  `cfg_m_<model>_<craft>.cfg` was the model name *as it read at that moment*, so the option
+  only ever split anything while Rotorflight was actively renaming the model — with *"set
+  model name on TX"* off for the craft (the FC's `MODEL_SET_NAME` flag) both halves of the
+  file name were identical and the setting did nothing at all. That precondition was never
+  documented, which is most of why the option looked like it worked.
+  **Upgrading loses nothing:** per-craft mode always wrote the plain model file too, with the
+  same content, so the last saved configuration is in it and is what UltiDash now reads. The
+  `CfgPerCraft` key is swept out of the model file on the first save; old `cfg_m_*_*.cfg`
+  files stay on the card unread and can be deleted. What is genuinely gone is the split
+  itself: someone who flew several crafts from one EdgeTX model *with* the FC flag set now
+  has one configuration for all of them — the most recently saved one.
+- **Fuel steps are no longer throttled by the repeat interval.** The Fuel alert's *Repeat
+  interval* used to double as the minimum gap between two descending %-step callouts, so a
+  fast-falling end of flight lost a step — with *dense below 15 %* / *fine step 5 %* the
+  15 → 10 → 5 ladder can pass in well under the 6 s default. The steps now use a fixed 2 s
+  gap (just enough that two callouts don't tread on each other) and the *Repeat interval*
+  applies to the critical nag only, as its name suggests. Steps are also spoken **only on
+  the way down**: a rising level (pack recovering off-load, an FC value jumping back up)
+  re-arms the ladder silently instead of counting its way back up. Replaying a real flight
+  log through the old and new engine at *dense 25 % / fine 2 %*: 12 callouts before, 15
+  after — the three swallowed ones were 24 / 20 / 16 %. A **fourth** swallowed step (the
+  first one after arming on a full pack) is fixed separately, see *Fixed* below.
+- **Unit suffixes are now optional — and off by default.** The small unit beside each value
+  (`V`, `A`, `rpm`, `°C` …) is controlled by a new *Settings ▸ Display ▸ **Units beside
+  values*** switch, **default off**, which restores the original formatting: the value keeps
+  the full column width and therefore the **biggest font that fits**. The units were costing
+  font size on every screen and left the flight panel too small to read on the 480×320 TX15
+  (and the 480×272 TX16S MK2). The switch covers the flight values panel, the Telemetry
+  detail cards and every skin slot fed by the skin API, so a skin's own value slots follow
+  it too. Turn it on where there is room.
+- **Display holds only skin-independent settings now.** The *Bottom bar* section is gone; its
+  two rows sat in the wrong group:
+  - ***Bottom bar: TPWR*** → **Skin** group, as ***Status bar: TPWR***, declared by the
+    skin. It only toggles a field of the host status bar, and whether that bar is shown at
+    all is a per-skin option — so under a skin that draws no status bar, the Display row was
+    a dead switch. It greys out when the active skin's bar is off, and (as before) affects
+    the **flight** view only: the stats page always prints TX power. The key is shared
+    across skins, like the top-bar rows.
+  - ***TPWR bar max (mW)*** → **Thresholds ▸ Link & signal**, as ***TX power limit (mW)***.
+    It is not a display option but this transmitter's **ELRS dynamic-power ceiling**
+    (25 / 100 / 250 / 500 / 1000 mW, region- and config-dependent) — the 100 % reference of
+    the inverted TPWR bar on the ELRS detail page, next to the other link limits.
+  - Both **stored keys are unchanged** (`ShowTPWR`, `TxPwrMax`) — nothing to re-configure.
+  - The *Sensor check* no longer hides the missing-`TPWR` hint when the status-bar field is
+    off: the ELRS detail page's TPWR bar needs the sensor regardless, so a configured *TX
+    power limit* alone now makes the sensor relevant.
+
+### Fixed
+
+- **The BEC and Temperature alerts were dead in flight on some setups.** Both asked the RF
+  tool whether the craft was armed instead of reading the ARM sensor — and on setups where
+  the RF tool never reports an armed sub-state, that answer is *never yes*, so neither alert
+  could fire at all. They now read the sensor, like every other armed-only alert. Where the
+  RF tool's state is the right source — the voltage latch, the session statistics — nothing
+  changed.
+
+- **A layout's RSSI bar could go red while the voice stayed silent.** With antenna diversity
+  the spoken warning follows the *better* antenna; the colour thresholds a layout asks the
+  host for read antenna 1 alone. Both follow the better antenna now — the whole point of
+  that service is that the bar and the callout cannot disagree.
+
+- **A faulty layout could take the dashboard down with it, callouts included.** A skin file
+  is code you drop onto the card, and its two view builders ran unguarded: an error in one
+  killed the widget's Lua state, so the alerts and voice callouts — which have nothing to do
+  with how the screen is arranged — went with it. A failing builder now falls back to the
+  built-in look with the usual *"failed - using default"* banner, a failing menu page closes
+  back to the dashboard, and both say why in the log. Neither is remembered for the session:
+  a builder can fail on one odd frame of data, and that must not cost you your layout for
+  the rest of the flight.
+
+- **"Reset to defaults" left your colour overrides on screen until the next reboot.** The
+  config file was reset correctly — the colours were not, so the page said *defaults* and the
+  dashboard still showed the old ones, which reads as the reset not having worked. Overridden
+  colour roles are deliberately not written to the file (that is what keeps a config small),
+  and nothing put the live ones back. They revert on the spot now.
+
+- **Saving a template over an unreadable template file wiped it.** *Manage templates*
+  already refuses to open while your own templates cannot be read — but the sensor picker's
+  **Save** never asked, and with the file unreadable the list it writes back holds the
+  built-ins alone. One save replaced your templates with nothing; a second one dropped the
+  backup copy too. Save now makes the same refusal, and says so where you actually end up —
+  the chart — instead of only on a page you have just left.
+
+- **A hand-stocked template with more than four sensors lost the extras on first use.** The
+  documented shape of a template file is a *superset*: list as many sensors as you like and
+  the log's own header decides which four are drawn. That trimming had moved to load time, so
+  the first rename, move or *Hide built-ins* wrote the shortened list back and the rest were
+  gone for good. The list is kept whole again and capped only where it is displayed.
+  Two smaller ones with it: template names from the file now go through the same clean-up as
+  a name typed on the radio (a duplicate gets a number instead of appearing twice, where
+  before the second card was unreachable), and a name that already belongs to a built-in is
+  refused even while *Hide built-ins* is on — it used to be accepted and then collide the
+  moment you switched the built-ins back on.
+
+- **A shortcut could open a detail page you had no way to close.** Detail pages are
+  fullscreen pages — the tap that closes them needs touch, and a widget-grid zone gets none.
+  The tap and menu routes are fullscreen-only anyway, so a switch shortcut was the one way to
+  strand yourself on one. Shortcuts to detail pages now wait for fullscreen exactly as
+  shortcuts to Toolbox tools already did, and a shortcut-opened *Status log* starts at the
+  top instead of inheriting the scroll position of the last one.
+
+- **A missing detail-page module took the whole widget down.** If `ultidashDetail.lua` did
+  not make it onto the card, the log said *"detail pages disabled"* — and then the widget
+  died on the next start anyway, because the module was called before that promise could be
+  kept. The check now covers everything the host later relies on, taps on the four detail
+  zones do nothing while there is nothing to open (they used to eat the following tap and
+  leave the menu glyph dead for one press), and a *"Skin page failed"* banner no longer
+  lingers after switching to a layout that simply has no page of its own.
+
+- **An empty value in a config file swallowed the next two settings.** The parser read the
+  whole file as one stream instead of line by line, so on a line with nothing after the `=`
+  the whitespace rule ate the line break and the value rule then took the *following* line as
+  the value — one setting lost its value, the next vanished entirely. A comment line
+  containing an `=` was read as a setting for the same reason. Every line is now matched on
+  its own and anchored to its start. Two more of the same family went with it: a config file
+  written by a *newer* UltiDash no longer has its schema stamp pushed backwards by an older
+  one (which made the next upgrade migrate a file that was already migrated), and the one-time
+  adoption of a pre-0.7.0 file is written through a temporary file and only then renamed into
+  place — a write that runs out of card used to leave a stub behind that permanently hid the
+  intact original.
+
+- **Deploying UltiDash without the layouts deleted their settings.** Saving anything drops
+  config keys that no current setting knows, which is what retires keys from older versions —
+  but a layout that is not on the card never gets to say which keys are its own, so one save
+  was enough to remove a configuration nobody had touched. Since the layouts ship separately
+  this was one forgotten copy step away. The config now remembers which layouts it was written
+  with and holds that clean-up while one of them is missing, exactly as it already did for a
+  layout that is on the card but broken. Removing a layout for good simply leaves its keys in
+  the file.
+
+- **A battery whose line carried a `recycles=` or `ballast=` field had it overwritten.**
+  The post-flight stamp looked for `cycles=` and `last=` anywhere in the line, so it found them
+  inside longer field names of your own and counted up — or dated — the wrong field. Both are
+  now recognised only where a field can actually start.
+
+- **A layout's config migration could fail without a trace.** The host runs it inside a
+  guard so a bad one cannot take the dashboard down, but the failure was never logged, and a
+  migration that silently never ran is indistinguishable from one with nothing to convert. It
+  now names the layout and the error in the log.
+
+- **Opening *Settings ▸ Skin* with the Dash1 layout killed the widget.** On a TX16S MK3 the
+  page painted itself and then a red `ERROR in widget: CPU limit` over the top, dimmed
+  everything under it and stopped responding — the settings menu could not even be left. It
+  needed a model with a normal amount of telemetry to show up, which is why it reached a radio
+  rather than a test: the more sensors the model has discovered, the more expensive the page,
+  and Dash1's is the widest one in the program at 34 rows with eleven sensor pickers.
+  Two things shared one allowance. Every sensor row asked *"where in the pick list is my
+  current value?"* on **every frame** and answered it by walking the whole list — eleven rows
+  times a ~39-entry list, every frame, for a value that only moves when you tap something. And
+  the pick list itself, a scan of all 60 of the model's sensor slots, was built inside the same
+  call that builds the page; the live closures of an LVGL page run on whatever instructions
+  that call leaves over, so there was nothing left for them. Now the list is built in the
+  page's existing preparation call — the one that already stages the working copy, one
+  invisible frame earlier — and the rows look their value up in a table instead of searching
+  for it. Nothing about the page changes: the same 34 rows, the same values, the same edits.
+  This is host-side, so **every** layout with sensor rows got cheaper, not just Dash1. Worst
+  measured page cycle on the MK3, build plus its own live closures: Dash1 17469 → 13281,
+  Cockpit 15091 → 11484, Grid 13618 → 11463. Reproduced in the simulator harness on the MK3
+  from the reporting pilot's own 262-key configuration — red before the change, clean after,
+  including with a raw (uncurated) sensor picked.
+
+- **The budget harness could not see per-frame cost at all, and now can.**
+  The PC-side instruction-budget check (a development tool, not part of the release)
+  collected each page's live closures and ran them *after* the call it was timing, so every
+  number it ever printed was build cost only — a page could pass at 13541
+  and still die on the radio, which is what happened above. It now invokes each build's own
+  closures inside a counted window and reports the **cycle**: build plus frame, which is the
+  number EdgeTX's 20000 is actually applied to. Its model also carries 50 telemetry sensors now
+  instead of none, so sensor pickers are measured at the size a real model gives them.
+
+- **The Log Viewer's sensor picker could die and stay dead.** Open a log, tap *Custom
+  sensors*, fold a group open, and the page could paint a red `ERROR in foreground calRefs
+  error` over itself, dim everything under it and stop responding — no tap did anything after
+  that, and only leaving the page cleared it. It got likelier with every sensor row shown, and
+  the bigger the screen the worse, so the 800×480 MK3 saw it most. It was there before the
+  template manager, which merely sat on the wrong side of a limit that was already reached.
+  Two things were spending the same budget. The page hung a live closure on each row — three
+  per row, twelve rows on the MK3 — and those closures run on whatever instructions are left
+  over from building the page that created them, so the build and its own machinery competed
+  for one allowance. And the grouping of the log's ~100 columns was recomputed every single
+  time a group was folded or unfolded, although it only depends on the file. Now the page
+  redraws instead of animating itself — a sensor tap costs the same redraw that folding and
+  scrolling always cost, and the picture is identical — and the grouping is worked out once
+  per log. Measured in the simulator harness on the MK3, over the folded picker, one-, two-
+  and twelve-sensor groups in both List and Grid: red before, clean in four runs of four
+  after.
+
+- **The first-run hint clipped its own title on every radio.** The *UltiDash setup* panel that
+  greets a fresh placement split its height into four equal lines and then drew the title in a
+  larger font than the three lines below it, so the title never had the room it needed — worst
+  on the 480×272 TX16S, which has the least to spare. The panel now measures both fonts and
+  grows if it has to.
+
+- **Two texts overflowed their box on some radios.** *Diversity: yes/no* in the ELRS page
+  footer had a hardcoded height that only fitted the two 480-wide radios, so it was the MK3
+  that clipped it; it is measured now. And *Status ▸ Repeat* — the summary of which alerts
+  repeat and how often — is a generated line whose length grows with the number of active
+  alerts, which wrapped to two lines inside a one-line row on the TX15 and the TX16S. That row
+  now takes a second line when it needs one, rather than the summary being shortened: it is a
+  diagnostic line and all of it is worth keeping.
+
+- **A *Debug log* left switched on could kill the widget on the next start.** With the option
+  already stored when UltiDash starts, the developer perf overlay is built before the first
+  performance sample exists, and it handed its label an empty text — which aborts the refresh
+  pass and takes everything below it: the screen freezes on the first frame, no callout is
+  ever spoken, and the debug log stays at its session header. Switching the option on from the
+  menu never reached that state, which is why it stayed hidden. The overlay now shows `-`
+  until the first sample arrives, as it was always meant to. Found in the simulator harness;
+  on a radio it needs the widget to start within the first second of power-on, so it is
+  unlikely to have been seen in the field.
+
+- **An in-flight telemetry dropout lost the whole flight's log line.** Lose the link long
+  enough in flight for the RF tool to drop and reconnect, and the flight was missing from
+  `flights.csv` afterwards — however long it had been. Same root cause as the callout below,
+  one branch over: the flight record is meant to be flushed **at** an armed disconnect,
+  precisely because a later reconnect resets the flight-time counter, and that branch asked the
+  same impossible question. So the flush waited for the falling ARM edge instead, which arrives
+  only when the link comes back — by which time the reconnect had zeroed the clock, and the
+  flush computed a flight of 0 seconds and wrote nothing. The widget's own defence against
+  exactly that (`counter was reset mid-record`) cannot fire on a session's first flight. Both
+  branches now read the ARM sensor. Measured in the simulator harness against a real flight
+  controller (`fcfltgap`): a 6.4 s gap in a 33 s armed flight wrote **no row** before and
+  writes the flight's row after. Lose telemetry while
+  flying and UltiDash was supposed to announce *telemetry lost*, repeat it, and say
+  *telemetry ok* on the reconnect. On the bench it did; in the air it never could. The
+  escalation asked whether the RF tool's **previous** state was `armed` at the moment it went
+  `disconnected` — and at a real loss it never is: the tool loses the ARM value about 1.3
+  seconds after the frames stop and reports `disarmed`, and only about 4.9 seconds later does
+  its own connection timeout make it `disconnected`. So the gate compared `disarmed` with
+  `armed` and the whole alert stayed silent, together with the *telemetry ok* on the
+  reconnect and the escalation-volume boost that hangs off the same latch. It had only ever
+  been seen working against a stand-in that jumped straight from armed to disconnected.
+  UltiDash now asks the **ARM sensor** whether the craft was flying when the link went away.
+  That is the one signal that survives the gap — the sensor keeps serving its last received
+  arming word for EdgeTX's own ~30 s expiry, an order of magnitude longer than the tool's
+  timeout — while a **normal disarm is unaffected**, because there the cleared arming word
+  still reaches the radio over the live link and reads as disarmed. Measured end to end
+  against a real Rotorflight 4.6.0 and the real RFTool 2.3.0 in the simulator harness
+  (`fctelemlost`: three announcements 5.21 / 5.26 s apart and one *telemetry ok*, where the
+  same run measured none before), with `fctelemdisarm` as its negative control: land, disarm,
+  unplug — and nothing is announced. Plug a fresh pack
+  in soon after unplugging the last one and the start-up cell check announced *battery low*
+  with the voltage the **previous** flight ended on, and turned the battery gauge amber — on a
+  full pack. Reproduced on 2026-08-01 and dated to the millisecond from the widget's own Debug
+  log: the check reached its verdict **3.35 seconds before the new pack reported anything at
+  all**. The cause is a platform behaviour rather than a stale variable — EdgeTX keeps handing
+  Lua the last value it received until the new telemetry session replaces it, so the reading
+  the check armed on was a perfectly current read of a battery that was already off the
+  helicopter. The check now recognises a reading that is unchanged since the last session and
+  **waits** for the connected pack to report (up to 30 s, after which the existing "no value"
+  warning stands). Nothing is suppressed: a pack that really is low still announces, at the
+  voltage it actually has. Only a *fast* pack change was affected — leave a minute between
+  packs and the sensor had already been reset. Covered by a regression test that fails
+  without the fix.
+- **"CPU limit" when arming with the settings page still open.** Changing any setting and
+  then arming (with telemetry connected) could kill the widget with
+  `ERROR in widget: .../ultidash.lua: CPU limit`. The autosave wrote the cfg file **and**
+  re-resolved it into the options in a single widget call — together most of EdgeTX's ~20k
+  instruction budget — and the arm-close path runs that inside the 5 Hz telemetry pass, so
+  the call went over (measured 22.4k). The autosave is now staggered like the deferred
+  start-up: one cycle writes the file, the next resolves it, neither sharing a call with
+  other work (measured 11.1k / 6.5k). Costs two invisible frames; nothing changes for the
+  user beyond the crash being gone. Present since the autosave was introduced — reported
+  from a v0.6.1 radio, but v0.7.0 had it too. The budget harness now covers both autosave
+  callers (RTN close and arm-close) including the deferred stages.
+- **The first fuel callout after arming on a FULL pack was swallowed.** With the default
+  10 % step the descending ladder started speaking at *80 %*, never at *90 %*. The
+  "first observation after arming" is meant to be adopted silently (so arming on a
+  half-used pack doesn't fire a callout straight away) — but it was consumed on the first
+  *change* of the level rather than on the first *pass*, and on a full pack the first
+  change IS the first real step. Replayed through the fuel-callout replay tool (development only): a 100 % → 25 %
+  descent now announces 90 / 80 / 70 …; arming on a half-used pack is unchanged.
+- **Skin session min/max never updated on the dashboard.** A skin declaring
+  `M.wants_extrema` only ever saw its `min`/`max` fill while the *Telemetry* detail page
+  was open, and then froze at that state — the manifest flag was read but never copied off
+  the skin module, so the opt-in was inert. The budget harness now asserts the effect, not
+  just the cost.
+- **Reset to defaults** wrote every "unset" colour role into the cfg as `-1` (~57 keys per
+  scheme). That inflated the file, rebuilt exactly the cfg-parse load the save path
+  deliberately avoids, and made the reset write the single heaviest call in the widget
+  (17k of the ~20k budget). It now follows the same rule as a normal save, and — like the
+  autosave — is staggered into its own cycles (measured 9.6k / 6.9k).
+- **Fixed (tag-less) colour schemes were not actually fixed.** They fell through to the
+  UltiDash scheme's override keys and so inherited that scheme's user colours. Documented
+  behaviour (docs/SKINS.md §6) now matches the code. Colliding scheme tags between skins
+  are reported in the debug log during discovery.
+- **Layout: several boxes were sized in fixed pixels for an unmeasured font** — the four
+  detail pages' *tap to close* hint, the *Telemetry*/skin-failure placeholder texts and the
+  Status page's rows. On the 800×480 MK3, where the fonts are taller, that clipped
+  descenders. All measured now, as the rest of the UI already does.
+- **Menus and settings on a short screen (480×272 class).** Row heights and the page-header
+  reserve were decided purely from `zone.h`, but the EdgeTX controls they must clear
+  (toggle switches, the page title bar) scale with the *theme*, not the screen height — so
+  on a 480×272 radio the settings rows would have been shorter than their own toggles, the
+  exact overlap that the taller rows were introduced to fix. Row heights now take
+  `lvgl.UI_ELEMENT_HEIGHT` as a floor and the header reserve is constant. The 800×480 MK3
+  and 480×320 TX15 are unaffected. A battery-picker button *width* that was keyed on the
+  screen *height* was corrected too.
+- Small fixes: the debug perf overlay no longer sits on top of the menu button (it would
+  hide the only way to switch itself off again), the Log Viewer's pan checks the RAM cache
+  for the window it actually lands on, and the passive-view style signature can no longer
+  alias with 16 skins installed.
+
 ## v0.6.1 — 2026-07-23
 
 Maintenance release on top of v0.6.0: one small battery-callout option plus Log Viewer
@@ -97,11 +623,10 @@ field.**
   (OK / not-full warn / low / critical / cell-check) and the top-bar TX battery icon
   (OK / low) — historically fixed — now have their own *Battery* section on each Colors
   page. Defaults are unchanged.
-- **PC-side instruction-budget check** (`tools/check_budget.lua`, dev tool): loads the real
+- **PC-side instruction-budget check** (a development tool, not part of the release): loads the real
   widget sources with EdgeTX API stubs and counts Lua VM instructions per lifecycle call
   with the same hook mechanism as EdgeTX's ~20k "CPU limit" — so a budget overrun is
-  visible before deploying. Run `lua tools/check_budget.lua` (repo root, `-v` for
-  per-cycle detail; exit 0 = within budget).
+  visible before deploying, not as a crash on the radio.
 - **Governor-state voice callouts.** New *Gov voice* settings group announces the governor
   state (the `Gov` sensor) on every change **in flight (armed only)** — "spooling up",
   "governor active", "throttle hold", "autorotation", "bailing out", "governor fallback",
@@ -416,6 +941,19 @@ field.**
   so UltiDash picks up the new theme colours.
 
 ### Fixed
+- **Flight values panel: wide numbers no longer collide with their unit.** A number is drawn
+  in the column width left of its unit suffix, so a wide value plus a wide unit overran on the
+  narrow TX15 (a 4-digit *Headspeed* pushed into/under the "rpm" label). Each row now sizes its
+  own value font to the biggest that fits its widest value *beside* its unit, so every row keeps
+  its unit and stays as large as it can — only a genuinely wide row (4-digit Headspeed + "rpm")
+  ends up a touch smaller, instead of one shared font shrinking the whole panel or units being
+  dropped.
+- **Settings hub: the "General" group (Debug log, Config-per-craft, Flight log) is
+  reachable again.** The menu grid lays out group tiles section by section, and the
+  section run-lengths still summed to 12 after the *Skin* group was added as a 13th group,
+  so the last group ("General") fell off the grid entirely — its settings still worked with
+  their saved values but couldn't be opened. The section runs now sum to 13 (Battery &
+  limits holds ESC load again), which also re-aligns the shifted section headers.
 - **Colour picker: theme/fixed swatch picks no longer come back as dark blue.** The
   native EdgeTX colour popup returns two encodings: RGB/HSV pad picks arrive as an
   RGB565 value, but the *Theme* tab and the fixed swatch buttons return a raw colour
@@ -663,7 +1201,7 @@ field.**
   and the Log Viewer's footer/filter rows are all memoized now — text is rebuilt only
   when a value actually changes. Pixel-identical, steady GC pressure gone. The radio's
   general settings (TX battery limits) are also read once per 10 s instead of per pass.
-- **The budget check now measures the historically risky paths.** `tools/check_budget.lua`
+- **The budget check now measures the historically risky paths.** The development-only check
   runs every settings group, the submenus, the detail pages, sensor check and toolbox
   menu, plus a connected-FC pass with a legacy-cfg migration fixture, and reports
   per-chunk module-load costs — the class of overrun that used to surface as a "CPU

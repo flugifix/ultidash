@@ -318,13 +318,20 @@ end
 --- rf2.settingsSaved(true, false) — the no-reboot path (cf. rotorflight-lua-scripts
 --- commit 4fbe4b9, which flipped the battery page's reboot flag true→false). Finally
 --- re-reads so the dashboard reflects the new profile's capacity/thresholds.
---- DISARMED ONLY (msp_allowed gate); the FC also rejects config writes while armed.
+--- DISARMED ONLY (msp_allowed AND the ARM sensor); the FC also rejects config writes
+--- while armed.
 --- index is 0-based (0..5 = profile 1..6). Returns true if the write was queued.
 local function set_battery_profile(wgt, index)
     if not rf2 or not rf2.useApi then return false end
     if type(index) ~= "number" or index < 0 or index > 5 then return false end
     local state = ensure_rf_state(wgt)
     if not state.msp_allowed then return false end
+    -- defense-in-depth, exactly as read_rf_data has it: msp_allowed flips only on the
+    -- RFTool callback, which lags the ARM sensor and on documented setups never reports
+    -- the armed sub-state at all. A picker press inside the close-on-arm window reached
+    -- the write. The ARM sensor decides armed-questions, so the "DISARMED ONLY" above is
+    -- now true of the only MSP WRITE this widget makes.
+    if craft_armed(wgt) then return false end
 
     local ok = pcall(function()
         rf2.useApi("mspBatteryProfile").write({ batteryProfile = { value = index } })

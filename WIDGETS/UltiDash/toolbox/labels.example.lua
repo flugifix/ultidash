@@ -1,48 +1,47 @@
 -- =====================================================================
---  UltiDash Toolbox  -  Nutzer-Beschriftungen  (Vorlage)
+--  UltiDash Toolbox  -  custom labels  (template)
 --
---  So benutzt du die Datei:
---    1. Diese Datei nach  /WIDGETS/UltiDash/toolbox/labels.lua  kopieren.
---    2. In labels.lua nur das eintragen, was du aendern willst.
---    3. Modell neu laden (oder Funke neu starten) -> Aenderung aktiv.
+--  How to use this file:
+--    1. Copy it to  /WIDGETS/UltiDash/toolbox/labels.lua
+--    2. In labels.lua, enter only what you want to change.
+--    3. Reload the model (or restart the radio) -> the change is live.
 --
---  Adjust Map UND Adjust Editor lesen labels.lua beim ersten Oeffnen
---  ein und legen die Eintraege PARTIELL ueber ihre Defaults:
---    * nicht gesetzt (nil) -> Default bleibt
---    * leerer String ""    -> Slot wird geleert (kein +/- mehr)
+--  Adjust Map AND Adjust Editor read labels.lua the first time they are
+--  opened and lay the entries PARTIALLY over their defaults:
+--    * not set (nil)     -> the default stays
+--    * empty string ""   -> the slot is cleared (no +/- any more)
 --
---  WICHTIG: labels.lua wird bei einem Update NICHT ueberschrieben --
---  ein Update ersetzt nur die Toolbox-/Widget-Dateien. Diese
---  .example-Datei darf dagegen ersetzt werden.
+--  IMPORTANT: labels.lua is NOT overwritten by an update -- an update
+--  replaces only the Toolbox/widget files. This .example file, on the
+--  other hand, may be replaced.
 --
---  Damit ist die dargestellte Tabelle KOMPLETT frei umbaubar: jede
---  Zelle (Funktionsname je Position [1]..[6] pro Trim-Zeile) und die
---  Spalten-Kuerzel (sub) -- passend zu einer eigenen adjfunc-Belegung
---  auf dem FC.
+--  So the displayed table is COMPLETELY free to rebuild: every cell
+--  (function name per position [1]..[6] per trim row) and the column
+--  abbreviations (sub) -- to match your own adjfunc assignment on the FC.
 --
---  Aufbau:
---    rows[ZeilenNr] = { [1] = "...", ... [6] = "..." }  -- Funktionsname je Pos
---    sub = { "P","I","D","F","O","B" }                  -- optional: Spalten-Kuerzel
---    ranges[ZeilenNr] = { [1] = "...", ... [6] = "..." }-- optional: Bereichs-Hinweise
---                                                       --   des Editors (TbBert)
+--  Structure:
+--    rows[rowNo] = { [1] = "...", ... [6] = "..." }   -- function name per pos
+--    sub = { "P","I","D","F","O","B" }                -- optional: column labels
+--    ranges[rowNo] = { [1] = "...", ... [6] = "..." } -- optional: the editor's
+--                                                     --   range hints (TbBert)
 --
---  ZeilenNr:  1=Pitch  2=Roll  3=Yaw  4=Throttle  5=Trim 5  6=Trim 6
---  Position:  1..6  entspricht den Spalten P / I / D / F / O / B
+--  rowNo:     1=Pitch  2=Roll  3=Yaw  4=Throttle  5=Trim 5  6=Trim 6
+--  Position:  1..6  corresponds to the columns P / I / D / F / O / B
 -- =====================================================================
 
 return {
 
-  -- Spalten-Kuerzel (optional). Auskommentiert = Default P/I/D/F/O/B.
+  -- Column abbreviations (optional). Commented out = default P/I/D/F/O/B.
   -- sub = { "P", "I", "D", "F", "O", "B" },
 
   rows = {
 
-    ---- Beispiele: nur einzelne Dinge aendern ----
-    -- [3] = { [5] = "Gov Cyc FF (eigen)" },   -- nur Zelle Yaw / Pos 5
-    -- [1] = { [1] = "Pitch P (eigen)" },      -- nur Zelle Pitch / Pos 1
-    -- [6] = { [4] = "", [5] = "" },           -- Slots leeren
+    ---- Examples: change single things only ----
+    -- [3] = { [5] = "Gov Cyc FF (own)" },     -- only cell Yaw / pos 5
+    -- [1] = { [1] = "Pitch P (own)" },        -- only cell Pitch / pos 1
+    -- [6] = { [4] = "", [5] = "" },           -- clear slots
 
-    ---- Vollstaendige Defaults zum Kopieren & Anpassen (auskommentiert) ----
+    ---- The complete defaults, to copy and adapt (commented out) ----
     -- [1] = { "Pitch P Gain", "Pitch I Gain", "Pitch D Gain", "Pitch F Gain", "Pitch O Gain", "Pitch B Gain"  },
     -- [2] = { "Roll P Gain",  "Roll I Gain",  "Roll D Gain",  "Roll F Gain",  "Roll O Gain",  "Roll B Gain"   },
     -- [3] = { "Yaw P Gain",   "Yaw I Gain",   "Yaw D Gain",   "Yaw F Gain",   "Gov Cyc FF",   "Yaw B Gain"    },
@@ -52,11 +51,11 @@ return {
 
   },
 
-  -- Bereichs-Hinweise des Editors (Option "Adj editor: ranges hint" / TbBert):
-  -- gleiche Struktur wie rows, nur Strings; "" blendet einen Hinweis aus.
-  -- Nicht gesetzte Zellen behalten die eingebauten Default-Hinweise.
+  -- The editor's range hints (option "Adj editor: ranges hint" / TbBert):
+  -- same structure as rows, strings only; "" hides a hint.
+  -- Cells that are not set keep the built-in default hints.
   -- ranges = {
-  --   [1] = { [1] = "90-150" },                -- Pitch / Pos 1
-  --   [5] = { [1] = "0-50" },                  -- eigener Hinweis fuer eine eigene Zelle
+  --   [1] = { [1] = "90-150" },                -- Pitch / pos 1
+  --   [5] = { [1] = "0-50" },                  -- your own hint for your own cell
   -- },
 }

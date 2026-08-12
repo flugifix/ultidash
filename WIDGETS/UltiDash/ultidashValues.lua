@@ -31,7 +31,8 @@ local vtx_col_lo = lcd.RGB(0xff, 0x33, 0x33)
 local st_armed    = lcd.RGB(0x20, 0xB0, 0x20)
 local st_disarmed = COLOR_THEME_WARNING
 
--- scheme kept for future use; colours come from the handed-in `p` and `sem` (see ultidash.lua).
+-- scheme (a SCHEMES descriptor since the registry refactor) kept for future use; colours
+-- come from the handed-in `p` and `sem` (see ultidash.lua).
 function M.set_palette(scheme, p, sem)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]

@@ -2,7 +2,7 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.6.1 (2026-07-23) — experimental`
+`Status: v0.7.0 — in development, experimental`
 
 > 🚀 **New to UltiDash?** See it first in the **[Illustrated Walkthrough](docs/WALKTHROUGH.md)**,
 > then get it running with the **[Quick Start guide](docs/QUICKSTART.md)** — the shortest path
@@ -55,9 +55,9 @@ At a glance — full detail in the **[Features](#features)** list below.
 - **ESC load monitor** *(opt.)* — utilization bar + overload alarm.
 
 **Config & tools**
-- **In-widget settings menu** — saved per EdgeTX model slot (optional *per craft*); no EdgeTX option list.
+- **In-widget settings menu** — saved per EdgeTX model; no EdgeTX option list.
 - **Configurable value slots** — any sensor + selectable current source.
-- **Toolbox** *(opt.)* — **RF2 Config** (full FC setup on the radio — bind to a shortcut) · Log Viewer (`/LOGS` graphs) · RF Adjustment · Flight Log.
+- **Toolbox** *(opt.)* — **RF2 Config** (full FC setup on the radio — bind to a shortcut) · Log Viewer (`/LOGS` graphs) · RF Adjustment · Flight Log · FC battery profile.
 - **Flight log & battery management** *(opt.)* — per-flight CSV + per-pack cycle counting.
 - **Sensor check** — flags any missing/renamed telemetry sensor.
 - **No external libraries.**
@@ -110,8 +110,8 @@ here, I will of course respect that.
   UltiDash writes to the FC — disarmed only; everything else is read/announce-only.)*
 - **In-widget settings menu** — no EdgeTX option list to fight: open the full-screen menu
   and edit everything with real toggle switches, dropdowns and +/− steppers, grouped into
-  named pages. Settings are **saved per EdgeTX model slot** on the SD card — shared by every
-  Rotorflight craft flown on that slot, with an optional *per craft* split (see below).
+  named pages. Settings are **saved per EdgeTX model** on the SD card — shared by every
+  Rotorflight craft flown on that model (see below).
 - **Voice & vibration callouts, configurable per alert** — fuel % (or the pack / cell
   voltage — the descending %-step callouts can speak voltage instead of, or alongside, the
   percent), cell/pack voltage (announce as cell **or** pack, independent of the display),
@@ -143,12 +143,16 @@ here, I will of course respect that.
     from the radio (needs a one-time model setup).
   - **Log Viewer** *(WIP)* — graph `/LOGS/*.csv` on the radio: swipe the file list, pick a
     built-in template or a category-grouped sensor set, then zoom / pan / drag a time cursor
-    over up to 4 curves.
+    over up to 4 curves. Own template sets are made and managed **on the radio** — save a
+    picked set, then rename, duplicate, reorder or delete it from the same page.
   - **RF2 Config** — the original Rotorflight configuration tool (rotorflight-lua-scripts)
     opened straight from the dashboard, run unmodified from `/SCRIPTS/RF2/` (needs the RF
     Tool widget; disarmed only).
   - **Flight Log** — browse the flight log on the radio: recent flights, per-model
     totals and battery usage (see the flight-log feature below).
+  - **Battery profile** — the same FC battery-profile picker the dashboard's *B-Profile*
+    field opens, so it stays reachable under a layout that offers no such field (disarmed
+    and MSP-connected only — it is the one page that writes to the FC).
 - **Flight log & battery management** *(optional, off by default)* — log every flight
   (date, time, FC model name, tracked flight time) to an import-friendly
   `fltlog/flights.csv`, with a configurable **minimum flight time** so spool-up tests
@@ -161,10 +165,6 @@ here, I will of course respect that.
 - **Sensor check** *(diagnostic)* — a read-only menu page that lists the sensors UltiDash
   needs and flags what is **OK / no data / missing**, with a one-line note on what each gap
   breaks — the fastest way to spot a mis-discovered or renamed telemetry sensor.
-- **Second-screen views** — place UltiDash again on another screen set to **ELRS details**
-  or **Status info**; these passive instances mirror the dashboard's data. *(**Feedback
-  wanted:** I'm unsure how much this is actually used — if you rely on it, please open an
-  issue; otherwise I reserve the right to remove it in a future version.)*
 - **No external libraries** — the dashboard loads only its own files. *(The one exception is
   the optional **RF2 Config** tool, which by design runs the stock Rotorflight scripts already
   on your SD card at `/SCRIPTS/RF2/`.)*
@@ -201,10 +201,14 @@ SOUNDS/en/ultidash/    →  <SD>/SOUNDS/en/ultidash/
 SOUNDS/de/ultidash/    →  <SD>/SOUNDS/de/ultidash/
 ```
 
-Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen. The
-only EdgeTX widget option is **`ViewMode`** (Dashboard / ELRS details / Status info) —
-leave it on **Dashboard** for the main instance. Everything else is configured inside the
-widget (see below).
+Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen —
+**one instance per model**. The widget has no EdgeTX options; everything is configured
+inside the widget (see below).
+
+> ⚠️ **Upgrading from a version with `ViewMode`:** the second-screen *ELRS details* /
+> *Status info* views were removed. A second instance that used one of them becomes a
+> full dashboard after the update (a "2 Dashboard instances active!" banner appears) —
+> delete that second instance.
 
 > ℹ️ **Telemetry sensors.** UltiDash resolves its known sensors by their Rotorflight sensor
 > **ID**, so leftover empty EdgeTX duplicate sensors (`RxBt`, `Curr`, …) no longer *shadow*
@@ -216,8 +220,8 @@ widget (see below).
 
 ## Configuration
 
-There is essentially **one EdgeTX widget option, `ViewMode`** — all real configuration
-lives in an **in-widget settings menu**:
+There are **no EdgeTX widget options** — all configuration lives in an **in-widget
+settings menu**:
 
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **menu symbol** (the ☰ glyph, top-left, next to the clock) — *disarmed only*.
@@ -229,35 +233,47 @@ The **Settings** submenu — a 3-column grid in four themed sections:
 
 | Section | Group | Covers |
 |---------|-------|--------|
-| *Appearance* | **Display** | top-left content + clock format, color scheme / background, stats-page mode, voltage display, the top-bar bar toggles, TPWR bar max, detail-page behaviour, quiet bars |
-| | **Colors** | **per-scheme color overrides**: one page per scheme — palette slots, traffic-light status colors, UI chrome and the battery-bar / TX-battery fills, each with a native color picker + per-color *Def* reset |
-| | **Telemetry** | submenu: **Tele Main** — the 5 right-hand dashboard value slots (curated sensors, *Voltage (auto)*, *ESC Load (calc)* — or **any raw sensor** via the native picker); **Tele Details** — the 12 sensor slots of the Telemetry detail page (same hybrid pickers) |
-| *Battery & limits* | **Battery** | reserve %, fuel-callout density, **fuel callout value (percent / pack / cell voltage)**, cell-threshold source (FC config / manual cell voltages), startup cell-check delay, **current sensor**, **announce voltage as cell/pack** |
-| | **Thresholds** | link (RQly) warn/crit, RSSI warn/crit/hold, skipped-packet limit, power-warn voltage, BEC warn/crit, **ESC/MCU temperature warn/crit** |
+| *Appearance* | **Display** | **dashboard skin**, background fill, unit suffixes, stats-page mode, voltage display, detail-page behaviour |
+| | **Skin** | the **active skin's** own colour scheme + layout options (the UltiDash skin: top-left content, clock, timer, the top-bar toggles, quiet bars, status-bar TPWR). Pick the layout with *Display → Dashboard skin*; this release carries the built-in **UltiDash** look (see [docs/SKINS.md](docs/SKINS.md) — **skins are in development**) |
+| | **Colors** | **per-scheme color overrides**: one page per scheme *of the active skin* — palette slots, traffic-light status colors, UI chrome and the battery-bar / TX-battery fills, each with a native color picker + per-color *Def* reset |
+| *Battery & limits* | **Telemetry** | submenu: **Tele Main** — the 5 right-hand dashboard value slots (curated sensors, *Voltage (auto)*, *ESC Load (calc)* — or **any raw sensor** via the native picker); **Tele Details** — the 12 sensor slots of the Telemetry detail page (same hybrid pickers) |
+| | **Battery** | reserve %, fuel-callout density, **fuel callout value (percent / pack / cell voltage)**, cell-threshold source (FC config / manual cell voltages), startup cell-check delay, **current sensor**, **announce voltage as cell/pack** |
+| | **Thresholds** | link (RQly) warn/crit, RSSI warn/crit/hold, skipped-packet limit, **TX power limit (ELRS dynamic-power ceiling)**, power-warn voltage, BEC warn/crit, **ESC/MCU temperature warn/crit** |
 | | **ESC load** | the ESC continuous-current load monitor: master switch, limit GVAR, warn/critical %, alarm hold time, load-bar placement (Current row / vertical in the battery gauge) |
 | *Sound & callouts* | **Volume** | fixed callout volume + when it applies, the optional **master-volume bridge via GVAR** with normal / escalation percentages, and a **Test/Play** preview row |
 | | **Alerts** | **voice language (English / Deutsch)**, master mute, overlay auto-close, and **one page per alert**: active, repeat (count / interval), escalation volume, vibrate, fullscreen overlay (critical alerts) — plus a **Test/Play** row per alert that previews its real callout |
 | | **Voice** | submenu: **Switch voice** — announce motor / rescue / governor / profile from a chosen TX switch (physical **or** logical, native picker); **Gov voice** — announce the governor state on change (armed only), master toggle + per-state enables |
 | *System* | **Shortcuts** | bind switches to pages hands-free — 6 position slots (hold = open) + 2 toggle slots (press to step), targeting any detail page **or** Toolbox tool |
 | | **Toolbox** | the RF adjustment tools: channels, GVAR pulse, look & voice (see [docs/TOOLBOX.md](docs/TOOLBOX.md)) |
-| | **General** | per-craft config, the **debug log** (off by default) + how many log sessions to keep, and the **flight log / battery query / FC-profile-on-pick** switches |
+| | **General** | the **debug log** (off by default) + how many log sessions to keep, and the **flight log / battery query / FC-profile-on-pick** switches |
 
 Each group page also has a **Reset … to defaults** button that resets only that page; the
 *Reset to defaults* button below the settings grid resets the whole model.
 
-> 🎨 **About the color scheme (Display → Color scheme).** Three palettes: the built-in
-> **UltiDash** look (the path I actually fly and test), **UltiDash dark** (high-contrast
-> white-on-black with neon accents), and an **EdgeTX theme** option (theme-aware — **not my
-> personal focus**, less tested, feedback welcome). Every scheme's colors can be customized
-> under **Settings → Colors** (per model, with per-color *Def* reset). If something looks
-> off under the theme palette, please open an issue with a screenshot.
+> 🧪 **The skin system is in development.** The dashboard layout is pluggable: the engine,
+> the skin API, the discovery (`skins/*.lua`) and the *Skin* settings group are part of this
+> release, and the built-in **UltiDash** look is a skin like any other. The **additional
+> layouts are not part of it** — they are still being reworked, and the API they are written
+> against may still change in ways that break a skin written against today's version. Read
+> [docs/SKINS.md](docs/SKINS.md) as a preview rather than as a stable contract.
+
+> 🎨 **About the color scheme (Skin → Color scheme).** Colour schemes belong to the skin.
+> The **UltiDash** skin offers three palettes: the built-in **UltiDash** look (the path I
+> actually fly and test), **UltiDash dark** (high-contrast white-on-black with neon
+> accents), and an **EdgeTX theme** option (theme-aware — **not my personal focus**, less
+> tested, feedback welcome). Other skins bring their own schemes. Every scheme's colors can
+> be customized under **Settings → Colors** (per model, with per-color *Def* reset). If
+> something looks off under the theme palette, please open an issue with a screenshot.
 
 Edits are **saved automatically** when you leave the page (back arrow or RTN) and stored
-**per EdgeTX model slot** in `/WIDGETS/UltiDash/cfg/cfg_m_<model-slot>.cfg` — so every
-Rotorflight craft flown on that slot shares them. The slot keying survives Rotorflight's
-"set model name on TX" renaming. Enable *General → Config file per craft* to keep a
-separate file per craft flown from the same model slot. (Config files from older
-versions that still sit in the widget root are moved into `cfg/` automatically on start.)
+**per EdgeTX model** in `/WIDGETS/UltiDash/cfg/cfg_m_<model-name>.cfg` — so every
+Rotorflight craft flown on that model shares them. The key is the **model name**, which
+survives both Rotorflight's temporary "set model name on TX" renaming and the model-file
+renumbering that EdgeTX Companion does when models are added or deleted. Two models with
+the same name share one file, so give a copied model its own name if it needs its own
+config. (Config files from older versions are picked up automatically — those in the widget
+root are moved into `cfg/`, and pre-0.7.0 files keyed by the model number are re-keyed to
+the name on first start.)
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full settings list, the layout
 breakdown, the callout matrix, the detail pages and the "what is shown when" tables.

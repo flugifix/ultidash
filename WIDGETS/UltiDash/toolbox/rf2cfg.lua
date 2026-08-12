@@ -163,7 +163,7 @@ local function open(wgt)
         if host_slots then
             for i = 1, #SLOTS do
                 local s = SLOTS[i]
-                if host_slots[s] ~= nil then rf2[s] = host_slots[s] end
+                rf2[s] = host_slots[s]   -- nil included, see M.close
             end
         end
         if orig_process then
@@ -188,10 +188,14 @@ function M.close(wgt)
         orig_process = nil
         queue_wrapper = nil
     end
+    -- restore UNCONDITIONALLY, a nil host slot included. A slot RfTool never filled
+    -- captured as nil, and skipping it left OUR closed runner installed under RfTool's
+    -- name -- which set_battery_profile then calls (rf2.settingsSaved). The capture side
+    -- already guarantees this is the host's value and not our own (see open()).
     if host_slots then
         for i = 1, #SLOTS do
             local s = SLOTS[i]
-            if host_slots[s] ~= nil then rf2[s] = host_slots[s] end
+            rf2[s] = host_slots[s]
         end
     end
     pcall(function() rf2.mspQueue:clear() end)   -- drop pending reads/writes

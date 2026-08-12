@@ -91,7 +91,8 @@ local ESC_LEVEL_COLORS = {
 }
 
 -- swap the theme color shadows (called from ultidash.lua update() with the palette + semantic
--- colours it resolved). scheme is kept for future use; colours come from `p` and `sem`.
+-- colours it resolved). scheme (a SCHEMES descriptor since the registry refactor) is kept for
+-- future use; colours come from `p` and `sem`.
 function ultidash_functions.set_palette(scheme, p, sem)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
@@ -144,6 +145,13 @@ local ALERTLEVEL_NONE     = 0
 local ALERTLEVEL_LOW      = 1
 local ALERTLEVEL_CRITICAL = 2
 local FUEL_VLOW           = 10  -- % band above critical handled as singles, not 10s
+-- Minimum gap between two descending %-step callouts (centiseconds). Small on purpose:
+-- it only stops two announcements treading on each other, it is NOT a cadence. The
+-- CRITICAL nag keeps using the configurable FuelInt — that one IS a repeat interval.
+-- (Both shared FuelInt until 0.7.0, which swallowed a step whenever the fine steps
+-- passed faster than the repeat gap — exactly at the end of the flight, where a 5 %
+-- step is a matter of seconds.)
+local FUEL_STEP_GAP_CS    = 200
 local ALERT_SAMPLE_CS     = 50  -- voltage must hold the level this long before alerting
 -- A genuinely connected/measured cell never reads in the ~0..3 V "dead zone" while
 -- flying — it shows its real 3.3..4.2 V or collapses to ~0 when the supply is lost
@@ -189,22 +197,19 @@ local audio_volume = nil
 -- SHARED STATE (cross-instance)
 -- ============================================================================
 -- Module-local table shared by ALL instances of this widget (the script chunk is
--- loaded once; its upvalues are common to every instance). Discipline, unlike the
--- looser master_muted above: ONLY the Dashboard-mode instance (the "publisher",
--- ViewMode = Dashboard) writes here — via publish_shared in its refresh/background
--- cycle. ELRS-details / Status-info instances are read-only subscribers, so a
--- passive view on a second screen can show the dashboard's REAL active config
--- (incl. the MSP-fetched FC thresholds) without doing MSP or audio itself.
+-- loaded once; its upvalues are common to every instance). Written by
+-- publish_shared in the refresh/background cycle. Three consumers (the
+-- second-screen subscribers were removed): the
+-- menu ▸ Status page renders its snapshot, the detail builders read bg_filled and
+-- thresholds, and owner/ts detect two placed instances (dual publisher).
 -- Tables are mutated in place (no per-cycle allocations).
 local Shared = {
-    ready      = false,   -- true once a Dashboard instance has published
-    ts         = nil,     -- getTime() of the last publish (staleness detection)
+    ready      = false,   -- true once an instance has published (Status page keys off it)
+    ts         = nil,     -- getTime() of the last publish (dual-publisher detection)
     owner      = nil,     -- the wgt table of the last publisher (dual-publisher detection)
     model_name = nil,     -- FC craft name (cached by the publisher)
     connected  = false,
-    -- style: passive views follow the Dashboard's look (the main widget is the boss)
-    color_scheme = nil,   -- ColorScheme option value of the Dashboard instance
-    bg_filled    = nil,   -- BGFilled as boolean
+    bg_filled    = nil,   -- BGFilled as boolean (detail-page backgrounds)
     thresholds = {
         source = nil,                                  -- "FC config" / "Manual"
         cell_full = nil, cell_warn = nil, cell_crit = nil,  -- volts (resolved)
@@ -246,17 +251,6 @@ function ultidash_functions.get_shared()
     return Shared
 end
 
--- True while a Dashboard instance is actually RUNNING (published recently). Passive
--- views require this: without a live publisher they show a notice instead of stale
--- or instance-local data ("the main widget is the boss"). Window is generous (10 s)
--- because EdgeTX schedules background() for off-screen widgets at a coarse interval —
--- a too-tight window would flicker the passive views between notice and live.
-function ultidash_functions.shared_alive()
-    if not Shared.ready then return false end
-    local now = getTime() or 0
-    return (now - (Shared.ts or 0)) < 1000
-end
-
 -- Effective main-power-loss threshold in volts: "Cell count (auto)" derives
 -- it from the connected pack (Cel# or the FC battery config) x the per-cell value
 -- (PwrCellV, default 3.0 V/cell -> 3S = 9.0 V = the old fixed default), so 2S..12S work
@@ -279,10 +273,10 @@ function ultidash_functions.publish_shared(wgt)
     if not o or not v then return end
     local t, a = Shared.thresholds, Shared.alerts
 
-    -- Dual-publisher detection: two placed Dashboard instances are BOTH publishers (both
-    -- write Shared) -> doubled callouts, flickering passive views. If another instance
-    -- published recently (fresh ts, foreign owner), flag BOTH (each sees the other's
-    -- publishes). Display-only; behaviour is otherwise unchanged. Reads the OLD ts, so this
+    -- Dual-publisher detection: two placed instances are BOTH publishers (both
+    -- write Shared) -> doubled callouts. If another instance published recently
+    -- (fresh ts, foreign owner), flag BOTH (each sees the other's publishes).
+    -- Display-only; behaviour is otherwise unchanged. Reads the OLD ts, so this
     -- must run before Shared.ts is updated below.
     local now = getTime() or 0
     if Shared.owner ~= nil and Shared.owner ~= wgt and (now - (Shared.ts or 0)) < 300 then
@@ -293,8 +287,7 @@ function ultidash_functions.publish_shared(wgt)
     Shared.ts         = getTime() or 0
     Shared.model_name = v.craft_name
     Shared.connected  = v.rf_connection_state ~= nil and v.rf_connection_state ~= "disconnected"
-    Shared.color_scheme = o.ColorScheme or 1
-    Shared.bg_filled    = (o.BGFilled == 1)
+    Shared.bg_filled  = (o.BGFilled == 1)
 
     t.source      = (o.CellSource == 2) and "Manual" or "FC config"
     t.cell_full   = v.vcel_full_threshold()
@@ -396,14 +389,30 @@ end
 -- voice too. Used by the voltage alert and the startup cell check (both read fresh on repeat).
 local function announce_voltage(wgt)
     local o = wgt.options
-    if o and o.VoltVoice == 2 then
-        local v = wgt.values.vcel
-        if v and v > MIN_PLAUSIBLE_CELL_V then
-            play_number(math.floor(v * 100 + 0.5), UNIT_VOLTS, PREC2)
+    local v = wgt.values.vcel
+    local plausible = v ~= nil and v > MIN_PLAUSIBLE_CELL_V
+    if o and o.VoltVoice == 2 and plausible then
+        play_number(math.floor(v * 100 + 0.5), UNIT_VOLTS, PREC2)
+        return
+    end
+    -- TOTAL voltage, DERIVED from the same latched cell value the callers triggered on --
+    -- not from wgt.values.vbat. vbat and vcel are two independent sensors with two
+    -- independent latches and different drop constants (VOLT_DROP_CELL * cells against
+    -- VOLT_DROP_CELL), so under load one accepts a frame the other rejects and the two hold
+    -- readings from different moments. Every caller of this function -- the voltage alert,
+    -- VSay1/VSay2 and the startup cell check -- decides on vcel, so speaking vbat announced
+    -- a number the decision was not made on: measured once at 3.73 V/cell with 22.38 V fed
+    -- and 22.71 V announced. Reconstruction costs at most half a centivolt per cell, which
+    -- PREC1 rounds away.
+    if plausible then
+        local cells = wgt.values.cel_count
+        if cells ~= nil and cells > 0 then
+            play_number(math.floor(v * cells * 10 + 0.5), UNIT_VOLTS, PREC1)
             return
         end
-        -- no plausible cell value -> fall through to total voltage
     end
+    -- no plausible cell value, or no cell count yet: the pack latch is all there is, and
+    -- saying a slightly stale number beats going silent on an alert.
     local vbat = wgt.values.vbat
     if vbat then play_number(math.floor(vbat * 10 + 0.5), UNIT_VOLTS, PREC1) end
 end
@@ -711,6 +720,29 @@ function ultidash_functions.arm_sensor_on(wgt)
     arm = math.floor(arm)
     return (arm % 2) == 1 or arm == 1024
 end
+
+-- "Was the craft flying when the link went away?" -- the question the armed-disconnect branch
+-- means to ask, and the RF tool's PREVIOUS state cannot answer it. At a real telemetry loss the
+-- tool loses the ARM value about 1.3 s after the frames stop and reports "disarmed"; only ~4.9 s
+-- later does its own connection timeout make it "disconnected". So the previous_state handed to
+-- on_telemetry_state_changed is "disarmed" there and NEVER "armed" -- the gate could not match,
+-- and the armed-loss escalation never fired on a real link (it only ever fired against a
+-- stand-in that jumped straight from armed to disconnected).
+-- The ARM sensor answers it, and is the one signal that survives the gap: read_src reads "ARM"
+-- through getSourceValue (the name carries no app-id, so the resolver never maps it to an index),
+-- and getSourceValue does NOT age out -- it keeps serving the last received arming word until
+-- EdgeTX's own ~30 s sensor expiry, an order of magnitude longer than the tool's timeout.
+-- A genuine disarm is untouched by this: there the link is still up, the FC sends the cleared
+-- arming word, and the held value therefore reads DISARMED -- so a normal disarm-then-power-off
+-- still takes the quiet branch below. previous_state stays in front as the cheaper test and as
+-- the path for a model with no ARM sensor at all.
+local function disconnected_while_armed(wgt, previous_state)
+    if previous_state == "armed" then return true end
+    return ultidash_functions.arm_sensor_on(wgt)
+end
+-- exported for the UI layer's own disconnect branch (the flight-log flush), which has to make
+-- the identical judgement one module over
+ultidash_functions.disconnected_while_armed = disconnected_while_armed
 
 -- "Operating" = actively flying, taken from the RF TOOL's armed state (its armed/disarmed
 -- transitions are clean on this setup — see the debug logs — whereas the ARM telemetry
@@ -1176,8 +1208,7 @@ end
 -- constant 0 (LR1121Driver sets LastPacketSNRRaw = 0 for GFSK; signal-health doc
 -- confirms it for FLRC) -> the SNR row shows "-" instead of a yellow 0dB bar.
 -- Covers ELRS 3.x sequential (1-13, 2.4GHz) + 4.x 2.4GHz (21-41) + GemX (100+).
--- 900MHz 4.x (0-16) collides with 3.x and is NOT disambiguated (rare on a heli) —
--- see ultidash_resourcesandtools/elrs_rfmd_reference.md.
+-- 900MHz 4.x (0-16) collides with 3.x and is NOT disambiguated (rare on a heli).
 local RFMD_INFO = {
     [1]={"25Hz",-123,"25Hz (LORA)"},   [2]={"50Hz",-115,"50Hz (LORA)"},   [3]={"100Hz",-117,"100Hz (LORA)"},
     [4]={"100HzF",-112,"100Hz (LORA-full)"}, [5]={"150Hz",-112,"150Hz (LORA)"}, [6]={"200Hz",-112,"200Hz (LORA)"},
@@ -1271,6 +1302,29 @@ end
 -- AIRCRAFT TELEMETRY: VOLTAGE & TEMPERATURE
 -- ============================================================================
 
+-- Diagnostics (Debug log only): trace the voltage path around a fresh connect. The
+-- "wrong voltage right after plugging in a new pack" complaint can't be told apart from
+-- the state/PERF log alone — what's missing is the RAW sensor reading next to the LATCHED
+-- value, the cell count and the link state at that moment. on_telemetry_state_changed
+-- opens a BATT_TRACE_CS window on every (re)connect; inside it one line per pass is
+-- logged, then it goes quiet by itself. Zero cost with the Debug log off (dbg nil /
+-- disabled) or outside the window.
+local BATT_TRACE_CS = 2000        -- ~20 s of trace after a connect
+
+local function batt_trace(wgt)
+    if dbg == nil or wgt.batt_trace_until == nil then return end
+    local now = getTime() or 0
+    if now > wgt.batt_trace_until then wgt.batt_trace_until = nil; return end
+    if wgt.batt_trace_t == now or not dbg.is_enabled() then return end
+    wgt.batt_trace_t = now
+    local v = wgt.values
+    dbg.logf("BATT", "raw v=%s c=%s cel#=%s | held v=%s c=%s cels=%s | acc v=%s c=%s | rq=%s pl=%s chk=%s",
+        tostring(wgt.vbat_raw), tostring(wgt.vcel_raw), tostring(read_src(wgt, "Cel#")),
+        tostring(v.vbat), tostring(v.vcel), tostring(v.cel_count),
+        tostring(wgt.vbat_acc), tostring(wgt.vcel_acc),
+        tostring(read_src(wgt, "RQly")), tostring(wgt.power_lost), tostring(v.batt_checking))
+end
+
 -- Latched voltage update (see the MIN_PLAUSIBLE_CELL_V / VOLT_* notes at the top):
 -- ≤ 1 V never overwrites the held value; while disarmed a drop > drop_delta below
 -- the held value is only accepted once it stayed stable for VOLT_ACCEPT_CS.
@@ -1334,6 +1388,7 @@ function ultidash_functions.update_cell(wgt)
     local raw = read_src(wgt, "Vbat")
     local cells = wgt.values.cel_count or 6
     local accepted = latch_voltage(wgt, "vbat", raw, VOLT_DROP_CELL * cells, COLLAPSE_DROP_CELL * cells)
+    wgt.vbat_raw, wgt.vbat_acc = raw, accepted      -- batt_trace (Debug log) only
     -- Main-supply-collapse flag: a real Vbat reading that the latch rejected while we
     -- already hold a good value means the main supply is collapsing/collapsed (unplug
     -- on a buffer). Fires on the FIRST decay frame — other channels (BEC) use it to
@@ -1373,7 +1428,9 @@ function ultidash_functions.update_vcel(wgt)
     if wgt.upd_vcel_t == now then return end
     wgt.upd_vcel_t = now
     -- latched like update_cell (fixes "Latest 0.00" after a buffer-bridged unplug)
-    local accepted = latch_voltage(wgt, "vcel", read_src(wgt, "Vcel"), VOLT_DROP_CELL, COLLAPSE_DROP_CELL)
+    local raw_cell = read_src(wgt, "Vcel")
+    local accepted = latch_voltage(wgt, "vcel", raw_cell, VOLT_DROP_CELL, COLLAPSE_DROP_CELL)
+    wgt.vcel_raw, wgt.vcel_acc = raw_cell, accepted  -- batt_trace (Debug log) only
     -- widget-tracked, ARMED-only (see update_cell)
     if is_operating(wgt) and wgt.values.vcel ~= nil then
         update_tracked_extrema(wgt, "vcel", "vcel_min", "vcel_max")
@@ -1550,9 +1607,38 @@ local function resolve_bar_color(wgt)
     return wgt.batt_warn and BAR_COLOR_WARN or BAR_COLOR_OK
 end
 
+-- Ceiling (centiseconds) on deferring the startup cell check while no LIVE reading exists.
+-- Beyond it the check concludes on what it has, which is the existing "no value -> warn"
+-- path: a pack that never reports is a fault worth a warning, and an indefinite grey
+-- progress bar would be a worse answer than a wrong one. On the 2026-08-01 recording the
+-- new pack's first frame arrived 7,5 s after the connect, so this is 4x that margin.
+local BATT_CHECK_MAX_CS = 3000
+
+-- Is the voltage we are about to judge still the PREVIOUS pack's?
+--
+-- It cannot be told from the value itself — a carried-over reading is a perfectly live sensor
+-- read, which is why gating on "is there a reading" does not work and was tried first. What
+-- distinguishes it is that it is *unchanged*: EdgeTX hands Lua the last value it received
+-- until the new telemetry session replaces it, so immediately after a fast pack change the
+-- sensor still reads, to the hundredth of a volt, what the pack that was just unplugged
+-- ended on. `vbat_last_session` is that number, recorded at the disconnect.
+--
+-- A reading of nothing counts too: on the radio the sensor went to 0 between the two.
+--
+-- The false positive is a new pack that reads bit-identical to the last one's landing
+-- voltage, and it is harmless: the check then waits out BATT_CHECK_MAX_CS and reaches the
+-- same verdict, late. The false negative it prevents is a full pack announced as low.
+local function pack_reading_is_carried_over(wgt)
+    local v = wgt.vbat_raw
+    if v == nil or v <= 0 then return true end
+    local prev = wgt.vbat_last_session
+    return prev ~= nil and math.abs(v - prev) < 0.005
+end
+
 -- Startup cell-check (after ePowerbar): show a grey progress bar while the
 -- battery settles, then warn (colour + audio) if the pack is not fully charged.
 function ultidash_functions.update_battery_gauge(wgt)
+    batt_trace(wgt)                    -- diagnostics; self-limiting, off unless logging
     local vbat = wgt.values.vbat
     local startup_delay = math.max(1, wgt.options.StartupDelay or 4) * 100
     local cell_full = wgt.values.vcel_full_threshold()   -- from FC (mspBatteryConfig)
@@ -1562,19 +1648,65 @@ function ultidash_functions.update_battery_gauge(wgt)
     local has_voltage = vbat ~= nil and vbat > 0
     if cell_full > 0 and has_voltage and not had_voltage then
         wgt.batt_check_until = getTime() + startup_delay
+        wgt.batt_check_expiry = getTime() + BATT_CHECK_MAX_CS   -- see the deferral below
+        wgt.batt_check_deferred = false
         wgt.values.batt_checking = true
         wgt.values.batt_check_progress = 0
         wgt.batt_warn = false
         clear_repeat(wgt, "Cell")          -- a new check starts fresh (drop any old nag)
+        if dbg and dbg.is_enabled() then
+            dbg.logf("CELLCHK", "armed on first voltage: vbat=%s (raw %s) vcel=%s (raw %s) cels=%s full=%s delay=%ss",
+                tostring(vbat), tostring(wgt.vbat_raw), tostring(wgt.values.vcel), tostring(wgt.vcel_raw),
+                tostring(wgt.values.cel_count), tostring(cell_full), tostring(startup_delay / 100))
+        end
     end
     wgt.prev_vbat = vbat
 
     if wgt.values.batt_checking then
         local now = getTime()
-        if now >= (wgt.batt_check_until or 0) then
+        -- The window is up — but is there anything from THIS pack to judge yet?
+        --
+        -- After a fast pack change there is not. EdgeTX keeps handing Lua the previous
+        -- pack's last reading until the new telemetry session resets its sensors, so the
+        -- check arms on a voltage that belongs to the battery the pilot just took off the
+        -- helicopter; the latch then correctly protects that value against the zeros which
+        -- follow, and the verdict lands before the pack under test has reported at all.
+        -- Measured on the radio 2026-08-01: armed on 3.78 V/cell at 12:28:43.41, concluded
+        -- "low" at 12:28:47.50, and the pack it was judging first spoke at 12:28:50.85 —
+        -- with 4.14 V/cell. A full battery announced as low and the gauge amber, every time
+        -- the pack was changed quickly enough.
+        --
+        -- So: defer rather than decide, and only AT the window's end — asking per pass would
+        -- restart the bar on every dropped frame. This is not the power_lost gate that the
+        -- announce path below deliberately does without: a deferral cannot silence a real
+        -- callout, only make it wait for a value that exists. Bounded by BATT_CHECK_MAX_CS,
+        -- so a pack that never reports still reaches the "no value -> warn" verdict.
+        local deferring = now >= (wgt.batt_check_until or 0)
+            and now < (wgt.batt_check_expiry or 0)
+            and pack_reading_is_carried_over(wgt)
+        if deferring then
+            wgt.batt_check_until = now + startup_delay
+            wgt.values.batt_check_progress = 0
+            -- once per check, not once per pass: the next hardware log should show that the
+            -- deferral engaged and for how long, without burying the rest of the session
+            if dbg and dbg.is_enabled() and not wgt.batt_check_deferred then
+                wgt.batt_check_deferred = true
+                dbg.logf("CELLCHK", "deferred: vbat raw %s still the previous session's %s"
+                    .. " — waiting up to %ss for the connected pack to report",
+                    tostring(wgt.vbat_raw), tostring(wgt.vbat_last_session),
+                    tostring(BATT_CHECK_MAX_CS / 100))
+            end
+        elseif now >= (wgt.batt_check_until or 0) then
             wgt.values.batt_checking = false
             wgt.values.batt_check_progress = 100
             local cellv = wgt.values.vcel
+            if dbg and dbg.is_enabled() then
+                dbg.logf("CELLCHK", "done: vcel=%s (raw %s) vbat=%s (raw %s) full=%s -> %s",
+                    tostring(cellv), tostring(wgt.vcel_raw), tostring(wgt.values.vbat), tostring(wgt.vbat_raw),
+                    tostring(cell_full),
+                    (cellv == nil or cellv <= 0) and "no value (warn)"
+                        or (cellv >= cell_full) and "full (silent)" or "low -> announce")
+            end
             if cellv == nil or cellv <= 0 then
                 wgt.batt_warn = true
             elseif cellv >= cell_full then
@@ -1982,6 +2114,16 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
     refresh_audio_volume(wgt)
     local telem_snd = wgt.options and wgt.options.SndTelem == 1
 
+    -- The voltage this telemetry session ended on, kept across the gap so the NEXT session's
+    -- startup cell check can tell a carried-over sensor reading from the pack it is meant to
+    -- be judging (see pack_reading_is_carried_over). Taken from the latch, which by design
+    -- holds the last healthy value rather than the unplug decay. Every disconnect, armed or
+    -- not: a pack change after an armed disconnect is the same trap.
+    if new_state == "disconnected" then
+        local v = wgt.values and wgt.values.vbat
+        if v ~= nil and v > 0 then wgt.vbat_last_session = v end
+    end
+
     -- ESC-load session limit: the FC SETS the limit GVAR after connect but never clears
     -- it, so UltiDash zeroes it when the session really ends — the DISARMED disconnect
     -- (normal power-off; also fires on the initial disconnected state). An ARMED
@@ -2010,6 +2152,13 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
         -- generations, silently killing the Skip alert until a Lua reload.
         skp_name = nil
         clear_live_telemetry_values(wgt)
+        -- open the voltage trace window (Debug log only): a pack swap lands exactly here
+        wgt.batt_trace_until = (getTime() or 0) + BATT_TRACE_CS
+        wgt.batt_trace_t = nil
+        if dbg and dbg.is_enabled() then
+            dbg.logf("BATT", "connect (%s -> %s): live values cleared, trace window open",
+                tostring(previous_state), tostring(new_state))
+        end
         ultidash_functions.reset_telemetry_stats(wgt)
         -- telemetry recovered: announce only if the loss happened while armed (in flight)
         if telem_snd and wgt.link_lost_armed then
@@ -2035,7 +2184,10 @@ function ultidash_functions.on_telemetry_state_changed(wgt, previous_state, new_
         -- armed->disarmed edge in update_estatus) needs a connection it no longer
         -- has, so after a reconnect-in-disarm the nag would never stop.
         clear_repeat(wgt, "Arm")
-        if previous_state == "armed" then
+        -- NOT `previous_state == "armed"`: the RF tool passes through "disarmed" on the way to
+        -- "disconnected" at every real link loss, so that test never matched in flight. See
+        -- disconnected_while_armed.
+        if disconnected_while_armed(wgt, previous_state) then
             ultidash_functions.log("Connection lost (armed)")
             if telem_snd then
                 play_audio("telem_lost")
@@ -2066,6 +2218,8 @@ local function reset_callout_state(wgt)
     wgt.volt_pending = 0
     wgt.volt_level = ALERTLEVEL_NONE      -- worst level seen during the current debounce
     wgt.volt_announced = ALERTLEVEL_NONE  -- highest level already spoken this episode
+    wgt.vsay_done = nil                   -- fixed-voltage orientation callouts re-arm per flight
+    wgt.vsay_pend = nil
     clear_repeat(wgt, "Fuel")
     clear_repeat(wgt, "Volt")
 end
@@ -2112,15 +2266,27 @@ local function crank_fuel_calls(wgt)
                                       or  math.max(1, wgt.options.FuelStep or 10)
         local capa = math.ceil(fuel / step) * step
         if capa > 100 then capa = 100 end
-        if wgt.callout_last_capa ~= capa and now > wgt.callout_next_capa then
-            -- announce only at/below the start threshold, and skip the very first pass
-            -- after arming (callout_next_capa == 0)
-            if wgt.callout_next_capa ~= 0 and fuel <= (wgt.options.FuelStart or 100) then
+        -- The "first observation after arming" sentinel is consumed on the FIRST PASS,
+        -- not on the first CHANGE. reset_callout_state seeds callout_last_capa = 100, so
+        -- arming with a FULL pack left the sentinel standing (capa == last_capa == 100)
+        -- until the level actually moved -- and that first real step (100 -> 90) was then
+        -- swallowed as "the first observation". Verified against a replayed log: a
+        -- 100 % -> 25 % descent used to start announcing at 80 %, now at 90 %; arming on a
+        -- half-used pack is unchanged (no callout at arm).
+        if wgt.callout_next_capa == 0 then
+            wgt.callout_last_capa = capa
+            wgt.callout_next_capa = now
+        elseif wgt.callout_last_capa ~= capa and now > wgt.callout_next_capa then
+            if capa < wgt.callout_last_capa and fuel <= (wgt.options.FuelStart or 100) then
+                -- DESCENDING only: a rise (pack recovering off-load, an FC value jumping
+                -- back up) re-arms the ladder silently instead of counting its way up.
                 if fuel > critical + FUEL_VLOW then play_audio("battry") else play_audio("batlow") end
                 play_fuel_value(wgt, capa)
+                -- short gap only — the steps are NOT throttled by the nag's repeat
+                -- interval any more, which used to swallow one at a fast-falling end
+                wgt.callout_next_capa = now + FUEL_STEP_GAP_CS
             end
             wgt.callout_last_capa = capa
-            wgt.callout_next_capa = now + interval
         end
     else
         -- AT/BELOW critical: announce once on entry, then let the repeat engine nag
@@ -2222,6 +2388,51 @@ local function crank_voltage_alerts(wgt)
     end
 end
 
+-- Fixed per-cell voltage orientation callouts, ALONGSIDE the %-based fuel steps. Two
+-- configurable thresholds (VSay1/VSay2, centivolt per cell; 0 = that step off). Each is
+-- announced ONCE per flight the first time the per-cell voltage STAYS at/below it for
+-- VSayHold seconds (so a brief load sag doesn't fire early; 0 = immediate/next tick).
+-- Speaks only the voltage, per VoltVoice. Armed-only (the caller gates it); re-armed on
+-- disarm/disconnect via reset_callout_state. Independent of the low/critical Voltage alert.
+local function vsay_step(wgt, i, thr, cv, now, hold)
+    if thr <= 0 or wgt.vsay_done[i] then return false end
+    if cv <= thr then
+        local p = wgt.vsay_pend[i]
+        if p == 0 then
+            wgt.vsay_pend[i] = now + hold          -- entered the band: start the hold timer
+        elseif now >= p then
+            announce_voltage(wgt)
+            wgt.vsay_done[i] = true
+            wgt.vsay_pend[i] = 0
+            return true
+        end
+    else
+        wgt.vsay_pend[i] = 0                        -- recovered above: cancel the pending hold
+    end
+    return false
+end
+
+local function crank_voltage_say(wgt)
+    local t1 = wgt.options.VSay1 or 0
+    local t2 = wgt.options.VSay2 or 0
+    -- feature off, or MAIN POWER LOST (frozen last-good value is no real reading)
+    if (t1 <= 0 and t2 <= 0) or wgt.power_lost then return end
+    local cellv = wgt.values.vcel
+    if cellv == nil or cellv <= MIN_PLAUSIBLE_CELL_V then return end
+    local cv = math.floor(cellv * 100)
+    local now = getTime()
+    local hold = math.max(0, wgt.options.VSayHold or 3) * 100
+    if wgt.vsay_done == nil then wgt.vsay_done = { false, false }; wgt.vsay_pend = { 0, 0 } end
+    -- announce the HIGHER threshold first; never two voltages back-to-back in one pass
+    if t1 >= t2 then
+        if vsay_step(wgt, 1, t1, cv, now, hold) then return end
+        vsay_step(wgt, 2, t2, cv, now, hold)
+    else
+        if vsay_step(wgt, 2, t2, cv, now, hold) then return end
+        vsay_step(wgt, 1, t1, cv, now, hold)
+    end
+end
+
 function ultidash_functions.update_battery_callout(wgt)
     if not is_rf_connected(wgt) or not is_craft_armed(wgt) then
         reset_callout_state(wgt)
@@ -2237,6 +2448,7 @@ function ultidash_functions.update_battery_callout(wgt)
 
     crank_fuel_calls(wgt)
     crank_voltage_alerts(wgt)
+    crank_voltage_say(wgt)
 end
 
 -- ExpressLRS link-quality warning on the RQly (Link Quality %) sensor.
@@ -2463,7 +2675,7 @@ function ultidash_functions.update_power_warning(wgt)
                 play_audio("pwr_backup")
                 play_vibe(wgt, "Pwr")
                 local bec = wgt.values.vbec
-                if bec then play_number(bec * 10, UNIT_VOLTS, PREC1) end
+                if bec then play_number(math.floor(bec * 10 + 0.5), UNIT_VOLTS, PREC1) end
             end
             speak()
             wgt.pwr_announced = true
@@ -2478,13 +2690,18 @@ function ultidash_functions.update_power_warning(wgt)
 end
 
 -- BEC-voltage warning (relative, self-calibrating): the reference is the BEC voltage
--- AT THE ARM MOMENT (first plausible reading while operating, FROZEN until disarm/
+-- AT THE ARM MOMENT (first plausible reading while armed, FROZEN until disarm/
 -- disconnect), so it adapts to any 5 V / 6 V / 8.4 V BEC. It warns when
 -- the live BEC drops BecWarn % below that reference, critical at BecCrit %. Announced
 -- once per level (warn->crit announces again); the per-alert repeat engine handles
 -- repeats. Sensor-derived (Vbec, live/un-latched), no MSP -> armed-safe.
 function ultidash_functions.update_bec_warning(wgt)
-    if not wgt.options or wgt.options.SndBec ~= 1 or not is_operating(wgt) then
+    -- ARMED-gated on the SENSOR, not on the RF tool's armed sub-state. That sub-state is
+    -- the right source for the voltage latch and the stats extrema (it has clean edges),
+    -- but on the documented setups where the RF tool never reports it, it is never true --
+    -- and this alert was then dead for the whole flight. Every other armed-gated alert
+    -- reads the sensor.
+    if not wgt.options or wgt.options.SndBec ~= 1 or not is_craft_armed(wgt) then
         wgt.bec_ref = nil; wgt.bec_pending = 0; wgt.bec_level = 0; wgt.bec_announced = 0
         clear_repeat(wgt, "Bec")
         return
@@ -2492,7 +2709,7 @@ function ultidash_functions.update_bec_warning(wgt)
     local bec = wgt.values.vbec
     if bec == nil or bec <= MIN_PLAUSIBLE_CELL_V then return end
     -- FREEZE the reference at the arm edge (first plausible reading while
-    -- operating). The old running max-since-arm slowly ratcheted the reference up on
+    -- armed). The old running max-since-arm slowly ratcheted the reference up on
     -- noise spikes, tightening the %-drop alarm mid-flight. Reset via the branch above.
     if wgt.bec_ref == nil then wgt.bec_ref = bec end
     local ref = wgt.bec_ref
@@ -2530,7 +2747,7 @@ function ultidash_functions.update_bec_warning(wgt)
                 play_audio("bec_low")
             end
             local b = wgt.values.vbec
-            if b then play_number(b * 10, UNIT_VOLTS, PREC1) end
+            if b then play_number(math.floor(b * 10 + 0.5), UNIT_VOLTS, PREC1) end
         end
         speak()
         wgt.bec_announced = wgt.bec_level
@@ -2587,7 +2804,8 @@ end
 -- temp, NOT the Tmcu+ session-max the panel/stats use). Silent with no sensor/thresholds.
 function ultidash_functions.update_temp_warning(wgt)
     local o = wgt.options
-    if not o or o.SndTemp ~= 1 or not is_operating(wgt) then
+    -- the ARM sensor, for the same reason as the BEC alert above
+    if not o or o.SndTemp ~= 1 or not is_craft_armed(wgt) then
         wgt.tesc_pending = 0; wgt.tesc_level = 0; wgt.tesc_announced = 0
         wgt.tmcu_pending = 0; wgt.tmcu_level = 0; wgt.tmcu_announced = 0
         clear_repeat(wgt, "Temp")
@@ -2771,8 +2989,11 @@ local ESC_CODES = { "Volt", "Fuel", "Telem", "Link", "Rssi", "Pwr", "Bec", "EscL
 -- Is this alert currently in its escalation-worthy state? Reads cached values / the
 -- alert latches only (no extra sensor lookups), so it's cheap to call every pass.
 local function alert_active(wgt, code)
-    -- telemetry-lost is judged from its own latch (the ARM sensor is gone when the
-    -- link drops, so is_craft_armed can't be trusted here). Coupled to the RUNNING
+    -- telemetry-lost is judged from its own latch: the latch is set at the loss EDGE and there
+    -- is no per-pass condition to re-read while the link is away. (The reason formerly given
+    -- here -- "the ARM sensor is gone when the link drops" -- does not hold for the reader
+    -- UltiDash uses: read_src takes "ARM" through getSourceValue, which keeps serving the last
+    -- arming word through the gap. See disconnected_while_armed.) Coupled to the RUNNING
     -- repeat: the latch itself only clears on reconnect, but the boost
     -- must end with the nag — crank_repeats drops rep.Telem once TelemCnt is
     -- reached, so after a crash/power-off the pot gets the volume back by itself
@@ -2969,6 +3190,53 @@ function ultidash_functions.add_alert_overlay(panel, wgt, w, h)
         { type = "label", x = bx + 8, y = by + bh - sfh - 6, w = bw - 16, h = sfh,
           font = SMLSIZE, align = CENTER, color = white, text = "tap to dismiss", visible = vis },
     })
+end
+
+-- Dev perf overlay: a small always-on-top strip with the live UI-loop Hz + Lua/free
+-- heap (the same metrics as the Status footer), shown on EVERY view while the DebugLog
+-- option is on. Built as a TOP-LEVEL object created AFTER the view builders in update()
+-- so it stacks over whatever view is active. The text is memoized on the ~1 Hz-sampled
+-- metrics -> ~zero per-frame garbage (a perf tool must not itself add GC load).
+-- Non-clickable primitives -> steals no touch.
+function ultidash_functions.add_perf_overlay(wgt, w, h)
+    if not (wgt.options and wgt.options.DebugLog == 1) then return end
+    local _, sfh = lcd.sizeText("Ag", SMLSIZE)
+    local oh = sfh + 4
+    -- worst-case width so a long free-heap value never clips. Compact labels:
+    -- L = Lua heap (used), F = free heap, both kB.
+    local ow = math.min(w, lcd.sizeText("UI 999Hz  L99999k  F999999k", SMLSIZE) + 10)
+    local last_hz, last_kb, last_fk, last_s
+    local txt = function()
+        local hz, kb, fk = wgt.dbg_hz, wgt.dbg_lua_kb, wgt.dbg_free_kb
+        -- `last_s == nil` comes FIRST, and it is not belt-and-braces. On the very first
+        -- build no perf sample has been taken yet: the three dbg_* fields are assigned in
+        -- refresh()'s 1 Hz block (ultidash.lua:5842-5852), so hz/kb/fk are all nil, all
+        -- three comparisons are `nil ~= nil` = false, the body never runs and last_s stays
+        -- nil. The label below then receives nil as its text and refresh() raises
+        -- "bad argument #2 to 'label' (string expected, got nil)" on the first UI build,
+        -- taking every pass under it with it: the screen never moves again, no callout is
+        -- played, and the debug log keeps its session header for ever.
+        -- It can only happen when the overlay is built BEFORE the first sample, i.e. when
+        -- DebugLog was ALREADY 1 when the widget started (a stored setting). Toggling it
+        -- in the menu never reaches that state -- a pass has run by then and the three
+        -- fields are numbers -- which is why it survived so long.
+        -- The `or "-"` fallbacks below were written for exactly this case and are
+        -- unreachable without this term.
+        if last_s == nil or hz ~= last_hz or kb ~= last_kb or fk ~= last_fk then
+            last_hz, last_kb, last_fk = hz, kb, fk
+            last_s = "UI " .. (hz or "-") .. "Hz  L" .. (kb or "-")
+                .. "k  F" .. (fk or "-") .. "k"
+        end
+        return last_s
+    end
+    -- Anchored BOTTOM-LEFT. Not top-left: that is the menu glyph / the host's fallback
+    -- menu tap region, and covering it hides the only way back into the settings (i.e.
+    -- the only way to switch this overlay off again). Not top-right either: the Log
+    -- Viewer's zoom/pan buttons live there.
+    local p = lvgl.rectangle({ x = 0, y = math.max(0, h - oh), w = ow, h = oh,
+        filled = true, color = lcd.RGB(0, 0, 0) })
+    p:label({ x = 4, y = 2, w = ow - 8, h = sfh, font = SMLSIZE,
+        color = lcd.RGB(0, 255, 128), text = txt })
 end
 
 -- Background refresh: runs the same alert cascade as the foreground pass, but off

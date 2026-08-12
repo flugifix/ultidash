@@ -99,10 +99,16 @@ logs to exist:
    — an EdgeTX **Special Function ▸ SD Logs** (a switch + a rate, e.g. 1 s) is the usual
    way.
 2. Fly, then open *Toolbox ▸ Log Viewer* (disarmed): browse → open → pick a set → chart.
-3. *(Optional)* own templates: copy `toolbox/logtemplates.example.lua` to
-   `toolbox/logtemplates.lua` and edit (restart the radio to pick up changes).
+3. *(Optional)* own templates — **made on the radio**: pick your sensors in the picker and
+   tap **Save**; the *"What to display?"* page's **Edit** chip renames, duplicates, deletes
+   and reorders them. They live in `cfg/logtemplates.lua`, which the widget writes and
+   rewrites whole. Stocking that file from a PC still works (see
+   `toolbox/logtemplates.example.lua` for the format), but edits made to the **old**
+   `toolbox/logtemplates.lua` are ignored: it is adopted once into `cfg/` on the next Log
+   Viewer open and never read again. Changes need no restart, only closing and reopening
+   the page.
 
-**Detail:** [TOOLBOX §8](TOOLBOX.md#8-the-other-toolbox-pages-log-viewer-rf2-config--flight-log).
+**Detail:** [TOOLBOX §8](TOOLBOX.md#8-the-other-toolbox-pages-log-viewer-rf2-config-flight-log--battery-profile).
 
 ### F. Flight log & battery management
 
@@ -129,12 +135,7 @@ These need **no** FC/model/SD wiring — open the menu (☰, full-screen, disarm
 - **RF2 Config tool** (*Toolbox ▸ RF2 Config*) — the stock Rotorflight config tool inside
   UltiDash. Needs only the **RFTool** widget (already required) + the RF2 scripts in
   `/SCRIPTS/RF2/` (RFTool compiles them on first run). Disarmed-only.
-  *([TOOLBOX §8](TOOLBOX.md#8-the-other-toolbox-pages-log-viewer-rf2-config--flight-log).)*
-- **Second-screen views** — place UltiDash again on another screen and set its EdgeTX option
-  **`ViewMode`** to **ELRS details** or **Status info**; it mirrors the dashboard passively.
-  ***Feedback wanted*** — unsure this is actually used; may be removed in a future version
-  if there's no interest (open an issue if you rely on it).
-  *([REFERENCE §2.1](REFERENCE.md#21-the-only-edgetx-widget-option-viewmode).)*
+  *([TOOLBOX §8](TOOLBOX.md#8-the-other-toolbox-pages-log-viewer-rf2-config-flight-log--battery-profile).)*
 - **Switch announcements** (*Settings ▸ Voice ▸ Switch voice*) — announce motor / rescue /
   governor / profile from any physical or logical switch you pick.
   *([REFERENCE §2.7](REFERENCE.md#27-settings--switch-voice),
@@ -153,9 +154,8 @@ These need **no** FC/model/SD wiring — open the menu (☰, full-screen, disarm
   *([REFERENCE §2.7c](REFERENCE.md#27c-settings--shortcuts).)*
 - **Colors / palette** (*Settings ▸ Colors*) — per-scheme color overrides with a native
   picker. *([REFERENCE §2.3b](REFERENCE.md#23b-settings--colors-per-scheme-color-overrides).)*
-- **Config file per craft** (*Settings ▸ General*) — keep separate settings per craft flown
-  from the same model slot. *([REFERENCE §2.8](REFERENCE.md#28-where-settings-are-stored).)*
-- **Debug log** (*Settings ▸ General*) — diagnostics to `WIDGETS/UltiDash/debug.log`.
+- **Debug log** (*Settings ▸ General*) — diagnostics to `WIDGETS/UltiDash/logs/debug_NN.log`
+  (a new numbered file per session; *Keep sessions* decides how many are kept).
   *([REFERENCE §11](REFERENCE.md#11-debug-log-diagnostics).)*
 
 ---

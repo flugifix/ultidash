@@ -88,9 +88,12 @@ function M.load_registry()
     for line in string.gmatch(data, "[^\r\n]+") do
         if string.match(line, "^%s*#") == nil and string.find(line, "=", 1, true) ~= nil then
             local e = {}
-            for k, v in string.gmatch(line, "([%w_]+)%s*=%s*([^;]*)") do
-                k = string.lower(k)
-                v = trim(v)
+            -- rk/rv are the loop's control variables and must not be reassigned: Lua 5.5
+            -- makes them const (EdgeTX's older Lua tolerates it, but `luac -p` -- the
+            -- project's syntax gate -- rejects the file). Normalise into own locals.
+            for rk, rv in string.gmatch(line, "([%w_]+)%s*=%s*([^;]*)") do
+                local k = string.lower(rk)
+                local v = trim(rv)
                 if k == "id" then e.id = v
                 elseif k == "name" then e.name = v
                 elseif k == "cap" then e.cap = tonumber(v)
@@ -230,29 +233,38 @@ function M.mark_used(batt_id, dt)
     local changed = false
     -- the id= field is anchored to the line start or a ';' so a name/id that merely
     -- CONTAINS "id=" in another field can never be mistaken for the key
-    local CYCLES = "[cC][yY][cC][lL][eE][sS]%s*="
-    local LAST = "[lL][aA][sS][tT]%s*="
+    -- ...and the two fields we REWRITE are anchored the same way, by a frontier: the
+    -- match may only start where a word character does not precede it. Unanchored, the
+    -- stamp reached inside the user's own fields -- "recycles=7" was counted up as if it
+    -- were the cycle count, and "ballast=1" had its value replaced by the flight date.
+    -- The frontier costs nothing and covers both the line start and any ";" or space
+    -- before the key, which is every position a real field can begin at.
+    local CYCLES = "%f[%w_][cC][yY][cC][lL][eE][sS]%s*="
+    local LAST = "%f[%w_][lL][aA][sS][tT]%s*="
     for line in string.gmatch(data, "[^\r\n]+") do
-        if not changed and string.match(line, "^%s*#") == nil then
-            local id = string.match(line, "^%s*[iI][dD]%s*=%s*([^;]*)")
-                or string.match(line, ";%s*[iI][dD]%s*=%s*([^;]*)")
+        -- edit a COPY: `line` is the loop's control variable and is const in Lua 5.5
+        -- (see the note further up), so it must not be reassigned
+        local out = line
+        if not changed and string.match(out, "^%s*#") == nil then
+            local id = string.match(out, "^%s*[iI][dD]%s*=%s*([^;]*)")
+                or string.match(out, ";%s*[iI][dD]%s*=%s*([^;]*)")
             if id ~= nil and trim(id) == want then
-                local cyc = tonumber(string.match(line, CYCLES .. "%s*(%d+)")) or 0
-                if string.match(line, CYCLES) ~= nil then
-                    line = string.gsub(line, CYCLES .. "%s*%d*", "cycles=" .. (cyc + 1), 1)
+                local cyc = tonumber(string.match(out, CYCLES .. "%s*(%d+)")) or 0
+                if string.match(out, CYCLES) ~= nil then
+                    out = string.gsub(out, CYCLES .. "%s*%d*", "cycles=" .. (cyc + 1), 1)
                 else
-                    line = line .. ";cycles=" .. (cyc + 1)
+                    out = out .. ";cycles=" .. (cyc + 1)
                 end
                 local date = M.fmt_date(dt)
-                if string.match(line, LAST) ~= nil then
-                    line = string.gsub(line, LAST .. "%s*[^;]*", "last=" .. date, 1)
+                if string.match(out, LAST) ~= nil then
+                    out = string.gsub(out, LAST .. "%s*[^;]*", "last=" .. date, 1)
                 else
-                    line = line .. ";last=" .. date
+                    out = out .. ";last=" .. date
                 end
                 changed = true
             end
         end
-        lines[#lines + 1] = line
+        lines[#lines + 1] = out
     end
     if not changed then return false end
     -- ATOMIC replace. batteries.cfg is the user's hand-maintained file: a plain

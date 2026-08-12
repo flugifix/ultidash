@@ -26,7 +26,7 @@ local tb_avail, shortcut_open
 local SETTINGS_GROUPS, ALERT_PAGES, COLOR_PAGES, COLOR_ROLES, SENSOR_INFO
 local PANEL_SLOT_KEYS, DETAIL_SLOT_KEYS
 local fltlog, rf_service, ultidash_settings, ultidash_functions
-local SENSOR_OFF, VOLT_AUTO, ESCL_AUTO, RAW_SENTINEL, SCHEME_ULTIDASH
+local SENSOR_OFF, VOLT_AUTO, ESCL_AUTO, RAW_SENTINEL, SCHEME_DEFAULT
 local colors_fn
 
 -- ---- palette snapshot ------------------------------------------------------
@@ -75,7 +75,7 @@ function M.init(env)
     VOLT_AUTO             = env.VOLT_AUTO
     ESCL_AUTO             = env.ESCL_AUTO
     RAW_SENTINEL          = env.RAW_SENTINEL
-    SCHEME_ULTIDASH       = env.SCHEME_ULTIDASH
+    SCHEME_DEFAULT        = env.SCHEME_DEFAULT
     colors_fn             = env.colors
 end
 
@@ -146,15 +146,21 @@ local SENSCHECK_FEATURES = {
     { name = "*Skp", altname = "Skp", appId = nil, lbl = "Skipped frames", hint = "no skipped-frame count - skip alert dead",
       gate = function(o) return o.SkpWarn == 1 end },
     { name = "ARMD", appId = 0x1203, lbl = "Arming flags",  hint = "no arming-disable flags - arming reasons blank" },
-    { name = "Esc#", appId = 0x104F, lbl = "ESC status",    hint = "no ESC status - ESC fault decoder blank" },
+    -- 0x104F is TELEM_ESC1_MODEL, the vendor SIGNATURE byte -- the status word is the next
+    -- row (EscF / 0x104E). The consequence half of the hint is right and stays: without a
+    -- signature the decoder is picked as SIG_NONE and get_status() returns nil.
+    { name = "Esc#", appId = 0x104F, lbl = "ESC signature", hint = "no ESC signature - ESC fault decoder blank" },
     { name = "EscF", appId = 0x104E, lbl = "ESC faults",    hint = "no ESC fault flags - ESC fault decoder blank" },
     { name = "PID#", appId = 0x1211, lbl = "PID profile",   hint = "no PID profile - profile line blank" },
     { name = "RTE#", appId = 0x1212, lbl = "Rate profile",  hint = "no rate profile - profile line blank" },
     { name = "BAT#", appId = 0x1214, lbl = "Battery profile", hint = "no battery profile - profile line blank" },
     { name = "TQly", appId = nil,    lbl = "Uplink quality", hint = "no uplink quality",
       gate = function(o) return o.ShowTQly == 1 end },
+    -- needed for the status-bar TPWR field AND the ELRS detail page's TPWR bar — the
+    -- latter is reachable whatever the skin's status bar does, so a configured TX power
+    -- limit alone already makes the sensor relevant
     { name = "TPWR", appId = nil,    lbl = "TX power",       hint = "no TX power",
-      gate = function(o) return o.ShowTPWR == 1 end },
+      gate = function(o) return o.ShowTPWR == 1 or (o.TxPwrMax or 0) > 0 end },
     { name = "Tesc", appId = 0x10A0, lbl = "ESC temp",      hint = "no ESC temperature - ESC temp alert dead",
       gate = function(o, wgt) return senscheck_slot_uses(wgt, "Tesc") or (o.SndTemp == 1 and (o.TescWarn or 0) > 0) end },
     { name = "Tmcu", appId = 0x10A3, lbl = "MCU temp",      hint = "no MCU temperature - MCU temp alert dead",
@@ -509,6 +515,27 @@ local function build_settings_view(wgt, zone)
             end
         end)
         wgt.settings_working = t
+        -- The SENSOR PICK LIST rides on this call too, for the same reason the working copy
+        -- does. build_sensor_list walks all 60 model sensor slots and formats a label for
+        -- every curated one it finds -- ~3k instructions on a real 50-sensor model -- and it
+        -- used to sit inside the page BUILD, whose budget then had nothing left for the LVGL
+        -- ref pass that runs on the remainder of the same call. That is what killed dash1's
+        -- Skin page on a TX16S MK3 (eleven sensor rows; reported and reproduced 2026-08-09).
+        -- Freshness is unchanged: close_settings nils settings_working, so this call runs on
+        -- every page open, exactly as often as the build did.
+        -- ALWAYS assigned, nil included: that way a build can only ever read the list its own
+        -- seed produced, never the previous page's.
+        wgt.settings_senslist = nil
+        local sgrp = wgt.settings_page or SETTINGS_GROUPS[1]
+        if sgrp and sgrp.items then
+            for i = 1, #sgrp.items do
+                if sgrp.items[i].kind == "sensor" then
+                    local sl, sc = build_sensor_list(wgt)
+                    wgt.settings_senslist = { sl, sc }
+                    break
+                end
+            end
+        end
         -- remember which cfg file these edits belong to: autosave discards
         -- the copy when the target moved mid-edit (model switch / craft rename)
         wgt.settings_target = ultidash_settings.target_path
@@ -545,11 +572,15 @@ local function build_settings_view(wgt, zone)
     -- Colors, Volume, Thresholds ...) skip it entirely. has_sensor is detected in the
     -- width-measure loop just below and the list is built after it.
     local se_labels, se_codes
-    -- row height adapts to the screen: EdgeTX toggle switches are ~40 px tall on
-    -- the 800x480 TX16S and overlapped each other in 38 px rows. Both supported radios
-    -- (800x480 MK3, 480x320 TX15) take the >= 300 branch; the 38-px rows are a reserve
-    -- for smaller radios (480x272 class).
-    local row_h = (zone.h >= 300) and 50 or 38
+    -- Row height. The vertical budget may shrink on a short screen (the 38 px branch is
+    -- the reserve for the 480x272 class), but a row must NEVER be shorter than the
+    -- EdgeTX-drawn control it holds: toggle switches are ~40 px tall on the 800x480 MK3
+    -- and overlapped each other in 38 px rows. That height comes from the THEME, not from
+    -- zone.h -- keying the whole decision on the height alone would have handed the
+    -- 480x272 MK2 exactly the overlap that the 50 px fixed. lvgl.UI_ELEMENT_HEIGHT is the
+    -- same number the toggle is centred on further down, so use it as the floor.
+    -- The 800x480 MK3 and the 480x320 TX15 are unaffected (both already at 50).
+    local row_h = math.max((lvgl.UI_ELEMENT_HEIGHT or 32) + 10, (zone.h >= 300) and 50 or 38)
     -- measure the STDSIZE label height (rule 8): a hardcoded 24/22 clipped descenders on the
     -- taller TX16S font. Labels are lbl_h + 2 tall, vertically centred in the row.
     local _, lbl_h = lcd.sizeText("Ag", 0)
@@ -567,6 +598,7 @@ local function build_settings_view(wgt, zone)
     --   uni_cyc_w widest dropdown value on this page
     local val_w, uni_cyc_w = 80, 100
     local has_sensor = false
+    local vals_done = {}     -- i -> the resolved dynamic `vals`, so the row loop reuses it
     for i = 1, #grp.items do
         local it = grp.items[i]
         if it.kind == "num" then
@@ -574,8 +606,14 @@ local function build_settings_view(wgt, zone)
             local vw = math.max(lcd.sizeText(f(it.min or 0), 0), lcd.sizeText(f(it.max or 0), 0)) + 8
             if vw > val_w then val_w = vw end
         elseif it.kind == "choice" then
-            for vi = 1, #it.vals do
-                local tw = lcd.sizeText(it.vals[vi], 0) + 40
+            -- vals may be a FUNCTION of the working copy (per-skin schemes, stage 3b).
+            -- KEPT: the row loop below needs the same list, and resolving a dynamic one
+            -- twice per build means building the whole table twice -- for the skin list
+            -- that is a walk of the registry.
+            local vl = it.vals
+            if type(vl) == "function" then vl = vl(working); vals_done[i] = vl end
+            for vi = 1, #vl do
+                local tw = lcd.sizeText(vl[vi], 0) + 40
                 if tw > uni_cyc_w then uni_cyc_w = tw end
             end
         elseif it.kind == "sensor" then
@@ -585,9 +623,29 @@ local function build_settings_view(wgt, zone)
     local cyc_cap = math.floor(w * 0.45)
     if uni_cyc_w > cyc_cap then uni_cyc_w = cyc_cap end
     -- only pages with a sensor row pay for the 60-slot model sensor scan (see above)
+    -- se_by_code: the pick list REVERSED, code -> list position, built once for the whole page.
+    -- Every sensor row's dropdown needs "where in the list is my current value" ON EVERY FRAME
+    -- (a native `get`), and that used to be a linear walk of the list per row per frame. On a
+    -- real model the list is ~39 entries and dash1's Skin page has eleven sensor rows, so the
+    -- walk alone was 735 of the page's 1864 per-frame instructions -- measured 2026-08-09, on
+    -- the page a TX16S MK3 killed with `CPU limit`. One shared table turns all of it into a
+    -- hash lookup. It is exact rather than a memo: the list cannot change while the page is
+    -- open (the page is never rebuilt while editing, see the header comment).
+    local se_by_code
     if has_sensor then
-        se_labels, se_codes = build_sensor_list(wgt)
-        for ci = 1, #se_codes do if se_codes[ci] == RAW_SENTINEL then se_raw_idx = ci; break end end
+        -- normally handed over by the seed call above; the fallback keeps any path that
+        -- reaches a build without one correct rather than sensor-less
+        local staged = wgt.settings_senslist
+        if staged then
+            se_labels, se_codes = staged[1], staged[2]
+        else
+            se_labels, se_codes = build_sensor_list(wgt)
+        end
+        se_by_code = {}
+        for ci = 1, #se_codes do
+            se_by_code[se_codes[ci]] = ci
+            if se_codes[ci] == RAW_SENTINEL then se_raw_idx = ci end
+        end
     end
     -- EdgeTX draws pg:toggle at its own fixed size (no width parameter); this is the measured
     -- footprint per panel, used only to right-align it with the fields above/below it.
@@ -628,6 +686,19 @@ local function build_settings_view(wgt, zone)
         end
         local is_num = it.kind == "num"
 
+        -- `vals`/`ids` may be FUNCTIONS of the working copy (dynamic lists: the per-skin
+        -- colour schemes, the discovered skin list). Resolve them ONCE per row here -- the
+        -- choice branch below and value_text() both need them, and every call builds a
+        -- fresh table. With `ids` the stored value is the id STRING at the matching list
+        -- position, not the index.
+        local vlist, idlist
+        if it.kind == "choice" then
+            vlist = vals_done[i] or it.vals
+            if type(vlist) == "function" then vlist = vlist(working) end
+            idlist = it.ids
+            if type(idlist) == "function" then idlist = idlist(working) end
+        end
+
         -- value text resolver (reactive), memoized on the raw working value: the label runs
         -- per render frame but the value only moves on a tap/step, so re-format only on change.
         -- For switch rows the getSourceName lookup also rides the memo (only on change).
@@ -637,7 +708,15 @@ local function build_settings_view(wgt, zone)
             if vt_primed and raw == vt_last then return vt_str end
             local s
             if it.kind == "bool" then s = (raw == 1) and "On" or "Off"
-            elseif it.kind == "choice" then s = it.vals[raw or 1] or "?"
+            elseif it.kind == "choice" then
+                if idlist ~= nil then
+                    s = "?"
+                    for ii = 1, #idlist do
+                        if idlist[ii] == raw then s = vlist[ii] or "?" break end
+                    end
+                else
+                    s = vlist[raw or 1] or "?"
+                end
             elseif it.kind == "sensor" then s = sensor_pick_label(raw)
             elseif it.kind == "switch" then
                 -- fallback-only readout (the native picker renders its own text):
@@ -696,25 +775,31 @@ local function build_settings_view(wgt, zone)
                                   text = it.lbl, color = label_color }
             elems[#elems + 1] = { type = "label", x = sl_x - val_w2 - 6, y = ry + lbl_dy, w = val_w2, h = lbl_h + 2,
                                   text = value_text, color = label_color, align = RIGHT }
+            -- min/max DEFAULTED, not assumed. These rows can come from a skin's M.items,
+            -- i.e. from a third party's file, and a row that omits one used to raise here
+            -- (comparison with nil) -- inside a control callback, where it takes the whole
+            -- widget with it. A malformed row degrades to unbounded instead.
+            local it_min = it.min or 0
+            local it_max = it.max or math.huge
             local function set_val(v)
                 if it.step and it.step > 1 then v = math.floor(v / it.step + 0.5) * it.step end
-                if v < it.min then v = it.min elseif v > it.max then v = it.max end
+                if v < it_min then v = it_min elseif v > it_max then v = it_max end
                 working[it.key] = v
             end
             local oksl = pcall(function()
-                pg:slider({ x = sl_x, y = field_y(ry), w = sl_w, min = it.min, max = it.max,
-                    get = function() return working[it.key] or it.def or it.min end,
+                pg:slider({ x = sl_x, y = field_y(ry), w = sl_w, min = it_min, max = it_max,
+                    get = function() return working[it.key] or it.def or it_min end,
                     set = set_val })
             end)
             if not oksl then
                 local btn_x2 = right - btn_w
                 local btn_x1 = btn_x2 - btn_w - 8
                 elems[#elems + 1] = { type = "button", x = btn_x1, y = ry, w = btn_w, h = row_h - 6, text = "-",
-                                      press = function() set_val((working[it.key] or it.min) - it.step) end,
-                                      longpress = function() set_val((working[it.key] or it.min) - (it.big or it.step)) end }
+                                      press = function() set_val((working[it.key] or it_min) - (it.step or 1)) end,
+                                      longpress = function() set_val((working[it.key] or it_min) - (it.big or it.step or 1)) end }
                 elems[#elems + 1] = { type = "button", x = btn_x2, y = ry, w = btn_w, h = row_h - 6, text = "+",
-                                      press = function() set_val((working[it.key] or it.min) + it.step) end,
-                                      longpress = function() set_val((working[it.key] or it.min) + (it.big or it.step)) end }
+                                      press = function() set_val((working[it.key] or it_min) + (it.step or 1)) end,
+                                      longpress = function() set_val((working[it.key] or it_min) + (it.big or it.step or 1)) end }
             end
         elseif is_num then
             -- [-] [reactive value] [+]
@@ -725,17 +810,20 @@ local function build_settings_view(wgt, zone)
                                   text = it.lbl, color = label_color }
             elems[#elems + 1] = { type = "label", x = val_x, y = ry + lbl_dy, w = val_w, h = lbl_h + 2,
                                   text = value_text, color = label_color, align = CENTER }
+            -- defaulted for the same reason as the slider row above
+            local it_min = it.min or 0
+            local it_max = it.max or math.huge
             local function adjust(delta)
-                local v = (working[it.key] or it.min or 0) + delta
-                if v < it.min then v = it.min elseif v > it.max then v = it.max end
+                local v = (working[it.key] or it_min) + delta
+                if v < it_min then v = it_min elseif v > it_max then v = it_max end
                 working[it.key] = v
             end
             elems[#elems + 1] = { type = "button", x = btn_x1, y = ry, w = btn_w, h = row_h - 6, text = "-",
-                                  press = function() adjust(-it.step) end,
-                                  longpress = function() adjust(-(it.big or it.step)) end }
+                                  press = function() adjust(-(it.step or 1)) end,
+                                  longpress = function() adjust(-(it.big or it.step or 1)) end }
             elems[#elems + 1] = { type = "button", x = btn_x2, y = ry, w = btn_w, h = row_h - 6, text = "+",
-                                  press = function() adjust(it.step) end,
-                                  longpress = function() adjust(it.big or it.step) end }
+                                  press = function() adjust(it.step or 1) end,
+                                  longpress = function() adjust(it.big or it.step or 1) end }
         elseif it.kind == "bool" then
             -- real toggle switch (works in fullscreen widgets despite the docs'
             -- one-time-only note — verified in the 2.12 source: no script-type
@@ -820,12 +908,17 @@ local function build_settings_view(wgt, zone)
             -- against getSourceName on read (a firmware/model change that shifts
             -- indices falls back to "---" instead of showing a wrong source).
             local raw_key = it.key .. "Raw"
+            -- REACTIVE, once per frame per row: keep it to one hash lookup. The two branches
+            -- are disjoint by construction -- the curated list holds only Off, the two virtual
+            -- entries, SENSOR_INFO names and ‹ Raw ›, and `is_raw_sensor` is false for every
+            -- one of them -- so testing the list FIRST cannot change the answer, it only stops
+            -- the common case (a curated pick, which is what all eleven of dash1's rows have)
+            -- from paying for the raw test as well.
             local function cur_index()
                 local v = working[it.key] or SENSOR_OFF
+                local ci = se_by_code[v]
+                if ci then return ci end
                 if is_raw_sensor(v) then return se_raw_idx end   -- raw pick -> ‹ Raw ›
-                for ci = 1, #se_codes do
-                    if se_codes[ci] == v then return ci end
-                end
                 return 1
             end
             elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = cyc_x - 14, h = lbl_h + 2,
@@ -859,7 +952,10 @@ local function build_settings_view(wgt, zone)
                     filter = (lvgl.SRC_TELEM or 0) | (lvgl.SRC_CLEAR or 0),
                     get = function()
                         local nm = working[it.key]
-                        if not is_raw_sensor(nm) then return 0 end   -- curated -> "---"
+                        -- same reversal as cur_index: a curated pick is in the list, and
+                        -- answering it with a hash lookup skips the raw test entirely
+                        if se_by_code[nm or SENSOR_OFF] then return 0 end   -- curated -> "---"
+                        if not is_raw_sensor(nm) then return 0 end
                         local idx = working[raw_key]
                         if type(idx) == "number" and idx ~= 0 then
                             local okn, n = pcall(getSourceName, idx)
@@ -888,7 +984,7 @@ local function build_settings_view(wgt, zone)
             -- computed once at build time (the get() closure captures it) — the page may be
             -- editing a scheme other than the one currently rendered.
             local role   = it.role
-            local scheme = it.scheme or SCHEME_ULTIDASH
+            local scheme = it.scheme or SCHEME_DEFAULT   -- a SCHEMES descriptor since the registry refactor
             local b      = page_builtins(scheme)
             local sw_w   = math.min(110, math.floor(w * 0.16))
             local def_w  = btn_w
@@ -934,20 +1030,39 @@ local function build_settings_view(wgt, zone)
                                   press = function() it.act(wgt, working) end }
         else
             -- real dropdown (lvgl.choice popup picker, 1-based indices like our CHOICE
-            -- values); one shared width per page (uni_cyc_w) so the fields line up
+            -- values); one shared width per page (uni_cyc_w) so the fields line up.
+            -- vlist/idlist were resolved once at the top of this row (dynamic lists are
+            -- resolved at BUILD time, so a dependent pick made on this very page shows up
+            -- on the next page open). With `ids` the row STORES the id string at the
+            -- picked list position (stable when the discovered list changes), not the index.
+            local function cur_index()
+                if idlist == nil then return working[it.key] or 1 end
+                local raw = working[it.key]
+                for ii = 1, #idlist do
+                    if idlist[ii] == raw then return ii end
+                end
+                return 1
+            end
             local cyc_w = uni_cyc_w
             elems[#elems + 1] = { type = "label", x = 10, y = ry + lbl_dy, w = right - cyc_w - 24, h = lbl_h + 2,
                                   text = it.lbl, color = label_color }
             local okc = pcall(function()
                 pg:choice({ x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
-                    title = it.lbl, values = it.vals,
-                    get = function() return working[it.key] or 1 end,
-                    set = function(i) working[it.key] = i end })
+                    title = it.lbl, values = vlist,
+                    get = cur_index,
+                    set = function(i)
+                        if idlist ~= nil then working[it.key] = idlist[i] or idlist[1]
+                        else working[it.key] = i end
+                    end })
             end)
             if not okc then
                 elems[#elems + 1] = { type = "button", x = right - cyc_w, y = field_y(ry), w = cyc_w, h = field_h,
                                       text = value_text,
-                                      press = function() working[it.key] = ((working[it.key] or 1) % #it.vals) + 1 end }
+                                      press = function()
+                                          local nxt = (cur_index() % #vlist) + 1
+                                          if idlist ~= nil then working[it.key] = idlist[nxt] or idlist[1]
+                                          else working[it.key] = nxt end
+                                      end }
             end
         end
 
@@ -1020,9 +1135,17 @@ end
 -- above it and, if too tall, shrinks its rows/gaps toward a floor before overflowing
 -- into scroll — otherwise the reserved element sits off-screen (Toolbox armed hint).
 local function build_menu_grid(pg, w, h, items, cols, max_btn_w, reserve)
+    -- `big` is a VERTICAL budget only (gaps, minimum sizes, font tier): a short screen
+    -- gets tighter spacing. Anything that has to clear EdgeTX-drawn chrome must NOT hang
+    -- off it -- see row_h's floor and header_px below. The remaining `zone.h >= 300`
+    -- tests in this file are all of the vertical kind; a width cap keyed on the height
+    -- was a bug (fixed in build_battpick).
     local big = h >= 300
     local gap = big and math.max(10, math.floor(h * 0.02)) or 6
-    local row_h = big and math.max(44, math.floor(h * 0.12)) or 36
+    -- floor at the theme's element height so a button never ends up smaller than the
+    -- control EdgeTX draws into it (same reasoning as the settings rows)
+    local row_h = math.max(lvgl.UI_ELEMENT_HEIGHT or 32,
+                           big and math.max(44, math.floor(h * 0.12)) or 36)
     local btn_font = big and MIDSIZE or 0   -- 0 = STDSIZE (default)
     local side = math.max(16, math.floor(w * 0.05))
     local btn_w = math.floor((w - 2 * side - (cols - 1) * gap) / cols)
@@ -1080,12 +1203,21 @@ local function build_menu_grid(pg, w, h, items, cols, max_btn_w, reserve)
     -- page header (title + subtitle) eats the top of the zone; center in what's left,
     -- keeping the caller's reserved space free. If the grid overflows that space, shrink
     -- gaps then rows toward a floor (still comfortably tappable) before letting it scroll.
-    local header_px = big and 56 or 40
+    -- The lvgl.page title/subtitle header is drawn by EdgeTX and scales with the THEME,
+    -- not with zone.h -- so this reserve must not shrink just because the screen is short
+    -- (a 480x272 MK2 would have started its first row underneath the header). Menus are
+    -- fullscreen-only, so the old 40 px small-zone branch was never reachable anyway.
+    local header_px = 56
     local min_y = big and 10 or 6
     local avail = h - header_px - (reserve or 0) - min_y
-    local min_gap, min_row = (big and 6 or 4), (big and 34 or 28)
+    -- The row floor honours the THEME's element height too. Without it the shrink walked
+    -- straight past the floor row_h was built with (line ~1143) and produced buttons
+    -- smaller than the control EdgeTX draws into them -- the overlap that floor exists to
+    -- prevent. Overflowing and scrolling is the designed outcome past this point.
+    local min_gap = (big and 6 or 4)
+    local min_row = math.max(lvgl.UI_ELEMENT_HEIGHT or 32, (big and 34 or 28))
     while grid_h > avail and (gap > min_gap or row_h > min_row) do
-        if gap > min_gap then gap = gap - 1 else row_h = row_h - 2 end
+        if gap > min_gap then gap = gap - 1 else row_h = math.max(min_row, row_h - 2) end
         plan, grid_h = make_plan(row_h, gap)
     end
     local y0 = math.max(min_y, math.floor((h - header_px - (reserve or 0) - grid_h) / 2))
@@ -1184,17 +1316,32 @@ local function build_toolbox_menu_view(wgt, zone)
     if fltlog.avail then
         items[#items + 1] = { txt = "Flight Log", tcol = dim_armed, act = open_tool("tb_fltlog") }
     end
+    -- The FC battery-profile picker. ALWAYS present,
+    -- never conditional on availability: the whole point is a route no skin can remove, and
+    -- a tile that disappears when the FC is not talking is a route that is missing exactly
+    -- when the user goes looking for it. Unavailable therefore means DIMMED, like the
+    -- disarmed-only tools — armed, or no MSP (no RF connection / the gate closed). The open
+    -- path refuses in both states; this is the affordance in front of it.
+    local msp_ok = wgt.rf ~= nil and wgt.rf.msp_allowed
+    items[#items + 1] = { txt = "Battery profile",
+                          tcol = (wgt.armed_now or not msp_ok) and COLOR_DIM or nil,
+                          act = open_tool("battprofile") }
     wgt.tb_menu_armed = wgt.armed_now   -- arm state this build reflects (rebuild trigger)
     -- reserve room below the grid for the armed hint — without it the 5-button grid
-    -- filled the small screen to the bottom edge and the hint rendered off-screen
-    local any_hint = tb_logview_avail or tb_rf2cfg_avail or fltlog.avail
-    local hint_res = any_hint and (((zone.h >= 300) and 26 or 18) + 8) or 0
+    -- filled the small screen to the bottom edge and the hint rendered off-screen.
+    -- Unconditional since the battery-profile tile joined: it is always there and it is
+    -- disarmed-only, so there is always a tile the hint can be about.
+    local any_hint = true
+    -- hint height MEASURED (rule 8) instead of the old 26/18 guess
+    local _, hint_h = lcd.sizeText("Ag", SMLSIZE)
+    hint_h = hint_h + 4
+    local hint_res = any_hint and (hint_h + 8) or 0
     local grid_bottom = build_menu_grid(pg, zone.w, zone.h, items, 1, (zone.h >= 300) and 460 or nil, hint_res)
     -- reactive hint: visible only while the refused armed tap is fresh (~2 s)
     if any_hint then
         pg:build({
             { type = "label", x = 6, y = (grid_bottom or ((zone.h >= 300) and 460 or 220)) + 8,
-              w = zone.w - 12, h = (zone.h >= 300) and 26 or 18, font = SMLSIZE, align = CENTER,
+              w = zone.w - 12, h = hint_h, font = SMLSIZE, align = CENTER,
               color = COLOR_THEME_WARNING, text = "Available only while disarmed",
               visible = function() return (wgt.lv_armed_hint or 0) > (getTime() or 0) end },
         })
@@ -1234,13 +1381,14 @@ local function build_settings_menu_view(wgt, zone)
 
     local function reset_defaults()
         local function do_reset()
-            if not ultidash_settings.reset() then
-                ultidash_functions.log("settings reset FAILED (cfg file not writable)")
-                wgt.cfg_save_failed_text = nil                        -- default banner wording
-                wgt.cfg_save_failed_until = (getTime() or 0) + 1000   -- ~10 s sticky warn banner
-            end
-            ultidash_settings.apply(wgt)
-            bump_settings_gen()   -- invalidate palette memo + trip passive rebuild (host-local)
+            -- STAGGERED exactly like the autosave (see save_pending_settings in
+            -- ultidash.lua): reset() writes the whole key catalog to the card (measured
+            -- ~17k instructions) and apply() walks it again -- far too much for one
+            -- EdgeTX call, and this one runs inside a dialog callback. Only FLAG it here;
+            -- the host's stage 1 does the write in its own cycle and hands over to
+            -- stage 2 (settings_apply_pending), which applies, bumps settings_gen and
+            -- flags the rebuild.
+            wgt.settings_reset_pending = true
             wgt.settings_working = nil
             init_view_state(wgt).dirty = true
         end
@@ -1436,17 +1584,22 @@ local function build_sub_menu_view(wgt, zone)
     build_menu_grid(pg, zone.w, zone.h, items, 1, (zone.h >= 300) and 460 or nil)
 end
 
---- Battery-profile picker — opened by tapping the B-Profile field (DISARMED only).
+--- Battery-profile picker — opened by tapping the B-Profile field, by the Toolbox tile or
+--- by a switch shortcut (DISARMED only, and only with MSP allowed).
 --- Lists the 6 battery profiles with their per-profile capacity (when the FC reports
 --- it) and switches the active one through the RFTool MSP API (write MSP 176, persist
 --- without reboot, then re-read). Read-side stays as-is; this is the one place the
---- widget WRITES to the FC, and only when disarmed. Back/RTN returns to the dashboard.
+--- widget WRITES to the FC, and only when disarmed. Back/RTN returns where it came from.
 local function build_battprofile_view(wgt, zone)
     local pg = lvgl.page({
         title = "Battery profile",
         subtitle = "select active profile",
         back = function()
-            wgt.menu_view = nil
+            -- Opened from the Toolbox submenu, RTN unwinds back there — the same trail
+            -- shortcut.open records for every other tool page. The tap route clears
+            -- tool_back, so it still returns straight to the dashboard.
+            wgt.menu_view = (wgt.tool_back == "toolbox") and "toolbox" or nil
+            wgt.tool_back = nil
             init_view_state(wgt).dirty = true
         end,
     })
@@ -1467,7 +1620,7 @@ local function build_battprofile_view(wgt, zone)
     local x0 = math.floor((w - grid_w) / 2)
     local rows = 3
     local grid_h = rows * row_h + (rows - 1) * gap
-    local header_px = (h >= 300) and 56 or 40       -- page header eats the top
+    local header_px = 56                            -- EdgeTX page header, theme-sized (see build_menu_grid)
     local y0 = math.max((h >= 300) and 10 or 6, math.floor((h - header_px - grid_h) / 2))
 
     local elems = {}
@@ -1482,6 +1635,11 @@ local function build_battprofile_view(wgt, zone)
             w = btn_w, h = row_h, font = 0, text = line1 .. "\n" .. line2,
             press = function()
                 rf_service.set_battery_profile(wgt, i)
+                -- A PICK closes to the dashboard from every route (the tap route's
+                -- behaviour, and the useful one: the profile is switched, there is nothing
+                -- left to do in the Toolbox). Only the back arrow above unwinds the trail --
+                -- so clear it here, or the next tap-opened tool inherits it.
+                wgt.tool_back = nil
                 wgt.menu_view = nil
                 init_view_state(wgt).dirty = true
             end }
@@ -1509,21 +1667,38 @@ local function build_battpick(wgt, zone)
     local _, fh = lcd.sizeText("Ag", 0)
     local row_h = 2 * fh + 14
     local gap = 8
-    local btn_w = math.min((h >= 300) and 460 or 320, w - 32)
-    local x0 = math.floor((w - btn_w) / 2)
-    local skip_h = fh + 12
     -- ALL packs are selectable: the old fit-above-the-skip-button cap made
     -- packs beyond ~3 rows unreachable on the TX15 — lvgl.page scrolls, so rows past
-    -- the fold are a swipe away (the skip button simply ends the list)
+    -- the fold are a swipe away (the skip button simply ends the list).
+    -- From 4 packs up, a 2-COLUMN grid (like the battery-profile picker): full-width
+    -- rows fit only ~4 packs above the fold on the TX15 (user request 2026-07-22).
     local n = #batts
+    local cols = (n >= 4) and 2 or 1
+    local btn_w, x0
+    if cols == 2 then
+        btn_w = math.floor((w - 24 - gap) / 2)
+        x0 = math.floor((w - (2 * btn_w + gap)) / 2)
+    else
+        -- a WIDTH cap belongs on the width: keying it on zone.h gave the 480x272 MK2
+        -- narrower buttons than the equally wide 480x320 TX15 for no reason
+        btn_w = math.min(460, w - 32)
+        x0 = math.floor((w - btn_w) / 2)
+    end
+    local grid_w = cols * btn_w + (cols - 1) * gap
+    local skip_h = fh + 12
     local elems = {}
-    local y = (h >= 300) and 10 or 6
+    local y0 = (h >= 300) and 10 or 6
+    local y = y0
     for i = 1, n do
         local b = batts[i]
+        local c = (i - 1) % cols
+        local r = math.floor((i - 1) / cols)
+        y = y0 + r * (row_h + gap)
         local line1 = b.name or b.id
         local line2 = (b.cap and (b.cap .. " mAh") or "capacity ?")
             .. " - " .. (b.cycles or 0) .. " cycles"
-        elems[#elems + 1] = { type = "button", x = x0, y = y, w = btn_w, h = row_h,
+        elems[#elems + 1] = { type = "button",
+            x = x0 + c * (btn_w + gap), y = y, w = btn_w, h = row_h,
             font = 0, text = line1 .. "\n" .. line2,
             press = function()
                 wgt.flt_batt_id = b.id
@@ -1555,9 +1730,9 @@ local function build_battpick(wgt, zone)
                 wgt.menu_view = nil
                 init_view_state(wgt).dirty = true
             end }
-        y = y + row_h + gap
     end
-    elems[#elems + 1] = { type = "button", x = x0, y = y, w = btn_w, h = skip_h,
+    y = y0 + math.ceil(n / cols) * (row_h + gap)
+    elems[#elems + 1] = { type = "button", x = x0, y = y, w = grid_w, h = skip_h,
         font = SMLSIZE, text = "No battery / skip",
         press = function()
             wgt.flt_batt_id = nil

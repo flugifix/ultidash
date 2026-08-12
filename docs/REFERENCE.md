@@ -23,21 +23,27 @@ Rob "bob00" Gayle:
 | File | Content |
 |-------|--------|
 | `main.lua` | Entry point, registers the widget (`useLvgl = true`) |
-| `ultidash.lua` | UI build (all views + detail pages + settings menu), lifecycle (create/update/refresh), touch handling |
+| `ultidash.lua` | UI build (dashboard views + settings menu), lifecycle (create/update/refresh), touch handling, the skin engine |
+| `ultidashDetail.lua` | The four detail pages (ELRS / status log / battery / telemetry). Split out in 0.7.0 so a skin can draw them; the host keeps opening, closing, tap routing and the gates |
+| `ultidashMenu.lua` | Every full-screen menu page: the menu hub, the Settings and Toolbox submenus, the settings pages, sensor check and the two battery pickers. Lazy-loaded on menu open and released when the menu family closes |
 | `ultidashFunctions.lua` | Telemetry updates, battery logic, callout engine, switch voices, eStatus, shared-state publisher |
 | `ultidashValues.lua` | Value table with formatting/color getters |
 | `ultidashRf.lua` | RF service: connection state, MSP (battery profile, flight statistics) |
-| `ultidashOptions.lua` | The single EdgeTX widget option (`ViewMode`) |
+| `ultidashOptions.lua` | The EdgeTX widget-option list (empty — everything is configured in-widget, §2.2) |
 | `ultidashSettings.lua` | Per-model settings store (SD-card cfg files) — the in-widget settings overlay |
 | `ultidashEsc.lua` | Multi-vendor ESC status/fault decoder (from eStatus) |
 | `ultidashDebug.lua` | Optional SD-card debug logger (see §11) |
+| `skins/default.lua` | The built-in **UltiDash** look as a skin module — the fallback whenever a chosen skin is missing or broken, and the worked example for [SKINS.md](SKINS.md). Further skins are dropped in beside it as `skins/<id>.lua` |
 | `toolbox/adjmap.lua`, `toolbox/adjed.lua` | Toolbox tool pages: RF Adjustment Map / Editor (see §2.7b and [TOOLBOX.md](TOOLBOX.md)) |
+| `toolbox/common.lua` | Shared adjustment tables and helpers behind the Map and the Editor, loaded once so a `labels.lua` override applies identically to both |
 | `toolbox/labels.example.lua` | Optional custom adjustment-function labels (copy to `labels.lua`) |
 | `toolbox/logview.lua` | Toolbox tool page: telemetry Log Viewer (graphs `/LOGS/*.csv`; WIP, disarmed-only) |
-| `toolbox/logtemplates.example.lua` | Optional custom Log Viewer sensor templates (copy to `logtemplates.lua`) |
+| `toolbox/logtemplates.example.lua` | Commented template for stocking own Log Viewer sensor sets from a PC (copy to `cfg/logtemplates.lua`) — since 0.7.0 the radio itself maintains that file |
 | `toolbox/rf2cfg.lua` | Toolbox tool page: RF2 Config — zero-copy adapter running the original rotorflight-lua-scripts tool from `/SCRIPTS/RF2/` (disarmed-only) |
 | `toolbox/fltdata.lua` | Flight-log data core: battery registry parse, `flights.csv` append, cycle counters (see §12) |
 | `toolbox/fltlog.lua` | Toolbox tool page: Flight Log viewer (flights / per-model totals / batteries; disarmed-only) |
+| `cfg/` | Widget-owned data folder, never overwritten by an update: `cfg_m_<model-name>.cfg` per-model settings (§2.8) and `logtemplates.lua`, the Log Viewer's own sensor sets |
+| `logs/` | Debug-log folder: `debug_NN.log`, written only while *General ▸ Debug log to SD card* is on (§11) |
 | `fltlog/` | Flight-log data folder: `flights.csv` (written by the widget) + `batteries.cfg` (your battery registry, PC-edited) |
 | `fltlog/batteries.example.cfg` | Commented template for the battery registry (copy to `batteries.cfg`) |
 
@@ -45,27 +51,20 @@ Rob "bob00" Gayle:
 
 ## 2. Configuration
 
-### 2.1 The only EdgeTX widget option: `ViewMode`
+### 2.1 EdgeTX widget options: none
 
-| Option | Type | Default | Values | Meaning |
-|--------|------|---------|--------|---------|
-| **ViewMode** | CHOICE | Dashboard | Dashboard / ELRS details / Status info | What this widget **instance** shows |
+The widget declares **no EdgeTX options**. Place **exactly one** UltiDash instance — if
+two are placed, both drive callouts and the shared state (doubled announcements) and a
+**"2 Dashboard instances active!"** banner appears on both until you remove one.
 
-- **Dashboard** — the full widget (flight/stats views, all detail pages, the settings
-  menu, all sounds, MSP). Place **exactly one** Dashboard instance — if two are placed, both
-  drive callouts and the shared state (doubled announcements, flickering passive views) and a
-  **"2 Dashboard instances active!"** banner appears on both until you remove one.
-- **ELRS details / Status info** — passive views for a **second instance on another
-  screen**. They run no MSP, no audio and no statistics; they mirror the Dashboard
-  instance's data through a shared (module-local) state. While no Dashboard instance is
-  running they show a "No Dashboard instance running" notice. They also inherit the
-  Dashboard's color scheme and background.
+> ⚠️ **Upgrading from a version with `ViewMode`:** the second-screen *ELRS details* /
+> *Status info* views were removed (the feedback round found no real use). A second
+> instance that was set to one of them becomes a **full dashboard** after the update —
+> the banner above is the symptom. **Delete the second instance.** The same data lives on
+> as the Dashboard's own detail pages (tap the link bars / the status line) and the
+> menu's **Status** entry.
 
-> ℹ️ **Feedback wanted.** The second-screen *ELRS details* / *Status info* views are under
-> review — I'm not sure they see real use. If you rely on them, please open an issue;
-> otherwise I reserve the right to remove them in a future version.
-
-Everything else is configured **inside the widget**, not in the EdgeTX option list.
+Everything is configured **inside the widget**, not in the EdgeTX option list.
 
 ### 2.2 The in-widget settings menu
 
@@ -80,8 +79,8 @@ themed section headers; pick a group to open its page, its back arrow returns he
 
 | Section | Groups |
 |---------|--------|
-| **Appearance** | **Display**, **Colors** (§2.3b — submenu, one page per color scheme), **Telemetry** (submenu: *Tele Main* / *Tele Details*, §2.3a) |
-| **Battery & limits** | **Battery**, **Thresholds**, **ESC load** (§2.5a) |
+| **Appearance** | **Display**, **Skin** (§2.3s — the active skin's own colour scheme + options), **Colors** (§2.3b — submenu, one page per scheme of the active skin) |
+| **Battery & limits** | **Telemetry** (submenu: *Tele Main* / *Tele Details*, §2.3a), **Battery**, **Thresholds**, **ESC load** (§2.5a) |
 | **Sound & callouts** | **Volume** (§2.6), **Alerts** (§2.6a — submenu, one page per alert), **Voice** (submenu: *Switch voice* §2.7 / *Gov voice* §2.7-gov) |
 | **System** | **Shortcuts** (§2.7c), **Toolbox** (§2.7b), **General** (§2.7a) |
 
@@ -95,28 +94,74 @@ full-screen also saves. Each group page also has a **Reset <page> to defaults** 
 
 ### 2.3 Settings — Display
 
+Display holds the settings that are **common to every skin**. Anything specific to a
+particular layout — including the **colour scheme** — lives in the **Skin** group (§2.3s).
+
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
-| **Top-left shows** | choice | Model image | Model image / Timer |
-| **Top bar clock** | choice | Time only | Date + time / Time only |
-| **Timer (for top-left)** | num | Timer 1 | which model timer when *Top-left = Timer* |
-| **Color scheme** | choice | UltiDash | UltiDash (built-in light palette) / UltiDash dark (high-contrast white-on-black with neon accents) / EdgeTX theme — every scheme's colors are adjustable under *Settings ▸ Colors* (§2.3b) |
+| **Dashboard skin** | choice | UltiDash | the flight/stats **layout** (§2.3s). This release carries the built-in **UltiDash** look; the choice lists every skin file found in `skins/` beside it. Each skin has its own colour scheme + options in the *Skin* group |
 | **Fill background** | bool | on | fill the panel background color |
+| **Units beside values** | bool | **off** | show the unit (V / A / rpm / °C …) as a small suffix next to each value — flight panel, Telemetry cards and every skin slot fed by the skin API. **Off = the original formatting:** the value keeps the whole column and therefore the biggest font that fits. Worth turning on where there is room (800×480); on 480×320 (TX15) / 480×272 (TX16S MK2) it costs font size where there is none to spare |
 | **Stats page** | choice | On disconnected | Never / On disarmed / On disconnected |
 | **Voltage shown as** | choice | Cell voltage | Cell voltage / Battery voltage |
-| **Top bar: RQ bar** | bool | on | show the RQ (downlink link quality) bar |
-| **Top bar: TQ bar** | bool | on | show the TQ (uplink link quality) bar |
-| **Top bar: RSSI bars** | bool | on | show 1RSS (+ 2RSS with antenna diversity) |
-| **Top bar: TX voltage** | bool | off | show the radio battery voltage next to the icon |
-| **Bottom bar: TPWR** | bool | on | show TX power in the flight-view status bar |
-| **TPWR bar max (mW)** | num | not set | 100 % reference for the TPWR bar in the ELRS detail; unset → bar shows a hint |
 | **Close detail pages on arm** | bool | off | when on, arming closes an open detail page (off = keep ELRS detail open in flight) |
 | **Tap zones for detail pages** | bool | on | enable tapping the bars / status line / gauge to open detail pages (the menu glyph stays active either way) |
-| **Link bars: color only on warning** | bool | on | bars stay neutral while fine; color only on warn/crit (key `BarsQuiet`) |
+| **Keep backlight on (full screen)** | bool | on | while UltiDash owns the **whole** display, defer the radio's *Backlight off after* timeout each pass. With the backlight already off, EdgeTX spends the next press on waking the screen and no widget sees it — that is the tap meant to open a detail page. Only in full screen: in a layout zone the radio's own power saving stands. Your *Backlight off after* setting is deferred, never overridden |
+
+> **Moved to the skin (0.7.0).** *Color scheme* and the top-bar / left-panel rows
+> (*Top-left shows*, *Top bar clock*, *Timer*, the *RQ / TQ / RSSI / TX-voltage* toggles,
+> *Link bars: color only on warning*) are now part of the **Skin** group (§2.3s) — they
+> describe the UltiDash layout, not every skin. Stored keys are unchanged.
+>
+> The former *Bottom bar* section is gone too: **Status bar: TPWR** moved into **every
+> skin's own options** (§2.3s) — it toggles content of the status bar, and whether that bar
+> is shown at all is already a per-skin setting. **TX power limit (mW)** (the old *TPWR bar
+> max*) moved to **Thresholds ▸ Link & signal** (§2.5) — it describes this transmitter's
+> ELRS dynamic-power ceiling, not the display. Stored keys are unchanged.
 
 > Hands-free opening of detail pages **and** Toolbox tools by switch now lives in its own
 > **Shortcuts** group (§2.7c) — the old *Detail page switch* / *Switch opens* rows and the
 > Toolbox *Activation switch* were folded into it.
+
+### 2.3s Settings — Skin
+
+The **Skin** group holds everything that belongs to the *currently selected* dashboard
+skin (chosen with **Display → Dashboard skin**): its **Color scheme** row (always first),
+then that skin's own layout options. Switch the skin and this group's contents change with
+it. Each skin **remembers its own** scheme pick and option values independently — switching
+away and back restores them.
+
+**Built-in skins**
+
+| Skin | Layout | Own colour schemes | Own options |
+|------|--------|--------------------|-------------|
+| **UltiDash** | the classic three-panel dashboard (status · battery gauge · values) with the top bar and status bar — the default, unchanged | *UltiDash* / *UltiDash dark* / *EdgeTX theme* (the historical three) | *Top-left shows*, *Top bar clock*, *Timer*, *Top bar: RQ / TQ / RSSI / TX voltage*, *Link bars: color only on warning*, *Status bar: TPWR* |
+
+> **Rows several skins share.** Options that configure a **host component** rather than a
+> skin's own drawing — the top-bar rows (*Top bar clock*, *RQ / TQ / RSSI / TX voltage*,
+> *Link bars quiet*), *Timer* and *Status bar: TPWR* — use the same stored key in every skin
+> that offers them, so they are set **once for all of them** (only each skin decides whether
+> it draws that component at all). A skin's *own* rows are per-skin and independent.
+
+> **A skin that draws no top bar draws no menu glyph.** The settings menu stays
+> reachable regardless: **tap the top-left corner** of the screen in full-screen — the host
+> keeps that region tappable whatever the skin draws there, and a skin that draws its own
+> header can place the tap zone itself.
+
+The **Color scheme** row lists the active skin's schemes only. Their colours are edited
+the usual way under *Settings ▸ Colors* (§2.3b), which shows one page per scheme of the
+active skin. A skin's colour overrides are stored under the skin's own keys, so different
+skins never share a palette and switching skins never disturbs another skin's colours.
+
+Some schemes are **fixed**: their colours are defined by the skin itself and are not
+user-adjustable (they appear in the *Color scheme* choice but get no *Colors* page). A
+skin declares that per scheme; the built-in UltiDash look has none.
+
+> **Adding your own skins.** Skins are Lua files in `WIDGETS/UltiDash/skins/` and are
+> **discovered automatically** — dropping the file in is the install (the file name is
+> the skin's id). See **[SKINS.md](SKINS.md)** for the skin API, the value catalog and
+> the rules. A broken or missing skin falls back to the built-in UltiDash look — never a
+> blank screen.
 
 > **Color scheme — feedback-dependent.** UltiDash is developed and tested against the
 > built-in **UltiDash** palette (the primary path). The **EdgeTX theme** option
@@ -170,11 +215,12 @@ Each row is a **two-field hybrid**, both writing the same slot:
 
 ### 2.3b Settings — Colors (per-scheme color overrides)
 
-*Settings ▸ Colors* opens a submenu with **one page per color scheme** (UltiDash /
-UltiDash dark / EdgeTX theme). Each page lists that scheme's adjustable color roles; a row
-shows the role name, a **Def** button and a color swatch — tap the swatch to open the native
-EdgeTX color picker, tap **Def** to revert that color to the scheme's built-in. The page's
-*Reset … to defaults* reverts the whole scheme.
+*Settings ▸ Colors* opens a submenu with **one page per colour scheme of the active skin**
+(for the UltiDash skin: UltiDash / UltiDash dark / EdgeTX theme; other skins list their own
+schemes — §2.3s). Each page lists that scheme's adjustable color roles; a row shows the role
+name, a **Def** button and a color swatch — tap the swatch to open the native EdgeTX color
+picker, tap **Def** to revert that color to the scheme's built-in. The page's *Reset … to
+defaults* reverts the whole scheme.
 
 | Section | Roles | Notes |
 |---------|-------|-------|
@@ -203,6 +249,9 @@ leaving the settings (autosave as usual).
 | **Fuel: dense below (%)** | num | 15 | below this level the fine step applies |
 | **Fuel: fine step (%)** | num | 5 | callout spacing in the dense zone |
 | **Fuel callout says** | choice | Percent | what the descending %-step callouts speak: **Percent** / **Battery V** (pack, PREC1) / **Cell V** (per-cell, PREC2) / **% + Battery V** / **% + Cell V** — the %-interval *triggering* is unchanged |
+| **Volt callout 1 (V/cell)** | num | off | extra orientation callout at a fixed per-cell voltage (0 = off) |
+| **Volt callout 2 (V/cell)** | num | off | second fixed per-cell voltage callout (0 = off) |
+| **Volt callout delay (s)** | num | 3 | the cell voltage must stay at/below a threshold this long before it speaks (0 = immediate); filters brief load sags |
 | **Cell thresholds from** | choice | FC config | FC config (`mspBatteryConfig`) / Manual |
 | **Full cell (manual)** | num | 4.12 V | only used when *Manual* |
 | **Low cell (manual)** | num | 3.45 V | only used when *Manual* |
@@ -225,10 +274,13 @@ refer to the chosen source.
 
 The four **Fuel** settings shape the fuel-callout density (value-driven, descending %):
 quiet up high, denser near the end. The defaults reproduce the historical cadence
-(announce from full in 10 % steps, every 1 % below 10 %). The **Fuel alert's *Repeat
-interval*** (§2.6a) plays a double role: besides spacing the repeats it also sets the
-**minimum gap between two step callouts** — a fast-falling fuel level can't machine-gun
-the 1 %-steps closer together than that interval.
+(announce from full in 10 % steps, every 1 % below 10 %). Steps are spoken **only on the
+way down** — a level that rises again (pack recovering off-load, a fresh pack, an FC value
+jumping back) re-arms the ladder silently instead of counting its way back up. Two steps
+are never spoken closer together than **2 s**; that gap only stops them treading on each
+other. The Fuel alert's *Repeat interval* (§2.6a) applies to the **critical nag only**
+— until 0.7.0 it also gated the steps, which swallowed one whenever the fine steps passed
+faster than the repeat gap (i.e. exactly at the end of a flight).
 
 **Fuel callout says** changes *what* those descending step callouts announce without
 touching *when* they fire: the remaining **percent** (default), the **battery/pack
@@ -238,6 +290,21 @@ voltage as* (which scopes only the voltage alert and the startup cell check); a
 voltage-only choice with no plausible reading falls back to the percent (never silent).
 The critical (below-critical) nag is unaffected — it keeps speaking the percent.
 
+**Volt callouts 1 & 2** are a *second*, voltage-triggered gate that runs **alongside** the
+%-step callouts (not instead of them): set a per-cell voltage (e.g. 3.80 and 3.75 V) and
+UltiDash speaks that voltage **once per flight** the first time the cell voltage settles
+at/below it. Each is announced per *Announce voltage as* (pack or per-cell). **Volt callout
+delay** is how long the voltage must stay in-band before it fires — so a brief sag through
+a hard maneuver doesn't trigger the callout early (0 = immediate). Both are `0 = off` by
+default; they re-arm on the next arm (i.e. each flight / battery). They ignore the low and
+critical *Voltage* alert thresholds (§2.6) — these are purely for orientation at a level
+you choose. MAIN-POWER-LOST suppresses them (the frozen last-good value is not a reading).
+
+Both thresholds are published to the skin API, so a skin that draws a cell-voltage scale can
+**mark them on it** — a tick in the text colour next to the red *alarm* and yellow *warning*
+ticks, so you see where the callout will fire. Whether it does is that skin's own option; the
+built-in UltiDash look draws no cell scale.
+
 With **FC config** the thresholds come from the Rotorflight FC
 (`vbatfullcellvoltage` / `vbatwarningcellvoltage` / `vbatmincellvoltage`), read on
 connect/disarm and cached. Cell count and capacity always come from the FC.
@@ -246,7 +313,8 @@ connect/disarm and cached. Cell count and capacity always come from the FC.
 
 Warning thresholds, grouped by subject with section headers on the page. *(The former
 "Callout interval" is gone — repeat cadence is now configured **per alert**, §2.6a. The
-TPWR bar max moved to Display, the ESC-load thresholds to their own group, §2.5a.)*
+ESC-load thresholds live in their own group, §2.5a. New in 0.7.0: **TX power limit**, the
+old Display row "TPWR bar max" — same key, it is a per-transmitter setup limit.)*
 
 **Link & signal**
 
@@ -258,6 +326,7 @@ TPWR bar max moved to Display, the ESC-load thresholds to their own group, §2.5
 | **RSSI critical (%)** | num | 8 | RSSI critical |
 | **RSSI hold time (s)** | num | 2 | low RSSI must persist this long before warning (filters rotational nulls) |
 | **Skipped-packet limit** | num | 50 | armed: `*Skp` counter reaching this → callout |
+| **TX power limit (mW)** | num | not set | this transmitter's **ELRS dynamic-power ceiling** (25 / 100 / 250 / 500 / 1000 mW — region- and config-dependent). It is the 100 % reference of the inverted TPWR bar on the ELRS detail page (§3.2), so you can see how close dynamic power runs to its limit. *not set* → that bar stays empty and shows a hint; the raw mW value is still printed |
 
 **Power & BEC**
 
@@ -390,7 +459,7 @@ the historical continuous callout cadence. **Main power lost** defaults to *Repe
 until cleared* (an audible buffer countdown) and **Telemetry** to *Repeat = on, 3×* —
 both safety-critical, where a single announce is easy to miss. The remaining alerts
 default to *Repeat = off* (announce once per episode). **Vibrate** defaults to on for
-Fuel, Voltage, Telemetry, BEC, ESC load and Main power lost. `Mute = All` remains the
+Fuel, Voltage, Telemetry, BEC, ESC load, Temperature and Main power lost. `Mute = All` remains the
 audio master kill-switch. With **Repeat** on, the **Voltage** alert re-announces the
 current level — *low or critical* — while it holds, not just critical.
 
@@ -442,11 +511,10 @@ so it never fires on a state that was already there when you arm.
 
 ### 2.7a Settings — General
 
-Meta settings: config-file behaviour and diagnostics.
+Meta settings: diagnostics, flight log and battery behaviour.
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
-| **Config file per craft** | bool | off | keep a separate config per craft flown from the same model slot (see §2.8) |
 | **Debug log to SD card** | bool | off | write a diagnostics log to the SD card (see §11) |
 | **Debug log: sessions kept** | num | 20 | 1–50 — how many rotating log files to retain |
 | **Log flights to SD card** | bool | off | flight log: one `flights.csv` line per flight (see §12) |
@@ -461,13 +529,17 @@ The Toolbox embeds the **RF Adjustment Map / Editor** tool pages (view and touch
 Rotorflight adjustment functions from the radio). Full setup — model prerequisites,
 channels, GVAR pulse, labels — in **[TOOLBOX.md](TOOLBOX.md)**.
 
-The Toolbox submenu additionally hosts three zero-config, **disarmed-only** tool pages
+The Toolbox submenu additionally hosts four zero-config, **disarmed-only** tool pages
 (no settings below apply to them): the **Flight Log** viewer (recent flights, per-model
 totals and battery usage from the flight log — see §12), the **Log Viewer** (graphs EdgeTX telemetry logs
-from `/LOGS/*.csv` — swipe-scroll the file list, then pick a built-in template or your
-own sensor set; zoom / pan / time cursor; WIP) and **RF2 Config** (the original
-rotorflight-lua-scripts configuration tool, run unmodified from `/SCRIPTS/RF2/`; needs
-the RF Tool widget connected and force-closes on arming — see [TOOLBOX.md](TOOLBOX.md) §8).
+from `/LOGS/*.csv` — swipe-scroll the file list, then pick a built-in template or one of
+your own — templates are made and managed on the radio, see [TOOLBOX.md](TOOLBOX.md) §8), **RF2 Config** (the
+original rotorflight-lua-scripts configuration tool, run unmodified from `/SCRIPTS/RF2/`;
+needs the RF Tool widget connected and force-closes on arming — see
+[TOOLBOX.md](TOOLBOX.md) §8) and the **FC battery profile** picker (switches the flight
+controller's active battery profile — the same page the dashboard's *B-Profile* field
+opens, so it stays reachable with a layout that has no such field; it is the one page that
+writes to the FC, and it needs a live MSP connection).
 
 Opening a Toolbox tool by switch moved to the **Shortcuts** group (§2.7c) — a shortcut can
 now open *Adjust Map*, *Adjust Edit*, *Log Viewer* or *RF2 Config* like any other page.
@@ -487,10 +559,15 @@ now open *Adjust Map*, *Adjust Edit*, *Log Viewer* or *RF2 Config* like any othe
 
 Bind switches to pages, hands-free. Any target below can be a **detail page** (ELRS /
 Status log / Battery / Telemetry) or a **Toolbox tool** (Adjust Map / Adjust Edit / Log
-Viewer / RF2 Config / Flight Log). Detail targets open only over the flight view; the
-disarmed-only tools (Log Viewer, RF2 Config, Flight Log) refuse to open while armed.
-Tool targets open only while the widget is **fullscreen** (they are fullscreen pages) — a
-switch held while not fullscreen opens the tool as soon as you enter fullscreen.
+Viewer / RF2 Config / Flight Log / FC battery profile). Detail targets open only over the
+flight view; the disarmed-only tools (Log Viewer, RF2 Config, Flight Log, FC battery
+profile) refuse to open while armed. *FC battery profile* additionally needs a live MSP
+connection — it is the one page that writes to the flight controller — and re-reads the
+profile before it opens.
+**Every** target opens only while the widget is **fullscreen** (both the detail pages and
+the tools are fullscreen pages) — a switch held while not fullscreen opens as soon as you
+enter fullscreen. In a widget-grid zone a detail page would have no way out: a zone gets no
+touch, so its *tap anywhere to close* hint is dead.
 Works independently of *Tap zones* (§2.3); *Close detail pages on arm* still applies to
 detail targets.
 
@@ -507,9 +584,11 @@ Two mechanisms:
   opt 1 → opt 2 → … → closed → opt 1 …
 
 Each slot is its own section on the page (*Position slot 1…6*, *Toggle switch 1…2*). In
-the *Opens* dropdown every target reads as `Category: Name` — detail pages `Page: …`
+the *Opens* dropdown a target reads as `Category: Name` — detail pages `Page: …`
 (e.g. `Page: ELRS`) and Toolbox tools `Toolbox: …` (e.g. `Toolbox: Flight Log`), so it is
-always clear what kind of target a slot opens.
+always clear what kind of target a slot opens. The one entry without a prefix is
+**FC battery profile**: it is a host feature rather than a Toolbox tool, reachable from the
+Toolbox, from a tap zone and from here alike.
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
@@ -537,21 +616,56 @@ always clear what kind of target a slot opens.
 EdgeTX gives widgets no API to write their own options, so settings live in a file on the
 SD card and overlay the (effectively empty) EdgeTX option list at runtime.
 
-- **Per model slot (default):** `/WIDGETS/UltiDash/cfg/cfg_m_<slot>.cfg`, keyed by the
-  model's file name (`model.getInfo().filename`) so it is **stable across Rotorflight's
-  "set model name on TX"** renaming. One file per model slot.
-- **Per craft (optional):** enable *Display → Config file per craft* to keep a separate
-  `cfg/cfg_m_<slot>_<craft>.cfg` per craft flown from the same slot.
+- **Per model (default):** `/WIDGETS/UltiDash/cfg/cfg_m_<model>.cfg`, keyed by the **EdgeTX
+  model name**, read once when the model becomes active and held for the rest of the session.
+  Two consequences worth knowing:
+  - **Reorganising the model list is safe.** EdgeTX hands out its model files (`model7.yml`)
+    by lowest free number, and rewriting the list — which EdgeTX Companion does whenever
+    models are added or deleted — renumbers the survivors. Keying by name survives that;
+    keying by the file number did not, and cost every model its settings.
+  - **Two models with the same name share one config file.** EdgeTX has no stable per-model
+    identifier, so this is yours to manage: a copied model needs its **own name** if it is
+    to have its own configuration. Names from a template (`Rotorflight`, `Rotorflight
+    Test`, …) are the case to watch.
+
+  Rotorflight's *"set model name on TX"* renames the EdgeTX model to the connected craft,
+  but only while it is connected — RF restores the stored name on disconnect, and the
+  latch means a craft connecting never moves the config file.
+- **One file per model, and no second level.** *Config file per craft*
+  (`cfg_m_<model>_<craft>.cfg`) was **removed in 0.7.0**. Its `<craft>` half was the model
+  name as it read at that moment, so it only ever split anything while Rotorflight was
+  actively renaming the model — with *"set model name on TX"* off, both halves of the file
+  name were identical and the option did nothing. **Upgrading loses nothing:** that mode
+  always wrote the plain model file as well, with the same content, so your last saved
+  configuration is in it. Old `cfg_m_*_*.cfg` files stay on the card unread and can be
+  deleted.
+- **Upgrading keeps your settings.** Versions before 0.7.0 keyed the file by the model
+  number (`cfg_m_model7.cfg`); the first start after the upgrade reads that file and
+  rewrites it under the model name. Nothing is deleted — the old file stays behind.
+- **Renaming a model starts its UltiDash settings fresh.** The file is keyed by the name, so
+  the renamed model finds no config of its own and comes up on the defaults. The old file is
+  still there under the old name: rename it to `cfg_m_<new name>.cfg` on a PC and the
+  settings are back. One trap goes with it — if a **pre-0.7.0** file for the same model slot
+  is still on the card, the renamed model adopts *that* instead, i.e. the configuration as it
+  stood before the upgrade rather than the defaults. Deleting the old `cfg_m_model<N>.cfg`
+  files once after upgrading avoids it.
+- **Two kinds of value migration run on the loaded file, in memory.** UltiDash's own schema
+  migration (stamped as `ClrSchemeV`) reinterprets keys whose *meaning* changed between
+  versions — the colour-scheme order in v1 is the example. Beside it, a **skin** may declare
+  `M.migrate` and convert **its own** keys the same way (see `docs/SKINS.md` §7c); the host
+  runs every installed skin's migration once per model, right after the file is read and
+  before anything is drawn. Both are **read-time** conversions: nothing is written to the SD
+  card for their sake, so an upgrade costs no extra write, and the converted form becomes
+  permanent the next time you save something on that model.
 - **The `cfg/` subfolder** keeps the widget root tidy. It ships with the widget, so nothing
   is created at runtime; UltiDash just uses it when present. Config files left in the widget
   **root** by older versions are moved into `cfg/` automatically on start (and adopted per
   model on first load), so upgrading loses nothing. If the folder is ever missing, UltiDash
   falls back to the old flat layout (files directly in `/WIDGETS/UltiDash/`) — settings are
   never at risk either way.
-- Defaults come from the settings tables above; a missing file simply means defaults. The
-  module-local cache is shared by all instances of the widget (so the passive views see
-  the same values). A value that is corrupt or the wrong type in the file (hand-edited,
-  damaged) falls back to its default instead of causing an error.
+- Defaults come from the settings tables above; a missing file simply means defaults.
+  A value that is corrupt or the wrong type in the file (hand-edited, damaged) falls
+  back to its default instead of causing an error.
 - **Unknown keys are dropped on save:** a key the current version doesn't know (a typo,
   or one left behind by a different version) is removed the next time the file is
   written. Downgrading to an older UltiDash therefore loses the newer version's
@@ -560,7 +674,7 @@ SD card and overlay the (effectively empty) EdgeTX option list at runtime.
   SD writes for a page you just looked at). If a write fails (card full, write-protected or
   removed), a **"Settings NOT saved (SD write failed)"** banner shows on the dashboard/stats
   view for ~10 s.
-- **Orphaned files are harmless.** Deleting or renaming a model leaves its `cfg_m_*.cfg`
+- **Orphaned files are harmless.** Deleting a model, or renaming it, leaves its `cfg_m_*.cfg`
   behind in `cfg/`, and rotated `debug_NN.log` files accumulate in `logs/`. UltiDash never
   auto-deletes them; they do no harm. Delete them from `/WIDGETS/UltiDash/cfg/` or `…/logs/`
   on a PC if you like — UltiDash recreates what it needs.
@@ -587,6 +701,12 @@ tap-to-open **detail pages**, the **battery-profile picker** and the **settings 
 > flight view; it reappears with the next arm / reconnect cycle.
 
 ### 3.2 Flight view
+
+The flight (and stats) view **layout depends on the selected skin** (§2.3s). The diagram
+below is the **UltiDash** skin — the built-in look and the one this release carries; an
+installed skin may arrange the same data differently. The detail pages, the settings menu,
+the status bar and the safety overlays (setup hint, warning banners, critical-alert overlay)
+are the same under every skin.
 
 ```
 ┌───────────────────────────────────────┐
@@ -707,15 +827,19 @@ detail in flight without losing callouts.
   antenna field actually switching) and latched for the session — a single-antenna receiver
   reads "Diversity: no". *(On a Gemini/GemX dual-band receiver 1RSS is the 900 MHz path, 2RSS
   the 2.4 GHz path — "yes" is correct there.)* TPWR is inverted (high power = working hard)
-  relative to *TPWR bar max* (shows a hint until that is set).
+  relative to *Thresholds ▸ TX power limit* (shows a hint until that is set).
 - **Status & events** (tap the ESC/status line): a bordered **status card** — arm state /
   governor / throttle, the ESC status and the arming status including the **full
   arming-disable reason list** — above a **scrollable, timestamped ESC event log** (every
   ESC status change, RESTART, and arm/disarm — newest first, color by severity; ▲/▼
   paging with an `N-M/30` position readout). A small footer shows dev metrics (Lua heap,
-  free heap, UI loop Hz, pass ms). The menu's **Status** entry shows the same grouped
-  configuration overview as the passive *Status info* view (thresholds & their source,
-  alert switches incl. repeat summary and ESC-load state, volume setup).
+  free heap, UI loop Hz, pass ms). The menu's **Status** entry shows a grouped
+  configuration overview (thresholds & their source, alert switches incl. repeat
+  summary and ESC-load state, volume setup), with a **Version** row at the top naming the
+  build the card carries. A development build appends a short commit there — the widget
+  cannot know it at runtime, so the build tooling writes it onto the card as an extra
+  `WIDGETS/UltiDash/build.lua`; a `+` after it means the build came from an uncommitted
+  working tree. **A release card has no such file** and the row shows the version alone.
 - **Battery** (tap the gauge): a **cell-voltage scale** with the active crit/low/full
   thresholds marked (and whether they come from FC or manual), then the battery in the
   dashboard segment look with % and used mAh inside it, and a Batt / Cell-min / Reserve
@@ -876,7 +1000,7 @@ configurable physical or logical switch.
 
 ### 5.3 Vibration
 Per alert: each alert page's **Vibrate** switch (§2.6a). Defaults reproduce the old
-"vibrate on critical" set (fuel, voltage, telemetry, BEC, ESC load). `Mute = All` also
+"vibrate on critical" set (fuel, voltage, telemetry, BEC, ESC load, temperature and main power lost). `Mute = All` also
 silences vibration.
 
 ### 5.4 Volume (two worlds)
@@ -934,7 +1058,8 @@ Hard-wired Rotorflight sensor names (no configurable sources):
 | `RFMD` | ELRS rate/mode → readable rate + RSSI sensitivity floor |
 | `RQly` / `TQly` | Down/uplink link quality |
 | `1RSS` / `2RSS` / `ANT` | ELRS RSSI per antenna / active antenna (diversity) |
-| `RSNR` | ELRS SNR (ELRS detail) |
+| `RSNR` | ELRS uplink SNR (ELRS detail) |
+| `TRSS` / `TSNR` | ELRS **downlink** RSSI / SNR, measured at the TX module — the ELRS detail page's TRSS bar and the combined `uplink / downlink` SNR readout (§3.4). Nothing else reads them: without `TRSS` that bar reads `-`, without `TSNR` the SNR row shows the uplink alone |
 | `TPWR` | TX power |
 | `*Skp` | Skipped/undecoded packet counter (label starts with `*`) |
 
@@ -1069,13 +1194,8 @@ to the Status detail's event log.
 - **Connect reads are single-shot (no retry):** the FC values read on connect (battery
   config, capacity, profile names) are requested once. If they are missing after a
   connect (rare — an MSP hiccup), unplug/replug the pack once.
-- The **layouts are designed for full-screen zones** (and the half-screen ViewMode
-  instances on the TX16S). In very small widget zones the stats table / the passive
-  Status view can run out of row height and overlap — use larger zones there.
-- While a Toolbox tool with its own exclusive cycle (**Log Viewer**, **RF2 Config**) is
-  open on the Dashboard, publishing to passive instances pauses — a second-screen
-  *ELRS details* / *Status info* instance then shows its "no Dashboard" notice until the
-  tool closes (deliberate: the tool gets the whole Lua budget).
+- The **layouts are designed for full-screen zones**. In very small widget zones the
+  stats table can run out of row height and overlap — use larger zones there.
 - After a fresh connect the raw min/max chips of *raw* telemetry slots may briefly show a
   0 from the disconnected gap — the session wipe on connect clears them; the 0-dip only
   appears while disconnected (honest EdgeTX session view).
@@ -1085,8 +1205,6 @@ to the Status detail's event log.
   Tap-dismiss needs full-screen (touch rule above) — with the widget in a normal zone
   the **first tap opens fullscreen** (that is EdgeTX's widget tap), a **second tap then
   dismisses**; otherwise the overlay clears via auto-close or when the condition ends.
-- A passive *ELRS details* / *Status info* instance needs a running **Dashboard** instance
-  to mirror.
 
 ---
 
@@ -1117,8 +1235,14 @@ Optional troubleshooting log, enabled per model in **Settings ▸ General ▸ De
 card** (default **off**). When off the cost is ~zero (every entry point early-returns; no SD
 IO, no heap growth).
 
+- **On-screen perf overlay:** while the debug log is on, a small strip in the **bottom-left**
+  of *every* view shows the live **UI-loop Hz**, **Lua heap** (`L`) and **free heap** (`F`), in
+  kB — the same metrics as the Status footer, but always visible (handy for watching load while
+  flying or stress-testing the Log Viewer). Bottom-left so it covers neither the menu glyph
+  (top-left) nor the Log Viewer's zoom/pan buttons (top-right). Nothing is drawn when the
+  option is off.
 - **Files:** rotating session files `/WIDGETS/UltiDash/logs/debug_NN.log` (read them from
-  the PC at `E:\WIDGETS\UltiDash\logs\debug_NN.log`). **Debug log: sessions kept** (1–50,
+  the PC at `<card>:\WIDGETS\UltiDash\logs\debug_NN.log`). **Debug log: sessions kept** (1–50,
   default 20) sets how many are retained; a tiny `debug_seq.txt` drives the round-robin
   slot. The `logs/` subfolder ships with the widget; old debug files left in the widget
   root by earlier versions are moved into it the next time logging is enabled (if the

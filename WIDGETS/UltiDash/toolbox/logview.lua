@@ -65,6 +65,34 @@ local BUILTIN_TEMPLATES = {
 }
 local CUSTOM_NAME = "Custom"     -- pseudo template: user-picked sensor set
 
+-- User templates: the file the WIDGET owns and rewrites whole (the radio-side
+-- manager). It lives in cfg/ and NOT in toolbox/, because a deploy overwrites
+-- every toolbox/*.lua wholesale -- one stray commit of that filename would wipe
+-- every user's templates on the next deploy. cfg/ is the directory a deploy
+-- creates and never writes into.
+local TPL_PATH   = "/WIDGETS/UltiDash/cfg/logtemplates.lua"
+-- The PC-edited predecessor. Read ONCE (adopted into TPL_PATH) and then ignored
+-- for ever; left in place, because the user may still hand-edit it for another
+-- card and TOOLBOX.md says it is inert.
+local TPL_LEGACY = "/WIDGETS/UltiDash/toolbox/logtemplates.lua"
+local MAX_USER_TPL = 24          -- the card page scrolls past ~8 and every card
+                                 -- re-matches its sensors against the header on
+                                 -- each build: an unbounded list is a budget risk
+-- Name length cap: the longest name that CANNOT truncate on any of the three
+-- targets, whatever it is made of. MEASURED (simulator font metrics, 2026-08-09)
+-- rather than estimated, and the measurement corrected the spec's premise:
+--   * the narrowest card is the TX15's, not the MK2's. 480x320 is >= 300 px high,
+--     so the card page uses MIDSIZE at the SAME width as the 480x272 MK2 uses
+--     SMLSIZE -- 230 px of card, 204 px of text, and MIDSIZE's widest glyph is
+--     22 px there. That alone would cap a name at NINE characters.
+--   * so the card falls back one font step when a name does not fit (see
+--     build_templates). At SMLSIZE the widest glyph is 12 px on both 480-wide
+--     radios and 16 px on the MK3, giving 200/12 = 16 and 360/16 = 22.
+-- 16 is therefore the number, and it holds for every character the keyboard can
+-- produce -- not just for letters. The spec expected 18-20; it also required
+-- "never truncates", and measured, those two are not the same number.
+local MAX_NAME_LEN = 16
+
 -- sensor grouping for the picker: EXACTLY the RF Configurator's "Telemetry
 -- Sensors" dialog groups (rotorflight-configurator src/tabs/receiver/telemetry/
 -- crsf.js), with the EdgeTX short names the RF Lua suite registers per sensor
@@ -117,15 +145,15 @@ local function group_of(name, unit)
   return G_OTHER
 end
 
--- build lv.sens_vrows: a flat list of visual rows for the grouped picker, plus
--- lv.sens_buckets (group index -> { colIdx, ... }) for the reactive per-group
--- selected/total counter. Row shapes:
---   { header = groupIndex }                     group divider band (collapsible)
---   { col = colIdx }                            LIST layout: one sensor per row
---   { cols = { colIdx, ... } }                  GRID layout: up to ncols per row
--- A collapsed group (lv.sens_collapsed[gi]) contributes only its header row.
--- Rebuilt whenever layout / ncols / collapse changes (caller nils lv.sens_vrows).
-local function build_sensor_vrows(lv, layout, ncols)
+-- lv.sens_buckets (group index -> { colIdx, ... }): which sensor sits in which
+-- group, and the denominator of the per-group selected/total counter.
+--
+-- It depends on lv.columns ALONE, so it is built once per file and NOT on every
+-- fold. It used to be rebuilt inside build_sensor_vrows, i.e. on every fold,
+-- unfold and layout switch: a walk over ~100 columns, each one a group_of() with
+-- up to three string.match calls, on the same tick that then builds the page.
+-- open_file nils it with the rest of the picker state.
+local function build_sensor_buckets(lv)
   local buckets = {}                       -- group index -> { colIdx, ... }
   for c = 3, #lv.columns do
     local gi = group_of(lv.columns[c].name, lv.columns[c].unit)
@@ -133,6 +161,18 @@ local function build_sensor_vrows(lv, layout, ncols)
     buckets[gi][#buckets[gi] + 1] = c
   end
   lv.sens_buckets = buckets
+end
+
+-- build lv.sens_vrows: a flat list of visual rows for the grouped picker.
+-- Row shapes:
+--   { header = groupIndex }                     group divider band (collapsible)
+--   { col = colIdx }                            LIST layout: one sensor per row
+--   { cols = { colIdx, ... } }                  GRID layout: up to ncols per row
+-- A collapsed group (lv.sens_collapsed[gi]) contributes only its header row.
+-- Rebuilt whenever layout / ncols / collapse changes (caller nils lv.sens_vrows).
+local function build_sensor_vrows(lv, layout, ncols)
+  if lv.sens_buckets == nil then build_sensor_buckets(lv) end
+  local buckets = lv.sens_buckets
   -- default: ALL groups collapsed (configurator-style overview first); nil
   -- marks "not initialized yet" (open_file resets it per file)
   if lv.sens_collapsed == nil then
@@ -280,30 +320,243 @@ local function parse_header_col(lv)
   return lv.hparse_pos > L + 1
 end
 
-local function load_user_templates()
-  local list, broken = {}, false
-  for i = 1, #BUILTIN_TEMPLATES do list[#list + 1] = BUILTIN_TEMPLATES[i] end
-  local ok, chunk = pcall(loadScript, "/WIDGETS/UltiDash/toolbox/logtemplates.lua")
-  if ok and type(chunk) == "function" then
-    local ok2, cfg = pcall(chunk)
-    if ok2 and type(cfg) == "table" and type(cfg.templates) == "table" then
-      if cfg.replace == true then list = {} end
-      for i = 1, #cfg.templates do
-        local t = cfg.templates[i]
-        if type(t) == "table" and type(t.name) == "string"
-            and type(t.curves) == "table" then
-          list[#list + 1] = t
-        end
+-- ---------------------------------------------------------------------
+-- user templates: read, own, write (the radio-side manager)
+-- ---------------------------------------------------------------------
+-- Read ONE template file. Returns cfg-or-nil plus whether the file EXISTS, so a
+-- missing file (fine, built-ins only) is never confused with a broken one (a
+-- notice, and edit mode refused -- writing would discard what it still holds).
+local function read_tpl_file(path)
+  local exists = (fstat ~= nil) and (fstat(path) ~= nil) or false
+  if not exists then return nil, false end
+  local ok, chunk = pcall(loadScript, path)
+  if not ok or type(chunk) ~= "function" then return nil, true end
+  local ok2, cfg = pcall(chunk)
+  if not ok2 or type(cfg) ~= "table" or type(cfg.templates) ~= "table" then
+    return nil, true
+  end
+  return cfg, true
+end
+
+-- control characters out, ends trimmed, capped; empty -> nil (rejected).
+-- The trim runs AGAIN after the cap: cutting at MAX_NAME_LEN can land in the
+-- middle of a space run and leave a name with a trailing blank, which then
+-- compares unequal to the same name typed without it.
+local function sanitize_name(s)
+  if type(s) ~= "string" then return nil end
+  s = string.gsub(s, "%c", "")
+  s = string.gsub(s, "^%s+", "")
+  s = string.gsub(s, "%s+$", "")
+  if #s == 0 then return nil end
+  if #s > MAX_NAME_LEN then
+    s = string.sub(s, 1, MAX_NAME_LEN)
+    s = string.gsub(s, "%s+$", "")
+    if #s == 0 then return nil end
+  end
+  return s
+end
+
+-- "<base> 2", "<base> 3", ... shortening the base to make room, or nil after 99
+-- tries. `taken` answers "is this name in use" -- the caller decides what that
+-- means, because the two callers know different sets.
+local function free_suffixed_name(base, taken)
+  for n = 2, 99 do
+    local suffix = " " .. n
+    local b = base
+    if #b + #suffix > MAX_NAME_LEN then
+      b = string.sub(b, 1, MAX_NAME_LEN - #suffix)
+    end
+    local cand = sanitize_name(b .. suffix)
+    if cand ~= nil and not taken(cand) then return cand end
+  end
+  return nil
+end
+
+-- the file's `templates` array -> our own entries. Copied rather than referenced:
+-- the manager mutates these, and the loaded chunk's tables are transient.
+-- The curve list is kept WHOLE. It used to be cut to MAX_CURVES here, i.e. at
+-- load, so the first rewrite of the file (a rename, a move, the Hide switch)
+-- made the loss permanent -- and a superset is the documented shape of a
+-- hand-stocked file (.example): more names than fit, of which the log's own
+-- header decides which four are drawn. match_template caps at display time,
+-- which is where the cap belongs and where it always was before.
+-- Names go through sanitize_name, and a duplicate gets a suffix rather than
+-- being shown twice: two identical labels on the card page silently resolve to
+-- whichever came first, for the "last used" badge as well as for the tap.
+local function tpl_entries(cfg)
+  local users, raw = {}, #cfg.templates
+  local taken = {}
+  if cfg.replace ~= true then
+    for i = 1, #BUILTIN_TEMPLATES do taken[BUILTIN_TEMPLATES[i].name] = true end
+  end
+  local function is_taken(n) return taken[n] == true end
+  for i = 1, raw do
+    local t = cfg.templates[i]
+    if type(t) == "table" and type(t.name) == "string" and type(t.curves) == "table"
+        and #users < MAX_USER_TPL then
+      local cs = {}
+      for k = 1, #t.curves do
+        if type(t.curves[k]) == "string" then cs[#cs + 1] = t.curves[k] end
       end
-      if #list == 0 then  -- replace=true but nothing valid -> fall back
-        for i = 1, #BUILTIN_TEMPLATES do list[i] = BUILTIN_TEMPLATES[i] end
-        broken = true
+      local nm = sanitize_name(t.name)
+      if nm ~= nil and taken[nm] then nm = free_suffixed_name(nm, is_taken) end
+      if nm ~= nil then
+        taken[nm] = true
+        users[#users + 1] = { name = nm, curves = cs }
       end
-    else
-      broken = true       -- file present but not a valid template table
     end
   end
-  return list, broken
+  return users, raw
+end
+
+-- lv.templates = built-ins (unless `replace`) followed by the user entries;
+-- lv.tpl_user_from is the index of the first user entry, so a card can tell the
+-- two apart without a second lookup.
+local function rebuild_list(lv, users, replace)
+  local list = {}
+  if not replace then
+    for i = 1, #BUILTIN_TEMPLATES do list[i] = BUILTIN_TEMPLATES[i] end
+  end
+  lv.tpl_user_from = #list + 1
+  for i = 1, #users do list[#list + 1] = users[i] end
+  lv.templates = list
+  lv.tpl_replace = replace
+end
+
+local function tpl_users(lv)
+  local u = {}
+  for i = (lv.tpl_user_from or 1), #lv.templates do u[#u + 1] = lv.templates[i] end
+  return u
+end
+
+local function tpl_user_count(lv)
+  if lv.templates == nil then return 0 end
+  return #lv.templates - (lv.tpl_user_from or 1) + 1
+end
+
+-- Load into lv. cfg/ wins outright; only when it does not exist is the legacy
+-- toolbox file looked at, and then it is ADOPTED (copied, never moved) -- the
+-- write itself is deferred to an idle tick (see M.refresh) because the first open
+-- already spends its budget on the header parse.
+local function load_user_templates(lv)
+  local cfg, exists = read_tpl_file(TPL_PATH)
+  local broken = (cfg == nil) and exists
+  if cfg == nil and not exists then
+    local lcfg, lexists = read_tpl_file(TPL_LEGACY)
+    if lcfg ~= nil then
+      cfg = lcfg
+      lv.tpl_adopt = true              -- write it to the new path when idle
+    elseif lexists then
+      broken = true
+    end
+  end
+  local users, replace, raw = {}, false, 0
+  if cfg ~= nil then
+    users, raw = tpl_entries(cfg)
+    replace = (cfg.replace == true)
+  end
+  -- replace = true with entries that are ALL invalid is a broken file, not an
+  -- empty one; replace = true with an honestly empty list is the user's own
+  -- choice (the Hide built-ins switch writes exactly that) and is honoured.
+  if replace and #users == 0 and raw > 0 then
+    replace, broken = false, true
+  end
+  rebuild_list(lv, users, replace)
+  lv.tpl_broken = broken
+end
+
+-- Serialise the whole table. Names and curve names go through %q, which escapes
+-- the quote and the backslash: one unescaped quote makes the file a syntax error,
+-- and the next open then hides every template the user owns.
+local function serialize_templates(users, replace)
+  local parts = {
+    "-- UltiDash Log Viewer templates - written by the radio, edits are overwritten",
+    "return {",
+    "  replace = " .. (replace and "true" or "false") .. ",",
+    "  templates = {",
+  }
+  for i = 1, #users do
+    local t = users[i]
+    local cs = {}
+    for k = 1, #t.curves do cs[k] = string.format("%q", t.curves[k]) end
+    parts[#parts + 1] = string.format("    { name = %q, curves = { %s } },",
+                                      t.name, table.concat(cs, ", "))
+  end
+  parts[#parts + 1] = "  },"
+  parts[#parts + 1] = "}"
+  return table.concat(parts, "\n") .. "\n"
+end
+
+-- ATOMIC replace, the proven fltdata.lua sequence: .new -> verify the size landed
+-- (io.write reports nothing useful on a full card; the on-disk size is the signal)
+-- -> park the original as .bak -> rename into place. Every failure exit leaves the
+-- original untouched.
+local function atomic_write(path, out)
+  local newp, bakp = path .. ".new", path .. ".bak"
+  local f = io.open(newp, "w")           -- truncates a stale .new from a failure
+  if f == nil then return false end
+  io.write(f, out)
+  io.close(f)
+  local st = (fstat ~= nil) and fstat(newp) or nil
+  if st == nil or st.size ~= #out then
+    if del ~= nil then del(newp) end
+    return false
+  end
+  if rename == nil then return false end
+  local had = (fstat(path) ~= nil)
+  if had then
+    if del ~= nil then del(bakp) end     -- FatFS rename refuses an existing target
+    if rename(path, bakp) ~= 0 then return false end
+  end
+  if rename(newp, path) ~= 0 then
+    if had then rename(bakp, path) end   -- restore; on failure .bak still has it
+    return false
+  end
+  return true
+end
+
+-- The ONE way anything changes: build the new user array, write it, and only then
+-- adopt it in memory. A failed write leaves the list -- and therefore the screen --
+-- telling the truth.
+local function tpl_commit(wgt, lv, users, replace)
+  if not atomic_write(TPL_PATH, serialize_templates(users, replace)) then
+    lv.tpl_msg = "Save failed - card full or write-protected?"
+    -- ...and give it a lifetime, so the chart can show it too. Saving from the
+    -- sensor picker also DISPLAYS the set, i.e. it leaves for the chart on the
+    -- same tap -- and the card page, the only place this line was ever drawn, is
+    -- one the user may not come back to. The template is not stored and only the
+    -- footer would have said so.
+    lv.tpl_msg_until = (getTime() or 0) + 500
+    wgt.lv_dirty = true
+    return false
+  end
+  rebuild_list(lv, users, replace)
+  lv.tpl_msg = nil
+  lv.tpl_broken = false
+  wgt.lv_dirty = true
+  return true
+end
+
+-- index of a template with this exact name, or nil. Built-ins are IN the
+-- comparison set: two identical labels on the card page would make
+-- wgt.lv_last_tpl match the first of them, silently.
+local function tpl_find_name(lv, name)
+  for i = 1, #lv.templates do
+    if lv.templates[i].name == name then return i end
+  end
+  return nil
+end
+
+-- ...and while "Hide built-ins" is on they are not in lv.templates at all, so the
+-- check above stops seeing them -- a name taken here would collide the moment the
+-- switch goes back off, which is one tap away. Only asked in that state; with the
+-- built-ins shown, tpl_find_name has already answered.
+local function builtin_has_name(lv, name)
+  if lv.tpl_replace ~= true then return false end
+  for i = 1, #BUILTIN_TEMPLATES do
+    if BUILTIN_TEMPLATES[i].name == name then return true end
+  end
+  return false
 end
 
 -- match a template against the header -> { {name, unit, col}, ... } (<= 4)
@@ -737,9 +990,7 @@ end
 
 -- pick a template (explicit index or auto: last used, else first matching)
 local function setup_template(wgt, lv, tpl_index)
-  if lv.templates == nil then
-    lv.templates, lv.tpl_broken = load_user_templates()
-  end
+  if lv.templates == nil then load_user_templates(lv) end
   local pick = tpl_index
   if pick == nil then
     for i = 1, #lv.templates do
@@ -818,9 +1069,7 @@ local function loader_tick(wgt, lv)
       -- display (template page incl. "Pick sensors ..."), so just prepare
       -- geometry + the template list here
       init_geometry(wgt, lv)
-      if lv.templates == nil then
-        lv.templates, lv.tpl_broken = load_user_templates()
-      end
+      if lv.templates == nil then load_user_templates(lv) end
       lv.curves = {}
       lv.custom_sel = {}
       lv.tpl_name = nil
@@ -1079,8 +1328,10 @@ local function open_file(wgt, lv, fname)
   lv.columns, lv.curves, lv.header_ok = nil, nil, false
   lv.header_line, lv.hparse_pos, lv.hparse_col = nil, 1, 1   -- chunked header parse state
   lv.custom_sel, lv.sens_vrows, lv.sens_scroll = nil, nil, 0  -- sensor-picker state
-  lv.sens_collapsed = nil                                    -- re-init: all collapsed
+  lv.sens_collapsed, lv.sens_buckets = nil, nil              -- re-init: all collapsed,
+                                                             -- buckets follow lv.columns
   lv.tpl_scroll = 0                                          -- template list to top
+  lv.tpl_edit, lv.tpl_msg, lv.dlg = nil, nil, nil            -- manager state per file
   lv.sessions, lv.index = {}, {}
   lv.cur_date, lv.day, lv.prev_t, lv.nline = nil, 0, nil, 0
   lv.cursor_t = nil
@@ -1195,7 +1446,16 @@ local function pan_step(wgt, lv, dir)
   if n0 < s.t0 then n0 = s.t0 end
   local n1 = n0 + span
   if n1 > s.t1 then n1 = s.t1; n0 = n1 - span end
-  if cache_find(lv, n0, n1) ~= nil then begin_extract(lv, n0, n1); return end  -- RAM hit
+  -- RAM hit: begin_pan lands on a whole-BUCKET step, which can differ from n0/n1 by up to
+  -- one bucket, so probe the cache for that window too -- otherwise a perfectly usable
+  -- cached window was skipped in favour of an SD edge read.
+  if cache_find(lv, n0, n1) ~= nil then begin_extract(lv, n0, n1); return end
+  local bw = lv.win_span / math.max(1, lv.nbuckets - 1)
+  local a0 = lv.win_t0 + dir * math.floor(math.floor((lv.nbuckets - 1) / 2) * bw + 0.5)
+  if a0 >= s.t0 and (a0 + span) <= s.t1 and a0 ~= n0
+      and cache_find(lv, a0, a0 + span) ~= nil then
+    begin_extract(lv, a0, a0 + span); return
+  end
   if begin_pan(lv, dir) then return end        -- finer than base: reuse + edge re-extract
   begin_extract(lv, n0, n1)                    -- last resort: full re-extract
 end
@@ -1232,25 +1492,347 @@ local function add_hit(lv, x, y, w, h, fn, cool)
 end
 
 -- plain-rect button (NO focusable type="button": captures PAGE/RTN)
-local function button(lv, layout, P, x, y, w, h, txt, font, fn, enabled_fn)
+--
+-- `enabled` is either a FUNCTION (reactive: two closures, re-run every frame on
+-- the remaining budget) or a BOOLEAN / nil (decided here, at build time, and the
+-- button carries no closure at all). Both forms exist on purpose: a page that
+-- rebuilds on every state change has nothing to be reactive about, and on the
+-- sensor picker the reactive form is part of what put the page over the
+-- instruction ceiling.
+local function button(lv, layout, P, x, y, w, h, txt, font, fn, enabled)
+  local live = (type(enabled) == "function")
+  local on   = live or (enabled == nil) or (enabled == true)
   layout[#layout + 1] = { type = "rectangle", x = x, y = y, w = w, h = h,
     thickness = 1, rounded = 4,
-    color = function()
-      if enabled_fn ~= nil and not enabled_fn() then return P.textDim end
-      return P.line
-    end }
+    color = live and function()
+        if not enabled() then return P.textDim end
+        return P.line
+      end or (on and P.line or P.textDim) }
   local _, th = lcd.sizeText(txt, font)
   layout[#layout + 1] = { type = "label", x = x, y = y + (h - th) / 2,
     w = w, h = th, font = font, align = CENTER,
-    color = function()
-      if enabled_fn ~= nil and not enabled_fn() then return P.textDim end
-      return P.text
-    end,
+    color = live and function()
+        if not enabled() then return P.textDim end
+        return P.text
+      end or (on and P.text or P.textDim),
     text = txt }
   add_hit(lv, x, y, w, h,
     function(wgt2, lv2, ts)
-      if enabled_fn == nil or enabled_fn() then fn(wgt2, lv2, ts) end
+      if live then
+        if enabled() then fn(wgt2, lv2, ts) end
+      elseif on then
+        fn(wgt2, lv2, ts)
+      end
     end, 30)
+end
+
+-- ---------------------------------------------------------------------
+-- template manager: the three dialogs, and the actions behind them
+-- ---------------------------------------------------------------------
+-- A dialog is a small OVERLAY panel drawn after the page, and it takes the page's
+-- tap targets with it (build_dlg clears lv.hit first) -- so the page below stays
+-- readable and is inert. Three kinds:
+--   "name"    a title, an lvgl.textEdit and Cancel / OK
+--   "confirm" a message and No / Yes
+--   "menu"    a card's action list (T9) and Cancel
+local function dlg_close(wgt, lv)
+  lv.dlg = nil
+  wgt.lv_dirty = true
+end
+
+local function open_name_dlg(wgt, lv, title, text, on_accept)
+  lv.dlg = { kind = "name", title = title, text = text or "", on_accept = on_accept }
+  wgt.lv_dirty = true
+end
+
+local function open_confirm(wgt, lv, title, msg, on_ok, on_cancel)
+  lv.dlg = { kind = "confirm", title = title, msg = msg,
+             on_ok = on_ok, on_cancel = on_cancel }
+  wgt.lv_dirty = true
+end
+
+local function open_msg(wgt, lv, title, msg)
+  lv.dlg = { kind = "confirm", title = title, msg = msg, only_ok = true,
+             on_ok = function(w2, lv2) dlg_close(w2, lv2) end }
+  wgt.lv_dirty = true
+end
+
+-- Store `curves` (an array of header names) under `name`. `at` is an index into
+-- lv.templates to overwrite IN PLACE -- position preserved, which is what makes
+-- the overwrite the whole "change a template" path (T11) -- or nil to append.
+local function tpl_store(wgt, lv, name, curves, at, drop)
+  -- The same refusal Edit mode makes, on the one write path that could reach the
+  -- file without going through it: while the own-templates file is UNREADABLE,
+  -- lv.templates holds the built-ins alone, so a save would serialise that empty
+  -- user list over the file -- and the second one would drop the .bak with it.
+  -- The picker's Save is the route; it never touches Edit mode.
+  if lv.tpl_broken then
+    lv.tpl_msg = "Own templates unreadable - not saving over them"
+    lv.tpl_msg_until = (getTime() or 0) + 500
+    wgt.lv_dirty = true
+    return false
+  end
+  local users = tpl_users(lv)
+  local base = lv.tpl_user_from or 1
+  local entry = { name = name, curves = curves }
+  if at ~= nil then
+    users[at - base + 1] = entry
+  else
+    users[#users + 1] = entry
+  end
+  -- a rename ONTO another entry replaces that one and removes the original
+  if drop ~= nil and drop ~= at then table.remove(users, drop - base + 1) end
+  return tpl_commit(wgt, lv, users, lv.tpl_replace)
+end
+
+-- Name -> collision check -> store. Re-enters itself on "no" with the text kept,
+-- which is why it is `local function` (self-visible) rather than a plain local.
+local function tpl_name_flow(wgt, lv, o)
+  open_name_dlg(wgt, lv, o.title, o.text, function(w2, lv2, name)
+    if builtin_has_name(lv2, name) then
+      lv2.dlg.err = "a built-in already has that name"
+      w2.lv_dirty = true
+      return
+    end
+    local hit = tpl_find_name(lv2, name)
+    if hit ~= nil and hit ~= o.self_idx then
+      if hit < (lv2.tpl_user_from or 1) then
+        lv2.dlg.err = "a built-in already has that name"
+        w2.lv_dirty = true
+        return
+      end
+      open_confirm(w2, lv2, "Replace?", "Replace \"" .. name .. "\"?",
+        function(w3, lv3)
+          dlg_close(w3, lv3)
+          o.store(w3, lv3, name, hit)
+        end,
+        function(w3, lv3)
+          local again = {}
+          for k, v in pairs(o) do again[k] = v end
+          again.text = name
+          tpl_name_flow(w3, lv3, again)
+        end)
+      return
+    end
+    dlg_close(w2, lv2)
+    o.store(w2, lv2, name, o.self_idx)
+  end)
+end
+
+-- "Vbat.Curr.EscT" -- the picked sensors in picker order. The separator is an
+-- ASCII dot on purpose: the EdgeTX keyboard's own character set is what a rename
+-- has to work with, and a proposal the keyboard cannot retype is a trap.
+local function propose_name(lv, curves)
+  local parts = {}
+  for i = 1, #curves do parts[i] = curves[i] end
+  local s = table.concat(parts, ".")
+  return sanitize_name(s) or "Set"
+end
+
+local function curve_names(curves)
+  local out = {}
+  for i = 1, #curves do out[i] = curves[i].name end
+  return out
+end
+
+-- a free name for a duplicate: "Power 2", "Power 3", ... (T6's escape hatch is
+-- immediate -- the table in the spec gives Duplicate no name dialog).
+-- The base is SHORTENED to make room for the suffix -- see free_suffixed_name.
+-- Without that, duplicating a name already at MAX_NAME_LEN produced "<base> 2"
+-- -> capped straight back to <base> -> a collision on every one of the 99 tries
+-- -> Duplicate silently did nothing. Found by a test whose template list sits
+-- at the cap on purpose.
+local function free_copy_name(lv, base)
+  return free_suffixed_name(base, function(cand)
+    return tpl_find_name(lv, cand) ~= nil or builtin_has_name(lv, cand)
+  end)
+end
+
+local function tpl_move(wgt, lv, idx, dir)
+  local base = lv.tpl_user_from or 1
+  local users = tpl_users(lv)
+  local i = idx - base + 1
+  local j = i + dir
+  if i < 1 or j < 1 or j > #users then return end
+  users[i], users[j] = users[j], users[i]
+  tpl_commit(wgt, lv, users, lv.tpl_replace)
+end
+
+local function tpl_delete(wgt, lv, idx)
+  local base = lv.tpl_user_from or 1
+  local users = tpl_users(lv)
+  table.remove(users, idx - base + 1)
+  tpl_commit(wgt, lv, users, lv.tpl_replace)
+end
+
+local function open_tpl_menu(wgt, lv, idx)
+  local t = lv.templates[idx]
+  if t == nil then return end
+  local base = lv.tpl_user_from or 1
+  local user = (idx >= base)
+  local items = {}
+  if user then
+    items[#items + 1] = { txt = "Rename", fn = function(w2, lv2)
+      tpl_name_flow(w2, lv2, {
+        title = "Rename template", text = t.name, self_idx = idx,
+        store = function(w3, lv3, name, at)
+          tpl_store(w3, lv3, name, t.curves, at, (at ~= idx) and idx or nil)
+        end })
+    end }
+  end
+  items[#items + 1] = { txt = "Duplicate", fn = function(w2, lv2)
+    dlg_close(w2, lv2)
+    if tpl_user_count(lv2) >= MAX_USER_TPL then
+      open_msg(w2, lv2, "No room", MAX_USER_TPL .. " templates - delete one first")
+      return
+    end
+    local name = free_copy_name(lv2, t.name)
+    if name == nil then
+      open_msg(w2, lv2, "Not possible", "no free name left for a copy")
+      return
+    end
+    local cs = {}
+    for k = 1, #t.curves do cs[k] = t.curves[k] end
+    tpl_store(w2, lv2, name, cs, nil)
+  end }
+  if user then
+    items[#items + 1] = { txt = "Delete", fn = function(w2, lv2)
+      open_confirm(w2, lv2, "Delete?", "Delete \"" .. t.name .. "\"?",
+        function(w3, lv3) dlg_close(w3, lv3); tpl_delete(w3, lv3, idx) end,
+        function(w3, lv3) dlg_close(w3, lv3) end)
+    end }
+    -- list order, NOT the visible row: the cards sit in a two-column grid, so
+    -- "up" would be two positions. An entry that cannot move is ABSENT.
+    if idx > base then
+      items[#items + 1] = { txt = "Move forward", fn = function(w2, lv2)
+        dlg_close(w2, lv2); tpl_move(w2, lv2, idx, -1)
+      end }
+    end
+    if idx < #lv.templates then
+      items[#items + 1] = { txt = "Move back", fn = function(w2, lv2)
+        dlg_close(w2, lv2); tpl_move(w2, lv2, idx, 1)
+      end }
+    end
+  end
+  lv.dlg = { kind = "menu", title = t.name, items = items }
+  wgt.lv_dirty = true
+end
+
+-- a filled/outlined chip; `on` decides the fill. Static per build (the tap
+-- rebuilds), same as layout_tab.
+local function chip(lv, layout, P, x, y, w, h, txt, on, fn)
+  if on then
+    layout[#layout + 1] = { type = "rectangle", filled = true, rounded = 4,
+      x = x, y = y, w = w, h = h, color = P.accent }
+  else
+    layout[#layout + 1] = { type = "rectangle", rounded = 4, thickness = 1,
+      x = x, y = y, w = w, h = h, color = P.line }
+  end
+  local _, th = lcd.sizeText(txt, SMLSIZE)
+  layout[#layout + 1] = { type = "label", x = x, y = y + (h - th) / 2, w = w, h = th,
+    font = SMLSIZE, align = CENTER,
+    color = on and (P.bg or lcd.RGB(0, 0, 0)) or P.text, text = txt }
+  add_hit(lv, x, y, w, h, fn, 30)
+end
+
+local function build_dlg(wgt, zone, lv, P)
+  local d = lv.dlg
+  local W, H = zone.w, zone.h
+  local _, sh = lcd.sizeText("Ag", SMLSIZE)
+  local font = (H >= 300) and MIDSIZE or SMLSIZE
+  local _, th = lcd.sizeText("Ag", font)
+  local rowH = sh + ((H >= 300) and 14 or 10)
+  local btnH = (H >= 300) and 36 or 28
+  local pw = math.min(W - 40, 380)
+  local body
+  if d.kind == "menu" then
+    body = #d.items * rowH
+  elseif d.kind == "name" then
+    body = btnH + 4 + sh
+  else
+    body = sh + 8
+  end
+  local ph = th + 10 + body + 10 + btnH + 10
+  if ph > H - 8 then ph = H - 8 end
+  local px = math.floor((W - pw) / 2)
+  local py = math.floor((H - ph) / 2)
+
+  lv.hit = {}                       -- the page below is inert while this is up
+  local layout = {}
+  layout[#layout + 1] = { type = "rectangle", filled = true, rounded = 8,
+    x = px, y = py, w = pw, h = ph, color = P.bg or lcd.RGB(0, 0, 0) }
+  layout[#layout + 1] = { type = "rectangle", rounded = 8, thickness = 2,
+    x = px, y = py, w = pw, h = ph, color = P.accent }
+  -- the title is a template NAME on the action menu, and a name at the length cap is wider
+  -- than the panel in the big font -- measured on the 24-template page, where it ran out
+  -- through both borders
+  local ttl = d.title or ""
+  local tf, tfh = font, th
+  if lcd.sizeText(ttl, tf) > pw - 24 then tf, tfh = SMLSIZE, sh end
+  layout[#layout + 1] = { type = "label", x = px + 12, y = py + 6, w = pw - 24, h = tfh,
+    font = tf, color = P.accent, text = ttl }
+
+  local by = py + th + 12
+  if d.kind == "menu" then
+    for i = 1, #d.items do
+      local it = d.items[i]
+      local ry = by + (i - 1) * rowH
+      layout[#layout + 1] = { type = "label", x = px + 18, y = ry + (rowH - sh) / 2,
+        w = pw - 36, h = sh, font = SMLSIZE, color = P.text, text = it.txt }
+      add_hit(lv, px + 6, ry, pw - 12, rowH, it.fn, 60)
+    end
+  elseif d.kind == "name" then
+    layout[#layout + 1] = { type = "label", x = px + 12, y = by + btnH + 4,
+      w = pw - 24, h = sh, font = SMLSIZE,
+      color = (d.err ~= nil) and P.hint or P.textDim,
+      text = d.err or ("tap the field - max " .. MAX_NAME_LEN .. " characters") }
+  else
+    layout[#layout + 1] = { type = "label", x = px + 12, y = by, w = pw - 24, h = sh,
+      font = SMLSIZE, color = P.text, text = d.msg or "" }
+  end
+
+  local bw = math.floor((pw - 36) / 2)
+  local byy = py + ph - btnH - 8
+  if d.kind == "menu" then
+    button(lv, layout, P, px + 12, byy, pw - 24, btnH, "Cancel", SMLSIZE,
+      function(w2, lv2) dlg_close(w2, lv2) end, nil)
+  elseif d.only_ok then
+    button(lv, layout, P, px + 12, byy, pw - 24, btnH, "OK", SMLSIZE,
+      function(w2, lv2) d.on_ok(w2, lv2) end, nil)
+  elseif d.kind == "confirm" then
+    button(lv, layout, P, px + 12, byy, bw, btnH, "No", SMLSIZE,
+      function(w2, lv2) d.on_cancel(w2, lv2) end, nil)
+    button(lv, layout, P, px + pw - 12 - bw, byy, bw, btnH, "Yes", SMLSIZE,
+      function(w2, lv2) d.on_ok(w2, lv2) end, nil)
+  else
+    button(lv, layout, P, px + 12, byy, bw, btnH, "Cancel", SMLSIZE,
+      function(w2, lv2) dlg_close(w2, lv2) end, nil)
+    button(lv, layout, P, px + pw - 12 - bw, byy, bw, btnH, "OK", SMLSIZE,
+      function(w2, lv2)
+        local name = sanitize_name(d.text)
+        if name == nil then
+          d.err = "a name is required"
+          w2.lv_dirty = true
+          return
+        end
+        d.on_accept(w2, lv2, name)
+      end, nil)
+  end
+  lvgl.build(layout)
+
+  -- The one focusable object this module owns, and it is built LAST and only
+  -- while the dialog is up. Spike (simulator, 2026-08-09): it builds in a
+  -- fullscreen widget page, a tap opens the EdgeTX keyboard over it, RTN on the
+  -- keyboard is a CANCEL (set() is not called at all -- and it is likewise not
+  -- called when the text is confirmed UNCHANGED), and the page's own RTN chain
+  -- still works afterwards.
+  if d.kind == "name" then
+    pcall(function()
+      lvgl.textEdit({ x = px + 12, y = by, w = pw - 24, h = btnH,
+                      value = d.text or "", length = MAX_NAME_LEN,
+                      set = function(s) d.text = s end })
+    end)
+  end
 end
 
 local function build_browse(wgt, zone, lv, P)
@@ -1379,7 +1961,7 @@ local function build_browse(wgt, zone, lv, P)
             s = #lv.files .. " logs"
             if lv.filter_model ~= nil then s = s .. "  -  " .. lv.filter_model end
             if lv.trunc then s = s .. " (list truncated)" end
-            if lv.tpl_broken then s = s .. "  -  logtemplates.lua invalid, using defaults" end
+            if lv.tpl_broken then s = s .. "  -  own templates unreadable, built-ins active" end
           end
         end
         return s
@@ -1605,9 +2187,19 @@ local function build_templates(wgt, zone, lv, P)
   local _, nh  = lcd.sizeText("Ag", nameFont)
   local _, sh  = lcd.sizeText("Ag", SMLSIZE)
   local headH  = tth + 8
+  local editing = (lv.tpl_edit == true)
+  -- one footer line, and only when there is something to say: the write banner
+  -- (§7) or the unreadable-file notice, which belongs HERE rather than in the
+  -- chart footer -- that is a place you only reach after leaving the page the
+  -- templates are missing from.
+  local foot = lv.tpl_msg
+  if foot == nil and lv.tpl_broken then
+    foot = "Own templates unreadable - built-ins active"
+  end
+  local footH = (foot ~= nil) and (sh + 4) or 0
   local n = #lv.templates + 1                       -- +1 = the custom card
   local gap = (H >= 300) and 8 or 5
-  local avail = H - headH - 6
+  local avail = H - headH - 6 - footH
   local nrows = math.ceil(n / 2)
   local cardH = math.floor((avail - (nrows - 1) * gap) / nrows)
   local capH = (H >= 300) and 64 or 48
@@ -1629,11 +2221,42 @@ local function build_templates(wgt, zone, lv, P)
     layout[#layout + 1] = { type = "rectangle", filled = true,
       x = 0, y = 0, w = W, h = H, color = P.bg }
   end
+  -- header chips (T9): Edit is the mode switch, and the mode carries the
+  -- Hide built-ins switch (T7) beside it. Both are plain rects -- no focusable
+  -- control on this page except the name dialog's own field.
+  local editW = lcd.sizeText("Edit", SMLSIZE) + 22
+  local hideW = editing and (lcd.sizeText("Hide built-ins", SMLSIZE) + 22) or 0
+  local chipY, chipH = 3, headH - 6
+  local editX = W - 6 - editW
+  local hideX = editX - 6 - hideW
+  chip(lv, layout, P, editX, chipY, editW, chipH, "Edit", editing,
+    function(wgt2, lv2)
+      if not lv2.tpl_edit and lv2.tpl_broken then
+        lv2.tpl_msg = "Own templates unreadable - not editing that"
+        wgt2.lv_dirty = true
+        return
+      end
+      lv2.tpl_edit = (not lv2.tpl_edit) or nil
+      wgt2.lv_dirty = true
+    end)
+  if editing then
+    chip(lv, layout, P, hideX, chipY, hideW, chipH, "Hide built-ins",
+      lv.tpl_replace == true,
+      function(wgt2, lv2)
+        tpl_commit(wgt2, lv2, tpl_users(lv2), not lv2.tpl_replace)
+      end)
+  end
+  local titleW = (editing and hideX or editX) - 12
   layout[#layout + 1] = { type = "label", x = 6, y = (headH - tth) / 2,
-    w = W - 12, h = tth, font = titleFont, color = P.accent,
-    text = "What to display?" }
+    w = titleW, h = tth, font = titleFont, color = P.accent,
+    text = editing and "Manage templates" or "What to display?" }
   layout[#layout + 1] = { type = "rectangle", filled = true,
     x = 0, y = headH - 1, w = W, h = 1, color = P.line }
+  if foot ~= nil then
+    layout[#layout + 1] = { type = "label", x = 6, y = H - sh - 2, w = W - 12, h = sh,
+      font = SMLSIZE, color = (lv.tpl_msg ~= nil) and P.hint or P.textDim,
+      text = foot }
+  end
 
   local cardW = math.floor((W - 12 - sbW - gap) / 2)
   local wide  = cardW >= 300                        -- room for the long sub text
@@ -1647,41 +2270,60 @@ local function build_templates(wgt, zone, lv, P)
         local name, sub, enabled, accent
         if custom then
           name = "Custom sensors"
+          -- inert in edit mode: it is not a template and has nothing to manage
           sub  = wide and "pick your own set from the log" or "pick your own set"
-          enabled = true
-          accent = P.hint
+          enabled = not editing
+          accent = enabled and P.hint or P.textDim
         else
           local t = lv.templates[idx]
           local cnt = #match_template(lv, t)
           name = t.name
-          sub  = wide and string.format("%d of %d sensors in this log", cnt, #t.curves)
-                 or string.format("%d of %d sensors in log", cnt, #t.curves)
-          enabled = (cnt > 0)
-          accent = enabled and P.accent or P.textDim
+          if editing then
+            sub = (idx < (lv.tpl_user_from or 1)) and "built-in" or "own template"
+          else
+            sub = wide and string.format("%d of %d sensors in this log", cnt, #t.curves)
+                  or string.format("%d of %d sensors in log", cnt, #t.curves)
+          end
+          -- a template whose sensors this log has none of is dim -- but in edit
+          -- mode it is still TAPPABLE, or it could never be deleted
+          enabled = (cnt > 0) or editing
+          accent = ((cnt > 0) and P.accent) or P.textDim
         end
         -- card border + accent side-bar
         layout[#layout + 1] = { type = "rectangle", x = cx0, y = cy0, w = cardW,
           h = cardH, rounded = 6, thickness = 1, color = P.line }
         layout[#layout + 1] = { type = "rectangle", filled = true, rounded = 3,
           x = cx0 + 3, y = cy0 + 4, w = 5, h = cardH - 8, color = accent }
-        -- name + sub
-        local ty = cy0 + math.floor((cardH - nh - sh) / 2)
+        -- name + sub. The name font steps DOWN when the name does not fit: at
+        -- MIDSIZE a 480x320 card holds nine of the widest glyphs, which would
+        -- have capped a name at nine characters for every radio (the file is
+        -- worth syncing between them, so the cap cannot be per-radio). Measured,
+        -- one step is enough for MAX_NAME_LEN on all three targets.
+        local nf, nfh = nameFont, nh
+        if lcd.sizeText(name, nf) > cardW - 26 then nf, nfh = SMLSIZE, sh end
+        local ty = cy0 + math.floor((cardH - nfh - sh) / 2)
         layout[#layout + 1] = { type = "label", x = cx0 + 20, y = ty,
-          w = cardW - 26, h = nh, font = nameFont,
+          w = cardW - 26, h = nfh, font = nf,
           color = enabled and P.text or P.textDim, text = name }
-        layout[#layout + 1] = { type = "label", x = cx0 + 20, y = ty + nh,
+        layout[#layout + 1] = { type = "label", x = cx0 + 20, y = ty + nfh,
           w = cardW - 26, h = sh, font = SMLSIZE, color = P.textDim, text = sub }
         if enabled then
           local ti = idx
           add_hit(lv, cx0, cy0, cardW, cardH,
             function(wgt2, lv2)
+              -- T9: in edit mode a card tap opens its action menu instead of
+              -- applying it. A hidden long-press over the same surface would be
+              -- an accidental delete at the field, with a glove on.
+              if lv2.tpl_edit and ti <= #lv2.templates then
+                open_tpl_menu(wgt2, lv2, ti)
+                return
+              end
               if ti > #lv2.templates then
                 -- prefill the picker with the currently shown curves
                 lv2.custom_sel = {}
                 for k = 1, #(lv2.curves or {}) do
                   lv2.custom_sel[lv2.curves[k].col] = true
                 end
-                lv2.sens_selgen = (lv2.sens_selgen or 0) + 1   -- invalidate the group counters
                 lv2.sens_scroll = 0
                 lv2.mode = "sensors"
                 wgt2.lv_dirty = true
@@ -1743,10 +2385,21 @@ end
 --   "list"  one sensor per full-width row + a drawn iOS-style toggle switch
 --   "grid"  the compact multi-column [x] cells (the original look)
 -- Groups are COLLAPSIBLE: tapping a header band folds it away (lv.sens_collapsed);
--- the band shows a live selected/available counter. Max MAX_CURVES picked. A flat
--- "visual row" list is windowed by scroll. Toggle/collapse states are reactive
--- (labels, switch overlay/knob) so toggling needs NO rebuild; changing the
--- layout, collapse set or scroll rebuilds (structure / hit rects change).
+-- the band shows a selected/available counter. Max MAX_CURVES picked. A flat
+-- "visual row" list is windowed by scroll.
+--
+-- THIS PAGE CARRIES NO REACTIVE CLOSURE. Every state change on it -- toggle,
+-- collapse, layout, scroll -- rebuilds, and the build reads the state directly.
+-- That is not a style choice: reactive closures get no instruction budget of
+-- their own, they run on what the call that created them left over
+-- (LuaWidget::foreground calls refresh() and then callRefs() in ONE protected
+-- block, lua_widget.cpp:295-312). A LIST row used to be four objects with three
+-- closures, sens_vis is 12 on the MK3, and the page drew
+-- "foreground calRefs error: (null)" in red -- intermittently, likelier with
+-- every extra row, and it never recovered. A toggle now costs the rebuild that
+-- folding and scrolling always cost, and that rebuild is CHEAPER than the
+-- reactive one was: three static objects per row, and nothing left to run
+-- afterwards.
 local function build_sensors(wgt, zone, lv, P)
   local W, H = zone.w, zone.h
   local titleFont = (H >= 300) and MIDSIZE or SMLSIZE
@@ -1777,20 +2430,56 @@ local function build_sensors(wgt, zone, lv, P)
     layout[#layout + 1] = { type = "rectangle", filled = true,
       x = 0, y = 0, w = W, h = H, color = P.bg }
   end
-  -- top bar: title | [List][Grid] tabs | count | Show
+  -- top bar: title | [List][Grid] tabs | count | Save | Show
+  --
+  -- It was already dense before Save joined it. MEASURED rather than designed:
+  -- at 480 px the row spends 8 + 84 + 6 + 84 + 6 + 52 + 8 + 108 = 356 px, leaving
+  -- ~112 px for the title, and "Sensors" in SMLSIZE is ~52 px there -- so it fits
+  -- on all three targets. The title still yields FIRST if a font ever grows.
   local showW = (W >= 700) and 96 or 84
   local showX = W - showW - 8
+  local saveW = showW
+  local saveX = showX - 6 - saveW
   local cntW  = 52
-  local cntX  = showX - 6 - cntW
+  local cntX  = saveX - 6 - cntW
   local tabW  = (W >= 700) and 66 or 54
   local tabsX = cntX - 8 - 2 * tabW
+  local titleW = tabsX - 12
+  local titleTxt = "Sensors"
+  if lcd.sizeText(titleTxt, titleFont) > titleW then titleTxt = "" end
+  local full = (tpl_user_count(lv) >= MAX_USER_TPL)
+  local nsel = count_sel(lv)               -- read ONCE; the page rebuilds on change
   layout[#layout + 1] = { type = "label", x = 6, y = (headH - tth) / 2,
-    w = tabsX - 12, h = tth, font = titleFont, color = P.accent, text = "Sensors" }
+    w = titleW, h = tth, font = titleFont, color = P.accent, text = titleTxt }
   layout_tab(lv, layout, P, tabsX,          4, tabW, headH - 8, "List", "list")
   layout_tab(lv, layout, P, tabsX + tabW,   4, tabW, headH - 8, "Grid", "grid")
   layout[#layout + 1] = { type = "label", x = cntX, y = (headH - sh) / 2,
     w = cntW, h = sh, font = SMLSIZE, align = RIGHT, color = P.hint,
-    text = function() return count_sel(lv) .. "/" .. MAX_CURVES end }
+    text = nsel .. "/" .. MAX_CURVES }
+  -- T10: creation lives HERE, because the selection (lv.custom_sel) lives here
+  -- and is cleared on leave. Save stores AND displays; a failed write still
+  -- displays (§6.1) -- the user should not lose the picture because the card is
+  -- full.
+  button(lv, layout, P, saveX, 3, saveW, headH - 6, "Save", SMLSIZE,
+    function(wgt2, lv2)
+      local curves = custom_curves(lv2)
+      if #curves == 0 then return end
+      local names = curve_names(curves)
+      tpl_name_flow(wgt2, lv2, {
+        title = "Save as template",
+        text = propose_name(lv2, names),
+        store = function(w3, lv3, name, at)
+          tpl_store(w3, lv3, name, names, at)
+          apply_curves(w3, lv3, curves, name)
+          lv3.cache = {}
+          lv3.cursor_t = nil
+          local s = lv3.sessions[lv3.session_i]
+          lv3.mode = "load"
+          begin_extract(lv3, s.t0, s.t1)
+          w3.lv_dirty = true
+        end })
+    end,
+    (nsel > 0) and not full)
   -- apply button: extract the picked set (enabled once >= 1 sensor picked)
   button(lv, layout, P, showX, 3, showW, headH - 6, "Show", SMLSIZE,
     function(wgt2, lv2)
@@ -1804,7 +2493,7 @@ local function build_sensors(wgt, zone, lv, P)
       begin_extract(lv2, s.t0, s.t1)
       wgt2.lv_dirty = true
     end,
-    function() return count_sel(lv) > 0 end)
+    nsel > 0)
   layout[#layout + 1] = { type = "rectangle", filled = true,
     x = 0, y = headH - 1, w = W, h = 1, color = P.line }
 
@@ -1825,32 +2514,21 @@ local function build_sensors(wgt, zone, lv, P)
         layout[#layout + 1] = { type = "label", x = 10, y = ry + (rowH - sh) / 2,
           w = W - 90 - sbW, h = sh, font = SMLSIZE, color = P.text,
           text = (collapsed and "[+] " or "[-] ") .. SENSOR_GROUPS[gi].name }
+        -- counted HERE, once per build, for the group's own bucket -- the count
+        -- used to be a memoized closure and is now just arithmetic on the way
+        -- past, because a toggle rebuilds the page anyway
+        local cnt = ""
+        local b = lv.sens_buckets ~= nil and lv.sens_buckets[gi]
+        if b ~= nil then
+          local sel = 0
+          for k = 1, #b do
+            if lv.custom_sel ~= nil and lv.custom_sel[b[k]] then sel = sel + 1 end
+          end
+          cnt = sel .. "/" .. #b
+        end
         layout[#layout + 1] = { type = "label", x = W - 74 - sbW,
           y = ry + (rowH - sh) / 2, w = 64, h = sh, font = SMLSIZE,
-          align = RIGHT, color = P.textDim,
-          -- memoized on the selection GENERATION: the bucket loop +
-          -- concat ran per header on every frame; sens_selgen bumps in the tap
-          -- handlers that mutate custom_sel, so the recount runs once per toggle
-          text = (function()
-            local kg, s
-            return function()
-              local g = lv.sens_selgen or 0
-              if s == nil or g ~= kg then
-                kg = g
-                local b = lv.sens_buckets ~= nil and lv.sens_buckets[gi]
-                if b == nil then
-                  s = ""
-                else
-                  local sel = 0
-                  for k = 1, #b do
-                    if lv.custom_sel ~= nil and lv.custom_sel[b[k]] then sel = sel + 1 end
-                  end
-                  s = sel .. "/" .. #b
-                end
-              end
-              return s
-            end
-          end)() }
+          align = RIGHT, color = P.textDim, text = cnt }
         add_hit(lv, 0, ry, W - sbW, rowH,
           function(wgt2, lv2)
             lv2.sens_collapsed = lv2.sens_collapsed or {}
@@ -1859,11 +2537,14 @@ local function build_sensors(wgt, zone, lv, P)
             wgt2.lv_dirty = true
           end, 30)
       elseif vr.col ~= nil then
-        -- LIST row: sensor name (left) + drawn toggle switch (right). The switch
-        -- is off-track (static) + on-overlay (visible= when selected) + knob
-        -- (pos= slides left/right) — the HW-verified reactive paths, so toggling
-        -- needs no rebuild. No real lvgl.toggle: it would capture PAGE/RTN.
+        -- LIST row: sensor name (left) + drawn toggle switch (right). THREE
+        -- static objects: label, track (accent when on, swOff when off) and the
+        -- knob at the end it belongs to. The on-overlay is gone -- one track in
+        -- the right colour draws the same picture as two stacked rects did, and
+        -- the state is read here instead of by a closure per frame. No real
+        -- lvgl.toggle either: it would capture PAGE/RTN.
         local cc = vr.col
+        local on = (lv.custom_sel ~= nil and lv.custom_sel[cc] == true)
         local col = lv.columns[cc]
         local lbl = col.name
         if col.unit ~= "" then lbl = lbl .. " (" .. col.unit .. ")" end
@@ -1874,26 +2555,14 @@ local function build_sensors(wgt, zone, lv, P)
         local swY   = ry + math.floor((rowH - swH) / 2)
         layout[#layout + 1] = { type = "label", x = 14, y = ry + (rowH - sh) / 2,
           w = swX - 20, h = sh, font = SMLSIZE,
-          color = function()
-            return (lv.custom_sel ~= nil and lv.custom_sel[cc]) and P.accent or P.text
-          end,
-          text = lbl }
+          color = on and P.accent or P.text, text = lbl }
         layout[#layout + 1] = { type = "rectangle", filled = true,
           rounded = math.floor(swH / 2), x = swX, y = swY, w = swW, h = swH,
-          color = swOff }
+          color = on and P.accent or swOff }
         layout[#layout + 1] = { type = "rectangle", filled = true,
-          rounded = math.floor(swH / 2), x = swX, y = swY, w = swW, h = swH,
-          color = P.accent,
-          visible = function()
-            return lv.custom_sel ~= nil and lv.custom_sel[cc] == true
-          end }
-        layout[#layout + 1] = { type = "rectangle", filled = true,
-          rounded = math.floor(knobD / 2), x = swX + 2, y = swY + 2,
-          w = knobD, h = knobD, color = knobC,
-          pos = function()
-            local on = lv.custom_sel ~= nil and lv.custom_sel[cc]
-            return (on and (swX + swW - knobD - 2) or (swX + 2)), swY + 2
-          end }
+          rounded = math.floor(knobD / 2),
+          x = on and (swX + swW - knobD - 2) or (swX + 2), y = swY + 2,
+          w = knobD, h = knobD, color = knobC }
         add_hit(lv, 0, ry, contentR, rowH,
           function(wgt2, lv2)
             lv2.custom_sel = lv2.custom_sel or {}
@@ -1902,7 +2571,7 @@ local function build_sensors(wgt, zone, lv, P)
             elseif count_sel(lv2) < MAX_CURVES then
               lv2.custom_sel[cc] = true
             end
-            lv2.sens_selgen = (lv2.sens_selgen or 0) + 1   -- invalidate the group counters
+            wgt2.lv_dirty = true          -- the page draws the selection, so redraw it
           end, 25)
       else
         -- GRID row: the original compact [x] cells (the "second option")
@@ -1912,26 +2581,13 @@ local function build_sensors(wgt, zone, lv, P)
             local cc = c
             local rx = 4 + (j - 1) * cellW
             local col = lv.columns[c]
+            local on = (lv.custom_sel ~= nil and lv.custom_sel[cc] == true)
             local lbl = col.name
             if col.unit ~= "" then lbl = lbl .. " (" .. col.unit .. ")" end
             layout[#layout + 1] = { type = "label", x = rx + 6,
               y = ry + (rowH - sh) / 2, w = cellW - 12, h = sh, font = SMLSIZE,
-              color = function()
-                return (lv.custom_sel ~= nil and lv.custom_sel[cc]) and P.accent or P.text
-              end,
-              -- memoized on the selected state: the mark concat ran per
-              -- cell on every frame
-              text = (function()
-                local kb, s
-                return function()
-                  local on = lv.custom_sel ~= nil and lv.custom_sel[cc] == true
-                  if s == nil or on ~= kb then
-                    kb = on
-                    s = (on and "[x] " or "[  ] ") .. lbl
-                  end
-                  return s
-                end
-              end)() }
+              color = on and P.accent or P.text,
+              text = (on and "[x] " or "[  ] ") .. lbl }
             add_hit(lv, rx, ry, cellW, rowH,
               function(wgt2, lv2)
                 lv2.custom_sel = lv2.custom_sel or {}
@@ -1940,7 +2596,7 @@ local function build_sensors(wgt, zone, lv, P)
                 elseif count_sel(lv2) < MAX_CURVES then
                   lv2.custom_sel[cc] = true
                 end
-                lv2.sens_selgen = (lv2.sens_selgen or 0) + 1   -- invalidate the group counters
+                wgt2.lv_dirty = true      -- the page draws the selection, so redraw it
               end, 25)
           end
         end
@@ -1959,9 +2615,18 @@ local function build_sensors(wgt, zone, lv, P)
     layout[#layout + 1] = { type = "rectangle", filled = true, rounded = 2,
       x = W - 6, y = thumbY, w = 5, h = thumbH, color = P.accent }
   end
+  -- The cap and the write banner say their piece HERE, not in a dialog: the state
+  -- has to be visible before the user invests a name (§7). The top bar has no room
+  -- for a sub-line under the button, so this footer carries it.
+  local hint = "Tap sensor/switch - tap group to fold - drag to scroll - RTN when done"
+  if lv.tpl_msg ~= nil then
+    hint = lv.tpl_msg
+  elseif full then
+    hint = MAX_USER_TPL .. " templates - delete one first (Save is off)"
+  end
   layout[#layout + 1] = { type = "label", x = 6, y = H - sh - 2,
-    w = W - 12, h = sh, font = SMLSIZE, color = P.textDim,
-    text = "Tap sensor/switch - tap group to fold - drag to scroll - RTN when done" }
+    w = W - 12, h = sh, font = SMLSIZE,
+    color = ((lv.tpl_msg ~= nil) or full) and P.hint or P.textDim, text = hint }
   lvgl.build(layout)
 end
 
@@ -2143,6 +2808,12 @@ local function build_chart(wgt, zone, lv, P)
     w = W - 2 * zb - 16,
     h = sh, font = SMLSIZE, align = CENTER, color = P.textDim,
     text = function()
+      -- a failed/refused template save, for the few seconds after it happened:
+      -- this is where Save leaves the user, and the card page's own footer is
+      -- behind them by then
+      if lv.tpl_msg ~= nil and (getTime() or 0) < (lv.tpl_msg_until or 0) then
+        return lv.tpl_msg
+      end
       local s = lv.sessions[lv.session_i]
       local a = fmt_mmss(lv.win_t0 - s.t0)
       local b = fmt_mmss(lv.win_t1 - s.t0)
@@ -2179,6 +2850,8 @@ function M.build(wgt, zone)
   else
     build_chart(wgt, zone, lv, P)
   end
+  -- the manager's dialogs draw OVER the page and take its tap targets with them
+  if lv.dlg ~= nil then build_dlg(wgt, zone, lv, P) end
 end
 
 local function rect_hit(ts, r)
@@ -2217,6 +2890,16 @@ function M.refresh(wgt, event, touch_state)
       wgt.lv_dirty = true                -- host rebuilds now (this tick did no scan)
       return
     end
+  end
+
+  -- Adoption of the legacy toolbox file (§4.3) is a WRITE, and it is deferred to
+  -- an idle tick: the open that discovers it has already spent its budget on the
+  -- header parse. A failure is not fatal -- the session runs off the loaded data
+  -- and the next open tries again.
+  if lv.tpl_adopt and lv.load_phase == nil and lv.templates ~= nil then
+    lv.tpl_adopt = nil
+    atomic_write(TPL_PATH, serialize_templates(tpl_users(lv), lv.tpl_replace == true))
+    return
   end
 
   local now = getTime() or 0
@@ -2304,8 +2987,10 @@ function M.refresh(wgt, event, touch_state)
     lv.fil_scroll = ns
   end
   -- template chooser: touch drag scrolls the card list (sensor-picker pattern:
-  -- rebuild per step, the hit rects move with the window)
-  if lv.mode == "templates" and EVT_TOUCH_SLIDE ~= nil and event == EVT_TOUCH_SLIDE
+  -- rebuild per step, the hit rects move with the window). Not while a dialog is
+  -- up: the rebuild would move the page under a panel that is meant to be modal.
+  if lv.mode == "templates" and lv.dlg == nil
+      and EVT_TOUCH_SLIDE ~= nil and event == EVT_TOUCH_SLIDE
       and touch_state ~= nil and touch_state.y ~= nil then
     lv.saw_slide = true
     lv.tap_block = now + 50
@@ -2326,7 +3011,8 @@ function M.refresh(wgt, event, touch_state)
   -- sensor picker: touch drag scrolls the column list (same pattern as the
   -- browser: startY anchor + swipe marker + tap cooldown; rebuild per step
   -- keeps the scrollbar thumb honest)
-  if lv.mode == "sensors" and EVT_TOUCH_SLIDE ~= nil and event == EVT_TOUCH_SLIDE
+  if lv.mode == "sensors" and lv.dlg == nil
+      and EVT_TOUCH_SLIDE ~= nil and event == EVT_TOUCH_SLIDE
       and touch_state ~= nil and touch_state.y ~= nil then
     lv.saw_slide = true
     lv.tap_block = now + 50
@@ -2365,6 +3051,21 @@ end
 function M.on_exit_key(wgt)
   local lv = wgt.lv
   if lv == nil then return false end
+  -- the manager unwinds first: an open dialog, then edit mode, then the page
+  -- RTN ABANDONS the dialog outright; it does not walk back a step. (A "no" on
+  -- the Replace? question does go back to the name field -- that is the No
+  -- button, and it is a different gesture.)
+  if lv.dlg ~= nil then
+    lv.dlg = nil
+    wgt.lv_dirty = true
+    return true
+  end
+  if lv.tpl_edit then
+    lv.tpl_edit = nil
+    lv.tpl_msg = nil
+    wgt.lv_dirty = true
+    return true
+  end
   if (lv.mode == "sensors" or lv.mode == "templates" or lv.mode == "sessions")
       and lv.win_t0 ~= nil and lv.curves ~= nil and #lv.curves > 0
       and lv.load_phase == nil then

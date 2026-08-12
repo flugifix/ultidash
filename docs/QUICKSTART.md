@@ -1,8 +1,8 @@
 # UltiDash — Quick Start
 
 The shortest path to a working UltiDash: the **base features** — the flight dashboard, the
-detail/second-screen **views** and the **statistics** page — up and running. Everything
-else is optional and configured later inside the widget.
+detail **views** and the **statistics** page — up and running. Everything else is
+optional and configured later inside the widget.
 
 > Prerequisites: an EdgeTX **color radio** (developed on 2.12), a heli on **Rotorflight
 > 2.3** with an **ELRS** link, and the **RFTool** widget from the Rotorflight Lua scripts.
@@ -64,8 +64,11 @@ That covers everything the built-in dashboard, views and statistics need. What e
 | 97 | `BAT#` | Battery profile |
 
 > **Order and the rest of the slots don't matter** — list them in any order; up to 40
-> sensors are allowed. If you also use the **RF Adjustment** toolbox tools, add `99`
-> (`ADJ`) to the list.
+> sensors are allowed. If you also use the **RF Adjustment** toolbox tools, add `99` (the
+> adjustment report) to the list. It reaches the radio as **one** CRSF frame, which the
+> RFTool telemetry decoder (step 3) splits into the two sensors the tools read: **`AdjF`**
+> (which function) and **`AdjV`** (its new value) — so those are the names to look for on
+> the Telemetry page, not `99`.
 
 > **The ELRS link sensors are automatic.** `RQly`, `TQly`, `1RSS`, `2RSS`, `RSNR`, `TPWR`,
 > `ANT` and `RFMD` come **natively from the ELRS receiver** — they are **not** part of
@@ -104,8 +107,8 @@ sensors should appear.
 
 ## 5. Add the UltiDash widget
 
-Place the **UltiDash** widget in a (full-screen) widget zone on a model screen. Leave its
-one EdgeTX option, **`ViewMode`**, on **Dashboard** for the main instance.
+Place the **UltiDash** widget in a (full-screen) widget zone on a model screen — one
+instance per model. The widget has no EdgeTX options to set.
 
 ## 6. Configure and verify
 
