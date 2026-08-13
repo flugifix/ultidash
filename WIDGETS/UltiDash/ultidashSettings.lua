@@ -161,6 +161,14 @@ local latched_key = nil
 -- cfg file cannot MOVE mid-session; it cannot recover the stored name if the rename
 -- already happened before the first load (boot with the craft powered and connected).
 -- In practice the first load lands in refresh #1, seconds before RF's MSP handshake.
+-- Set when the by-name lookup missed and the by-FILE scan below found this model's cfg
+-- under another name. It then IS the file for this session -- read AND written -- so a
+-- craft-name boot can never fork a second config off an existing one. Cleared on a real
+-- model switch, with the latch it belongs to.
+local resolved_path = nil
+-- What the by-name file claims when it disagrees with this model's file (Status shows it).
+local key_conflict = nil
+
 local function model_key()
     local info = model_info()
     local fname = ""
@@ -169,6 +177,8 @@ local function model_key()
         latched_file = fname
         latched_key = sanitize(info and info.name or "")
         if latched_key == "" then latched_key = "model" end
+        resolved_path = nil
+        key_conflict = nil
     end
     return latched_key
 end
@@ -238,7 +248,7 @@ local function old_slot_file()
     return base and ("cfg_m_" .. base .. ".cfg") or nil
 end
 
-local function model_path()  return cfg_prefix() .. model_file()  end
+local function model_path()  return resolved_path or (cfg_prefix() .. model_file())  end
 
 local function read_table(path)
     local f = io.open(path, "r")
@@ -367,14 +377,84 @@ local function read_or_adopt(into, names)
     return nil
 end
 
+-- ---------------------------------------------------------------------------
+-- Finding this model's cfg when its NAME has moved.
+--
+-- The key is the model name, and the name is not ours: Rotorflight's RF2 background
+-- script renames the EdgeTX model to the connected craft and restores it on disconnect.
+-- The boot latch covers a rename that happens while we run; it cannot cover one that had
+-- already happened when we first loaded (radio booted with the craft powered, or a
+-- restore that never ran). Then the by-name lookup misses and a SECOND config is born
+-- under the craft name -- one helicopter, two files, neither of them wrong-looking.
+-- Observed on a TX15 on 2026-08-13.
+--
+-- So the file is found by NAME and identified by FILE. Every save stamps `ModelFile`
+-- with the model file this cfg belongs to ("model5"); when the by-name lookup misses, we
+-- look for the cfg that carries this model's stamp and use THAT ONE IN PLACE -- not a
+-- copy, or the fork is merely postponed by one save.
+--
+-- Why not key on the model file to begin with: that was the pre-0.7.0 scheme, and EdgeTX
+-- Companion renumbers `modelN.yml` on add/delete, which orphaned every config at once.
+-- Name-as-filename survives that; file-as-identity survives the rename. Neither alone
+-- does both, and EdgeTX offers no stable id (checked: `modelId` is the binding's receiver
+-- number, and labels.yml's "hash" is the file's size and mtime).
+--
+-- Cost is paid only on the miss -- the path that today ends in a fresh default file.
+-- ONE 4 kB chunk per candidate: a real cfg is ~2 kB, so this reads whole files in
+-- practice, and a file larger than that simply is not matched (falls back to today's
+-- behaviour rather than to a wrong match).
+local function peek_model_file(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local head = io.read(f, 4096)
+    io.close(f)
+    if type(head) ~= "string" then return nil end
+    return string.match(head, "\nModelFile=([^\r\n]+)") or string.match(head, "^ModelFile=([^\r\n]+)")
+end
+
+local function scan_for_model_file()
+    local want = old_slot_base()
+    if want == nil or type(dir) ~= "function" then return nil end
+    local d = cfg_prefix()
+    local mine = model_file()
+    -- dir() takes the directory without its trailing slash
+    local listing = string.sub(d, -1) == "/" and string.sub(d, 1, -2) or d
+    local found = nil
+    pcall(function()
+        for fname in dir(listing) do
+            if fname ~= mine and string.match(fname, "^cfg_m_.+%.cfg$") then
+                if peek_model_file(d .. fname) == want then found = d .. fname return end
+            end
+        end
+    end)
+    return found
+end
+
 local function do_load()
     local main = read_cfg(model_file())
-    if main == nil then
-        -- One-time adoption, newest scheme first: the slot-keyed file this model wrote
-        -- before the key moved to the model name, then the pre-slot name-keyed file.
-        main = read_or_adopt(model_path(), { old_slot_file(), legacy_file() })
+    if main ~= nil then
+        -- A by-name hit that belongs to a DIFFERENT model file: two models sharing a name,
+        -- or a rename caught mid-flight. The name wins (it is what the user sees and what
+        -- every earlier session used); the contradiction is reported rather than resolved.
+        local stamp = main.ModelFile
+        local mine = old_slot_base()
+        if type(stamp) == "string" and mine ~= nil and stamp ~= mine then key_conflict = stamp end
+        return main
     end
-    return main
+    -- One-time adoption, newest scheme first: the slot-keyed file this model wrote
+    -- before the key moved to the model name, then the pre-slot name-keyed file.
+    main = read_or_adopt(model_path(), { old_slot_file(), legacy_file() })
+    if main ~= nil then return main end
+    -- ...and only then the by-file scan: this model's cfg under some other name.
+    local p = scan_for_model_file()
+    if p ~= nil then
+        local t = read_table(p)
+        if t ~= nil then
+            resolved_path = p    -- read AND write here for the rest of this session
+            return t
+        end
+    end
+    return nil
 end
 
 -- Persist any adoption recorded by do_load. Called by the host in its OWN refresh
@@ -397,6 +477,16 @@ function M.target_path()
     return model_path()
 end
 
+-- For menu -> Status. Two different statements, deliberately not merged:
+--   resolved  = this session is on a cfg found by MODEL FILE under another name, because
+--               the name lookup missed (the craft-name case).
+--   conflict  = the cfg found by NAME says it belongs to another model file. The name
+--               wins and this reports it; nothing is repaired behind the user's back.
+-- Both are nil in the ordinary case, and the row then shows the file name alone.
+function M.key_state()
+    return (resolved_path ~= nil), key_conflict
+end
+
 -- Load (once) and return the saved settings, or nil when nothing is stored.
 function M.load()
     if cache_loaded then
@@ -414,8 +504,12 @@ function M.load()
         end
     end
     cache_loaded = true
-    loaded_model_path = model_path()
     local ok, t = pcall(do_load)
+    -- AFTER do_load, never before: the by-file scan may have resolved this session onto a
+    -- cfg under another name, and model_path() then answers differently. Stamping the
+    -- pre-scan path here would make the very next load see it as "moved" and reload
+    -- forever -- in the hot path, on every update().
+    loaded_model_path = model_path()
     if ok then
         -- one-time schema migration, IN MEMORY ONLY -- never write here: M.load runs inside
         -- create()/update(), whose ~20k-instruction budget (lua_widget.cpp) an SD write blows
@@ -453,6 +547,13 @@ function M.save(values)
     -- one, and the migration that had already run would then run a second time on the next
     -- upgrade. The file's own stamp wins whenever it is ahead of us.
     t.ClrSchemeV = math.max(tonumber(t.ClrSchemeV) or 0, SCHEMA_VER)
+    -- Which MODEL FILE this config belongs to. The file name carries the model NAME, and
+    -- a connected craft can take that name away (see scan_for_model_file); this is the
+    -- half that does not move. Written on every save, never removed by the sweep -- same
+    -- standing as ClrSchemeV and SkinsSeen. NOT stamped when EdgeTX gives no filename:
+    -- an empty stamp would match every other model's empty stamp.
+    local slot = old_slot_base()
+    if slot ~= nil then t.ModelFile = slot end
     -- Drop keys no current version knows: orphans (removed features, renamed keys)
     -- otherwise accumulate in the file forever AND flow back into every instance's
     -- options via apply()'s passthrough. Valid = every defaults key (settings rows
@@ -497,7 +598,7 @@ function M.save(values)
     end
     if not hold then
         for k in pairs(t) do
-            if defaults[k] == nil and k ~= "ClrSchemeV" and k ~= "SkinsSeen"
+            if defaults[k] == nil and k ~= "ClrSchemeV" and k ~= "SkinsSeen" and k ~= "ModelFile"
                 and not (string.sub(k, -3) == "Raw" and defaults[string.sub(k, 1, -4)] ~= nil) then
                 t[k] = nil
             end

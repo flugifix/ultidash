@@ -2,6 +2,66 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.7.1 — 2026-08-13
+
+### Added
+
+- **The Status page names the config file this radio is using.** A **Config file** row under
+  *Version*, showing the `cfg_m_*.cfg` that is actually being read and written. Until now
+  nothing on screen answered that question, so settings you never made had no explanation.
+  Two markers can follow the file name: **(found)** — the lookup by name missed and this file
+  was located by its model-file stamp, i.e. the model is wearing a craft name at the moment;
+  and **(! model7)** — the file found by name says it belongs to another model.
+- **The debug mode's on-screen overlay has its own switch.** *Settings ▸ General ▸ Show perf
+  overlay* (default **on**). The live *UI Hz / Lua heap / free heap* strip and the SD debug log
+  used to be one setting, so a session that wanted the **log** — a flight, a screenshot, a
+  report somebody else reads — also got the strip sitting over the layout. Switching it off
+  leaves the logging completely untouched; the row is dimmed while *Debug log to SD card* is
+  off, which is the only state in which nothing is drawn anyway.
+
+### Fixed
+
+- **One helicopter could end up with two config files.** The per-model config is keyed by the
+  EdgeTX model name — and that name is not yours to keep: with *"set model name on TX"* on,
+  Rotorflight renames the model to the connected craft and puts the name back on disconnect.
+  UltiDash latches the name at start, which covers a rename that happens while it runs. It
+  could not cover one that had **already happened** when the widget first loaded, i.e. a radio
+  booted with the craft powered: the lookup by name then missed and a **second** config was
+  born under the craft name — one machine, two files, neither of them looking wrong, and
+  settings landing in whichever one that boot had picked. The config is now **found by name
+  and identified by model file**: every save stamps it with the model file it belongs to, and
+  when the lookup by name misses, UltiDash finds the config carrying this model's stamp and
+  uses **that** one — reading and writing it for the rest of the session, rather than copying
+  it, which would only postpone the split by one save. **The stamp is written from this
+  version on**, so a config last saved by an older one is protected from its next save onward,
+  not retroactively. If the file found by name turns out to carry *another* model's stamp —
+  two models sharing a name — the name wins, and the contradiction is reported on the Status
+  page instead of being repaired behind your back.
+- **A switch shortcut no longer swallows the press after you close its page some other way.**
+  Reported from the field against 0.6.1: *opening the Log Viewer over a switch does not always
+  work.* A **toggle** slot remembers how far along its option chain it is, and that counter
+  was only ever reset by a press of the same switch — so leaving the page with **RTN**, tapping
+  it away or **arming** left the counter standing. The next press then meant *close what is
+  already closed*: with a single-option chain it opened **nothing** (every second flick
+  appeared dead), and with a longer chain it opened the option *after* the page you had just
+  left. The chain now resynchronises against the page that is actually up, so the next press
+  always starts again at option 1. Position slots were never affected — leaving the position
+  resets them anyway.
+
+### Changed
+
+- **A shortcut thrown while the widget is not in EdgeTX's *Full screen* now says so.** Tool
+  and detail pages have always required full screen (a fullscreen page cannot be built into a
+  widget zone), and the switch simply did nothing — with no menu glyph in a zone there was
+  nothing on screen to connect the dead switch to a setting. The dashboard now shows a brief
+  **"Shortcut needs Full screen"** banner instead.
+- **Documented the toggle slot's press length.** Switches are read from the widget's own pass,
+  which runs about every 0.2 s, so a press has to last at least that long to be seen. A shorter
+  flick of a momentary switch is not filtered out — it is **sometimes** not sampled, which from
+  the cockpit is a switch that works most of the time. Measured on the MK3, five presses per
+  length: 0.20 s and longer 5/5, 0.15 s 4/5, 0.10 s 4/5, 0.06 s 1/5. Written into
+  `docs/REFERENCE.md` §2.7c.
+
 ## v0.7.0 — 2026-08-12
 
 ### Added

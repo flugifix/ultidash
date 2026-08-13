@@ -3200,6 +3200,12 @@ end
 -- Non-clickable primitives -> steals no touch.
 function ultidash_functions.add_perf_overlay(wgt, w, h)
     if not (wgt.options and wgt.options.DebugLog == 1) then return end
+    -- ...and the on-screen half has its own switch (`DbgOvl`, default on). The log and the
+    -- strip used to be one setting, so a session that wanted the FILE -- a flight, a
+    -- screenshot for a report, anything somebody else will look at -- also got the strip
+    -- sitting over the layout. Read as `== 0` rather than `~= 1` so a cfg written before this
+    -- key existed (nil) keeps the old behaviour rather than losing the overlay silently.
+    if wgt.options.DbgOvl == 0 then return end
     local _, sfh = lcd.sizeText("Ag", SMLSIZE)
     local oh = sfh + 4
     -- worst-case width so a long free-heap value never clips. Compact labels:

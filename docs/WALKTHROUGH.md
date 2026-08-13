@@ -9,10 +9,10 @@ detail pages, the menu and the Toolbox, in both the light and the dark colour sc
 > resolution differs but the layout is the same.)*
 
 > 📷 **The screenshots are from a build before 0.7.0** and have not been retaken yet, so
-> three of this release's additions are missing from them: the **Skin** settings group (the
-> settings grid below still shows the pre-0.7.0 grouping), the Toolbox's **Battery profile**
-> entry, and the **Version** row at the top of the Status page. Everything else looks as
-> shown. The text on this page describes 0.7.0.
+> four later additions are missing from them: the **Skin** settings group (the settings grid
+> below still shows the pre-0.7.0 grouping), the Toolbox's **Battery profile** entry, and the
+> **Version** and **Config file** rows at the top of the Status page. Everything else looks
+> as shown. The text on this page describes 0.7.1.
 
 ---
 

@@ -12,7 +12,9 @@ like any other and is the best-documented example to read alongside this guide.
 > described here, the discovery of `skins/*.lua`, the *Skin* settings group and the
 > per-skin colour schemes. The **additional layouts are deliberately not part of it** —
 > they are still being reworked, and holding them back is what keeps the API free to change
-> while they settle.
+> while they settle. They are published on their own instead, at
+> [flugifix/ultidash_skins](https://github.com/flugifix/ultidash_skins) and tagged per
+> UltiDash release, so the layouts can move without the widget moving with them.
 >
 > So treat this document as a **preview, not a stable contract**. The API is `api = 1` and
 > it may gain fields, rename them or drop them; a skin written against today's version can

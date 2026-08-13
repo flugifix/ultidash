@@ -2,7 +2,7 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.7.0 — in development, experimental`
+`Status: v0.7.1 — in development, experimental`
 
 > 🚀 **New to UltiDash?** See it first in the **[Illustrated Walkthrough](docs/WALKTHROUGH.md)**,
 > then get it running with the **[Quick Start guide](docs/QUICKSTART.md)** — the shortest path
@@ -256,6 +256,12 @@ Each group page also has a **Reset … to defaults** button that resets only tha
 > layouts are not part of it** — they are still being reworked, and the API they are written
 > against may still change in ways that break a skin written against today's version. Read
 > [docs/SKINS.md](docs/SKINS.md) as a preview rather than as a stable contract.
+>
+> They are not lost, only kept out of the widget release: the four of them —
+> *Minimal*, *Grid*, *Cockpit* and *Dash1* — live in
+> [flugifix/ultidash_skins](https://github.com/flugifix/ultidash_skins), tagged per UltiDash
+> release. Installing one is copying a file into `WIDGETS/UltiDash/skins/`; a skin that
+> fails to load falls back to the built-in look.
 
 > 🎨 **About the color scheme (Skin → Color scheme).** Colour schemes belong to the skin.
 > The **UltiDash** skin offers three palettes: the built-in **UltiDash** look (the path I
@@ -268,12 +274,15 @@ Each group page also has a **Reset … to defaults** button that resets only tha
 Edits are **saved automatically** when you leave the page (back arrow or RTN) and stored
 **per EdgeTX model** in `/WIDGETS/UltiDash/cfg/cfg_m_<model-name>.cfg` — so every
 Rotorflight craft flown on that model shares them. The key is the **model name**, which
-survives both Rotorflight's temporary "set model name on TX" renaming and the model-file
-renumbering that EdgeTX Companion does when models are added or deleted. Two models with
-the same name share one file, so give a copied model its own name if it needs its own
-config. (Config files from older versions are picked up automatically — those in the widget
-root are moved into `cfg/`, and pre-0.7.0 files keyed by the model number are re-keyed to
-the name on first start.)
+survives the model-file renumbering that EdgeTX Companion does when models are added or
+deleted. Rotorflight's "set model name on TX" temporarily renames the model to the connected
+craft, and since **0.7.1** that can no longer split a model's config in two: each file also
+records the model it belongs to, so a config is found by name and identified by model file
+(see `menu ▸ Status`, which names the file in force). Two models with the same name still
+share one file, so give a copied model its own name if it needs its own config. (Config files
+from older versions are picked up automatically — those in the widget root are moved into
+`cfg/`, and pre-0.7.0 files keyed by the model number are re-keyed to the name on first
+start.)
 
 See **[docs/REFERENCE.md](docs/REFERENCE.md)** for the full settings list, the layout
 breakdown, the callout matrix, the detail pages and the "what is shown when" tables.

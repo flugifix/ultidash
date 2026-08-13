@@ -517,6 +517,7 @@ Meta settings: diagnostics, flight log and battery behaviour.
 |---------|------|---------|-------|
 | **Debug log to SD card** | bool | off | write a diagnostics log to the SD card (see §11) |
 | **Debug log: sessions kept** | num | 20 | 1–50 — how many rotating log files to retain |
+| **Show perf overlay** | bool | **on** | the small live *UI Hz / Lua heap / free heap* strip in the bottom-left corner, shown on every view while the debug log is on. Switch it off to keep the **log** without the strip over the layout — for a flight, a screenshot, or anything somebody else is going to look at. Dimmed while *Debug log* is off, which is the only state in which the overlay is not drawn anyway |
 | **Log flights to SD card** | bool | off | flight log: one `flights.csv` line per flight (see §12) |
 | **Log per-flight stats** | bool | off | append the flight-statistics (cell / headspeed P1-3 / current / ESC temp / BEC min-max, sag count+deepest, mAh) to each flight line; shown on the viewer's per-flight detail page (§12.4). Needs *Log flights* |
 | **Min. flight time** | num | 30 s | 0–300 s — shorter arm cycles are not a flight (0 = log every arm) |
@@ -567,7 +568,10 @@ profile before it opens.
 **Every** target opens only while the widget is **fullscreen** (both the detail pages and
 the tools are fullscreen pages) — a switch held while not fullscreen opens as soon as you
 enter fullscreen. In a widget-grid zone a detail page would have no way out: a zone gets no
-touch, so its *tap anywhere to close* hint is dead.
+touch, so its *tap anywhere to close* hint is dead. Throwing a bound switch while **not**
+fullscreen therefore does nothing — and says so: the dashboard shows a brief
+**"Shortcut needs Full screen"** banner, because in a zone there is no menu glyph to ask and
+a silently dead switch is indistinguishable from a broken setting.
 Works independently of *Tap zones* (§2.3); *Close detail pages on arm* still applies to
 detail targets.
 
@@ -582,6 +586,13 @@ Two mechanisms:
   (the switch entering that position — momentary switches like `SH↓` work naturally)
   steps to the next option (skipping any left on *Off*), then closes after the last:
   opt 1 → opt 2 → … → closed → opt 1 …
+  **Hold the press for at least 0.2 s.** Switches are read from the widget's own pass, which
+  runs about every 0.2 s, so the switch has to still be in the position when one of those
+  samples lands. A shorter flick is not filtered — it is simply **sometimes** not seen, which
+  from the cockpit is a switch that works most of the time. Measured on the MK3, five presses
+  per length: **0.20 s and longer 5/5**, 0.15 s 4/5, 0.10 s 4/5, **0.06 s 1/5**. Position
+  slots are unaffected (they are held anyway, and *Switch delay* is the relevant number
+  there).
 
 Each slot is its own section on the page (*Position slot 1…6*, *Toggle switch 1…2*). In
 the *Opens* dropdown a target reads as `Category: Name` — detail pages `Page: …`
@@ -608,6 +619,13 @@ Toolbox, from a tap zone and from here alike.
 > after disarming. **Toggle** steps do *not* retry: a refused step leaves the chain
 > closed until the next press.
 >
+> **A toggle chain resynchronises when you close its page some other way.** Close a
+> shortcut-opened page with RTN, by tapping it away or by arming, and the next press of that
+> toggle starts the chain again at option 1 — it does not carry on where the chain stood.
+> (Before 0.7.1 it did, so with a single-option chain every second press appeared to do
+> nothing and with a longer one the next press opened the option *after* the page you had
+> just left.)
+>
 > **RTN** from a shortcut-opened Toolbox tool returns **straight to the dashboard** — there
 > is no menu trail to unwind (opened from ☰ ▸ Toolbox, RTN returns to that submenu as usual).
 
@@ -629,8 +647,24 @@ SD card and overlay the (effectively empty) EdgeTX option list at runtime.
     Test`, …) are the case to watch.
 
   Rotorflight's *"set model name on TX"* renames the EdgeTX model to the connected craft,
-  but only while it is connected — RF restores the stored name on disconnect, and the
-  latch means a craft connecting never moves the config file.
+  but only while it is connected — RF restores the stored name on disconnect, and the latch
+  means a craft connecting never moves the config file **while UltiDash is running**. What the
+  latch cannot cover is a rename that had **already happened** at the first load: boot the
+  radio with the craft powered and the model is wearing the craft's name before UltiDash ever
+  reads it. The lookup by name then misses — and used to create a second config under the
+  craft name, so one machine owned two files and settings landed in whichever one that boot
+  had picked.
+  - **Since 0.7.1 the file is found by NAME and identified by MODEL FILE.** Every save stamps
+    the config with the model file it belongs to (`ModelFile=model7`). When the lookup by name
+    misses, UltiDash scans `cfg/` for the config carrying this model's stamp and uses **that
+    one in place** — read *and* written for the rest of the session, not copied, since a copy
+    would only postpone the split by one save. `menu ▸ Status` names the file in force (§3).
+  - **The stamp is written from 0.7.1 onwards.** A config last saved by an earlier version
+    carries none, so that model is protected from its **next save** on, not retroactively.
+  - **If the file found by name carries another model's stamp** — two models sharing a name,
+    or a rename caught mid-flight — **the name wins**. It is what you see on the radio and
+    what every earlier session used; the contradiction is reported on the Status page rather
+    than repaired behind your back.
 - **One file per model, and no second level.** *Config file per craft*
   (`cfg_m_<model>_<craft>.cfg`) was **removed in 0.7.0**. Its `<craft>` half was the model
   name as it read at that moment, so it only ever split anything while Rotorflight was
@@ -840,6 +874,11 @@ detail in flight without losing callouts.
   cannot know it at runtime, so the build tooling writes it onto the card as an extra
   `WIDGETS/UltiDash/build.lua`; a `+` after it means the build came from an uncommitted
   working tree. **A release card has no such file** and the row shows the version alone.
+  Under it, a **Config file** row names the `cfg_m_*.cfg` this radio is actually reading and
+  writing — the question §2.8 leaves open once a connected craft can rename the model. Two
+  markers may follow the file name: **(found)** means the lookup by name missed and this file
+  was located by its model-file stamp, i.e. the model is wearing a craft name right now;
+  **(! model7)** means the file found by name says it belongs to another model.
 - **Battery** (tap the gauge): a **cell-voltage scale** with the active crit/low/full
   thresholds marked (and whether they come from FC or manual), then the battery in the
   dashboard segment look with % and used mAh inside it, and a Batt / Cell-min / Reserve
@@ -1240,7 +1279,10 @@ IO, no heap growth).
   kB — the same metrics as the Status footer, but always visible (handy for watching load while
   flying or stress-testing the Log Viewer). Bottom-left so it covers neither the menu glyph
   (top-left) nor the Log Viewer's zoom/pan buttons (top-right). Nothing is drawn when the
-  option is off.
+  option is off. **It has its own switch** — *Settings ▸ General ▸ Show perf overlay*
+  (default **on**) — so the log can run without the strip: the two used to be one setting,
+  and wanting the file for a flight or a bug report meant accepting the strip over the
+  layout. Off there leaves the logging untouched.
 - **Files:** rotating session files `/WIDGETS/UltiDash/logs/debug_NN.log` (read them from
   the PC at `<card>:\WIDGETS\UltiDash\logs\debug_NN.log`). **Debug log: sessions kept** (1–50,
   default 20) sets how many are retained; a tiny `debug_seq.txt` drives the round-robin

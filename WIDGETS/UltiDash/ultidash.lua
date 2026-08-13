@@ -2880,6 +2880,30 @@ local function version_text()
     return version_str
 end
 
+-- The cfg file in force, file name only -- the directory is fixed and the row is narrow.
+-- Read through the settings module rather than rebuilt here: `target_path` is already
+-- "the file a save would land in RIGHT NOW", which is exactly the question being asked.
+local cfg_file_str = nil
+local function cfg_file_text()
+    if cfg_file_str ~= nil then return cfg_file_str end
+    local ok, p = pcall(ultidash_settings.target_path)
+    -- string.match, NOT p:match -- the widget Lua state has no string metatable, so method
+    -- syntax raises "attempt to index a string value" and takes the dashboard down with it.
+    cfg_file_str = (ok and type(p) == "string" and string.match(p, "([^/]+)$")) or "?"
+    -- ...plus WHY it is this file, when it is not simply the model's name. Two states,
+    -- and they mean opposite things, so they never share a marker:
+    --   (found)   the name lookup missed and this cfg was located by its ModelFile stamp
+    --             -- i.e. the model is wearing a craft name right now.
+    --   (! <slot>) this file says it belongs to another model file. The name won; the
+    --             contradiction is shown rather than silently resolved.
+    local ok2, resolved, conflict = pcall(ultidash_settings.key_state)
+    if ok2 then
+        if conflict ~= nil then cfg_file_str = cfg_file_str .. "  (! " .. tostring(conflict) .. ")"
+        elseif resolved then cfg_file_str = cfg_file_str .. "  (found)" end
+    end
+    return cfg_file_str
+end
+
 local function build_status_view(wgt, zone)
     local w = zone.w
     local h = zone.h
@@ -2937,6 +2961,16 @@ local function build_status_view(wgt, zone)
         -- running" was unanswerable without pulling the card. A plain string: neither the
         -- version nor the build reference can change while the widget runs.
         { lbl = "Version", val = version_text() },
+        -- WHICH cfg file this radio is actually reading and writing, by name. The key is
+        -- the model name LATCHED AT BOOT (ultidashSettings model_key), and a connected
+        -- craft renames the EdgeTX model underneath us -- Rotorflight's own RF2 background
+        -- script does it and puts the name back on disconnect. So one helicopter can own
+        -- two cfg files, and which one is in force depends on whether the craft was
+        -- powered when the radio booted. That was invisible until now: a user looking at
+        -- settings they did not make had nothing on screen to explain it (2026-08-13).
+        -- Static like Version: the latch cannot move without a model switch, and a model
+        -- switch rebuilds this page anyway.
+        { lbl = "Config file", val = cfg_file_text() },
         { lbl = "Model / link", val = memo(
             function() return shared.ready, shared.model_name, shared.connected end,
             function()
@@ -3464,6 +3498,14 @@ local SETTINGS_TELE_DETAIL = {
 local SETTINGS_GENERAL = {
     { key = "DebugLog",    lbl = "Debug log to SD card",  kind = "bool", def = 0 },
     { key = "DebugKeep",   lbl = "Debug log: sessions kept", kind = "num", def = 20, min = 1, max = 50, step = 1, big = 5 },
+    -- The on-screen half of the debug mode, separated from the logging half. Default ON, so
+    -- switching the log on behaves exactly as it always did; what is new is that a session
+    -- that wants the LOG (a flight, a screenshot, a bug report someone else will read) can
+    -- have it without the strip sitting over the layout. Dimmed rather than hidden while the
+    -- log is off, because the row is meaningless then and disappearing rows move every row
+    -- under them.
+    { key = "DbgOvl",      lbl = "Show perf overlay",     kind = "bool", def = 1,
+      dim = function(w) return (w.DebugLog or 0) ~= 1 end },
     -- Flight log / battery management (Toolbox "Flight Log" shows the data;
     -- batteries are defined in fltlog/batteries.cfg, edited on the PC)
     { kind = "section", lbl = "Flight log" },
@@ -4112,6 +4154,25 @@ end
 -- Toolbox tool. Edge/hold triggered — never fights manual navigation (open/close only
 -- act on the exact page THIS binding controls).
 
+-- Is THIS target the page currently showing? The predicate `shortcut.close` decides by
+-- and the toggle slot resyncs its stage against (see shortcut.run). Identity, not
+-- provenance: a page of the same id opened by another route counts as up.
+function shortcut.is_up(wgt, tgt)
+    if tgt == nil then return false end
+    if tgt.kind == "detail" then return wgt.detail_view == tgt.id end
+    if tgt.kind == "tool"   then return wgt.menu_view == tgt.id end
+    return false
+end
+
+-- Arm the ~2 s "needs full screen" banner on the dashboard (add_dashboard_overlays).
+-- The fullscreen gate below is the one refusal a user cannot see the reason for: the
+-- menu glyph does not exist in a layout zone, so there is nothing on screen to connect
+-- the dead switch to. Every OTHER refusal here is either visible (a page is already up)
+-- or has its own hint (the disarmed-only one, in the Toolbox page).
+local function shortcut_fs_hint(wgt)
+    wgt.sc_fs_hint = (getTime() or 0) + 200
+end
+
 -- Is a tool target actually available right now (module present / loadable)?
 function shortcut.tool_ready(tgt)
     if tgt.id == "tb_adjmap" then return tb_load_adjmap() ~= nil end
@@ -4133,7 +4194,9 @@ function shortcut.open(wgt, tgt)
         -- the page renders into a box whose close hint ("tap anywhere") is dead, because a
         -- widget zone gets no touch. The menu-glyph and tap routes cannot reach this state
         -- at all -- both are fullscreen-only -- so a shortcut was the one way in.
-        if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then return false end
+        if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then
+            shortcut_fs_hint(wgt); return false
+        end
         -- nothing to open when the module did not load (see detail_load). Read off the
         -- instance, not off the module local: that local is declared further down the file
         -- and would be a global -- i.e. always nil -- from here.
@@ -4160,7 +4223,9 @@ function shortcut.open(wgt, tgt)
     -- then closes. The menu path can't hit this (the menu glyph is fullscreen-only), so
     -- mirror that guarantee here. Gated BEFORE tool_ready so we don't even lazy-load the
     -- module while not fullscreen. A held position re-fires once the user is fullscreen.
-    if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then return false end
+    if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then
+        shortcut_fs_hint(wgt); return false
+    end
     -- view gate BEFORE tool_ready: tool_ready lazy-LOADS the module, so with a bound
     -- switch held while another page is open it would load logview/rf2cfg every 5 Hz
     -- pass just to have the open refused below — the module stayed resident (GC drag)
@@ -4260,6 +4325,18 @@ function shortcut.run(wgt)
             if (s.stage or 0) >= 1 and s.list then shortcut.close(wgt, s.list[s.stage]) end
             s.stage = 0; s.prev = nil; s.list = nil
         else
+            -- RESYNC before the edge is read. `s.stage` used to be reset ONLY by
+            -- shortcut.close, i.e. only by a press of THIS switch -- so RTN, a tap and the
+            -- arm-close each shut the page and left the counter standing. The next press
+            -- then meant "close what is already closed": with a one-option chain it stepped
+            -- past the end and opened NOTHING (every other flick dead), and with a longer
+            -- one it opened the option AFTER the page the user had just left. Reported from
+            -- the field as "the switch does not always open the Log Viewer", and reproduced
+            -- under measurement. Cheap: two table reads on a slot that is not at stage 0.
+            if (s.stage or 0) >= 1
+                and not shortcut.is_up(wgt, s.list and s.list[s.stage]) then
+                s.stage = 0
+            end
             local on = ultidash_functions.swpos_active(sw)
             if s.prev == nil then
                 -- first evaluation of this slot: SEED the edge detector without firing.
@@ -4307,6 +4384,12 @@ local function add_warn_banner(panel, w, y, text, visible_fn)
     })
 end
 
+-- Reactive visibility for the "a shortcut was refused because we are not full screen"
+-- banner (~2 s, armed in shortcut_fs_hint). Unlike the three below it this one is about a
+-- state the LAYOUT ZONE is in, which is exactly where the user has no menu glyph to ask.
+local function sc_fs_hint_visible(wgt)
+    return function() return (wgt.sc_fs_hint or 0) > (getTime() or 0) end
+end
 -- Reactive visibility for the SD-write-failed warning banner (sticky ~10 s after a failed
 -- settings save/reset; see save_pending_settings / reset_defaults).
 local function save_failed_visible(wgt)
@@ -5100,6 +5183,20 @@ local function add_dashboard_overlays(main_panel, wgt, w, h, y_content, with_set
         add_warn_banner(main_panel, w, y_content + 2 + 2 * (measure_font(STDSIZE) + 6),
             "Skin '" .. tostring(wgt.options.Skin) .. "' failed - using default", skin_bad)
     end
+    -- A switch shortcut was thrown while the widget is NOT in EdgeTX's Full screen, where a
+    -- tool/detail page cannot be built at all. Always built and reactive like the first two
+    -- banners rather than conditional like the one above: its state DOES change without a
+    -- rebuild -- that is the whole point, the switch is thrown while the dashboard stands --
+    -- and arming it through a rebuild would redraw the dashboard twice a second under a HELD
+    -- position slot. A fourth distinct y so no two of them overlap -- but CLAMPED into the
+    -- panel, which the three above are not: a layout zone is exactly where this one has to
+    -- be readable, and a zone is short. Off the bottom it would be clipped rather than
+    -- error, i.e. it would fail in the one state it exists for. Overlapping the (rare,
+    -- persistent) skin-failed banner on a short zone is the better of the two.
+    local bh = measure_font(STDSIZE) + 4
+    add_warn_banner(main_panel, w,
+        math.min(y_content + 2 + 3 * (measure_font(STDSIZE) + 6), h - bh - 2),
+        "Shortcut needs Full screen", sc_fs_hint_visible(wgt))
     -- hidden critical-alert overlay layer, LAST so it stacks on top (reactive visible
     -- only -- state lives in update_alert_overlay, tap-dismiss in refresh())
     ultidash_functions.add_alert_overlay(main_panel, wgt, w, h)
