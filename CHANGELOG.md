@@ -2,6 +2,614 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.8.0 — 2026-08-24
+
+### Added
+
+- **A second MSP provider: RFSuite's service, experimental.** Everything UltiDash reads from
+  the flight controller — battery profile and config, governor, lifetime stats, telemetry
+  config, SmartFuel, ESC protocol, the adjustment table, and the one write (the
+  battery-profile switch) — can now come from **RFSuite for EdgeTX** instead of RFTool, over
+  that suite's published **MSP service** (`rfsuite.msp`, consumer contract v1). It fills the
+  same rows from the same MSP commands, so no page, skin or callout knows or cares which
+  provider answered. **RFTool still wins when both are loaded**, by decision: the radio has
+  one CRSF transmit slot and two MSP clients pushing into it lose each other's replies.
+  A new **menu ▸ Status ▸ MSP provider** row names who is serving, and tells *present* from
+  *active* — a published service that nobody is driving reads **(idle)**, which is the one
+  state in which the flight-controller rows stay empty and nothing else looks wrong.
+  **The costs are deliberate and small.** The detection is two table reads per pass; the back
+  end (`ultidashRfs.lua`) is loaded only on a card where the service is actually published,
+  so a card with RFTool — or with neither — pays nothing for it. UltiDash does not *pump*
+  that suite's link (pumping ticks its MSP runtime alone, so no sensors and no session fill)
+  and does not touch anything on `_G.rfsuite` beyond the contract, which is why the MSP
+  replies are decoded here rather than through RFSuite's own parsers. Reply callbacks park
+  the bytes and return: they run inside a foreign widget's instruction budget, and the decode
+  belongs in ours.
+  **Untested against a flight controller** — no card has yet carried both this and the
+  service, so treat it as experimental and keep RFTool installed for the proven path.
+
+- **The Rotorflight *RFSuite for EdgeTX* suite opens from the Toolbox.** A new
+  **Toolbox ▸ RFSuite** page runs `rotorflight-lua-edgetx-suite` inside UltiDash's
+  fullscreen, exactly as *RF2 Config* has run the classic `rotorflight-lua-scripts` tool:
+  nothing is copied, the suite loads from `/SCRIPTS/TOOLS/rfsuite-core/` on the card, so the
+  install decides the version. **Entirely optional and additive** — RFSuite does not replace
+  the RF Tool widget, which is still what UltiDash reads the flight controller through, and a
+  card without RFSuite shows a page explaining what is missing and where it goes rather than
+  an error. Disarmed-only like the other flight-controller pages, force-closed on arming, and
+  bindable to a switch shortcut (*Toolbox: RFSuite*, appended to the shortcut list so no
+  existing binding moves). While the page is open UltiDash stops RF Tool's MSP queue, so only
+  one client talks to the craft.
+  **Marked as experimental in the widget itself, not only here.** The Toolbox tile reads
+  **RFSuite (exp.)** (the shortcut entry likewise), and tapping it opens a warning page —
+  *HIGHLY EXPERIMENTAL*, the three effects below it, and an **Open anyway** button — before
+  the suite is loaded. The page stands in front because it is the last screen UltiDash owns:
+  from the first pass on, RFSuite paints the whole screen itself and no marker of ours can
+  survive there. It is shown on every open (there is no "don't ask again" setting), RTN goes
+  back to the Toolbox, and a card without RFSuite still gets the *not installed* page instead.
+  **Two limits, both from how EdgeTX runs Lua and neither a fault of either project.** A
+  widget gets 20 000 instructions per call and is killed at that point, while a standalone
+  Tools script is suspended and resumed with no such ceiling — and RFSuite's pages are
+  written for the second. UltiDash therefore treats a budget kill as a normal event and
+  retries instead of closing the tool, which is what lets a page finish across several
+  passes; but a kill landing inside RFSuite's own redraw loses that redraw and leaves the
+  page **blank** until it is reopened, and EdgeTX may print its own *“Error in widget
+  UltiDash widget function: CPU limit”* line — cosmetic, the next pass has a fresh budget,
+  and it cannot be suppressed from Lua because EdgeTX resets that counter only when a call
+  begins. RTN always works. And the suite's module graph costs
+  about 0,7 MB of the shared widget Lua state while open, of which closing returns roughly
+  two thirds. Running RFSuite from EdgeTX's own Tools menu is unaffected by both.
+
+- **The craft target is declared, not assumed.** UltiDash gains one **EdgeTX widget option**,
+  *Craft target*, set in the widget-settings dialog where the widget is placed. The list has a
+  single entry — **Rotorflight** — because that is the only craft firmware UltiDash realises;
+  the point is that the widget now says which firmware it reads instead of taking it for
+  granted, and only loads the Rotorflight machinery for a Rotorflight craft.
+  **Existing placements keep working and need no action.** A widget placed under 0.7.x has no
+  stored value for an option that did not exist then; EdgeTX reports it as an out-of-range `0`
+  and the widget reads that as *Rotorflight*. Nothing is announced, nothing is reset, no
+  setting moves, and the dialog simply shows *Rotorflight* the next time you open it. Any
+  unrecognised value — a hand-edited model file, or one written by a later UltiDash offering
+  more entries — falls back to *Rotorflight* the same way, and a stray `Target=` line in a
+  per-model `cfg_m_*.cfg` is ignored (the dialog owns this one, not the settings store).
+  Alongside it, the widget **cross-checks** the declared target against the sensors it
+  actually resolved: with the link up, sensors present, the resolver's index base derived and
+  **no** Rotorflight sensor recognised, *Sensor check* and **menu ▸ Status** report *"no
+  Rotorflight sensors found"*. It reports the observation, not a diagnosis — a model whose
+  sensors were renamed away from their Rotorflight IDs looks the same from here — and all
+  those conditions must hold together, so a cold radio or a powered-down craft never triggers
+  it.
+
+- **Batteries are managed on the radio.** `fltlog/batteries.cfg` no longer needs a PC:
+  packs can be **created, edited and deleted** from the Flight Log's *Batteries* tab (tap
+  a pack → detail page with **Edit** / **Delete**; **+ New** in the header) — and created
+  right on the battery query page (**+ New battery**, below *No battery / skip*), for the
+  moment an unknown pack is plugged in at the field: the form opens with *models* preset
+  to the connected craft, and after Save the pick list reloads with the new pack
+  selectable. Editable fields: id (unique, charset-checked, prefilled with the smallest
+  free number), name, capacity, models (all / multi-select over the names seen in the
+  flight log plus free text), FC profile and cycles (for stocking a used pack); `last`
+  stays widget-maintained. The editor performs **line surgery** — only the edited pack's
+  line is rewritten, atomically; comments, unknown fields and every other line stay
+  byte-identical, so a hand-maintained file survives radio edits. Renaming an id never
+  rewrites `flights.csv` (the editor warns with the flight count instead), deleting asks
+  first and names the pack's logged flights, and a registry beyond 64 KiB is refused for
+  editing with a visible message. Everything is disarmed-only; arming discards an open
+  form unwritten.
+- **The Flight Log looks like the rest of the Toolbox.** The page drops the stock
+  `lvgl.page` chrome for the detail-page style the other tools already use: own header
+  with the three tabs as **chips**, palette-matched colours in both schemes, and a `>`
+  chevron on every tappable row — a tap is never dead again: Flights rows open the
+  per-flight stats detail (as before, now in the same style), **Batteries rows open the
+  pack's detail page**, and **Models rows filter the Flights tab to that model** — a
+  `Model: … x` header chip shows the filter (tap or RTN clears it) and the footer counts
+  `N of M flights` with the filtered total time. The footer pager stays as it was.
+
+- **The statistics page opens on a tap.** Tapping the flight view's **status panel** (the
+  card that already shows the flight counter and total time) opens the statistics page on
+  demand, disarmed only — and it works with *Stats page* set to **Never** too: that setting
+  governs the automatic route, a deliberate tap is your own. The X closes it as usual.
+- **The menu on a switch.** A new shortcut target *Page: Menu / settings* opens the
+  settings hub — under exactly the menu glyph's own armed rule (refused only while
+  genuinely flying), shared with the glyph rather than copied, so the two can never drift.
+- **A Live Monitor: up to four sensors as live curves, in flight.** A new Toolbox tool
+  (*Toolbox ▸ Logs ▸ Live Monitor*, also a shortcut target) draws the last **15 / 30 / 60
+  seconds** of up to four freely picked sensors as stacked strips — after a manoeuvre one
+  glance answers *how deep did the headspeed sag, how high did the current spike, how fast
+  did it recover*, without a PC and without waiting for the flight's log. Every reading the
+  radio sees is kept as a 0.2 s **min/max band**, so a one-frame spike cannot fall between
+  samples; the recorder runs whether the page is open or not, and a thin marker shows where
+  you armed. Like the adjustment tools the page **works while armed** and never self-closes —
+  and it reads EdgeTX telemetry only, no MSP. Sensors and the default window under
+  *Settings ▸ Telemetry ▸ Live monitor*; with none configured the feature costs nothing.
+  Two honest limits, stated rather than discovered: a peak shorter than the sensor's own
+  telemetry interval never reaches the radio, and sampling is coarser while another screen
+  is shown.
+- **The menus have icons.** Every tile in the menu hub and the Settings menu carries a glyph
+  beside its label, and every menu page opens with **the same glyph in its header** — so a page
+  says where you are before you read a word of it. The set is 22 small PNGs under
+  `WIDGETS/UltiDash/img/`, single-colour line art drawn for a radio screen: on the header they
+  are tinted with the theme colour, on a tile they are drawn as-is and shrink on the narrow
+  radios. They install like everything else — **they ride in the main `UltiDash-v0.8.0.zip`**,
+  and neither voice download changes (the German pack is still `SOUNDS/de/` and nothing else).
+  A missing icon file costs its tile the picture and nothing more: the label is then drawn on
+  its own, and no page fails over an image.
+- **And every menu page says where it sits.** The header title is **UltiDash** on every page of
+  the menu tree, and the line under it carries the **whole path** rather than the last step of
+  it: *Settings > Display* on a group page, *Settings > Alerts* on the alert list and *Settings >
+  Alerts > Voltage* on one alert, *Settings > Colors > UltiDash dark*, *Settings > Telemetry >
+  Tele Main*, and *Diagnostics > Status* · *Diagnostics > ELRS Status* · *Diagnostics > Sensor
+  check* for the three read-out pages. Before, a leaf page put its own name in the title and only
+  half the path underneath, so two levels of the tree looked alike; now one line answers it. The
+  tool pages and the battery pickers are not part of that tree and keep their own titles.
+- **The whole settings menu is on one screen.** All 13 groups now fit without scrolling on the
+  TX16S MK3 and the TX15, in a 3-column grid of icon tiles under the four section headings
+  *Appearance* · *Battery & limits* · *Sound & callouts* · *System* — with **taller rows than
+  before** (55 px on the MK3), not smaller ones. What paid for it: headings that sit tight
+  instead of reserving a lead-in, and the **whole-model *Reset to defaults*, which is no longer
+  a button under the grid but the last row of the *General* group** (same confirmation, and it
+  now also drops the page's unsaved edits before returning to the settings menu, so nothing can
+  be autosaved back over the fresh defaults). The 480×272 MK2 still scrolls by about one row.
+- **The menu hub says which pages are which.** Two columns of icon tiles: **Settings** and
+  **Toolbox** — the two things you do — then a **‹ Diagnostics ›** heading over **Status**,
+  **ELRS Status** and **Sensor check**, the three pages that only read something out. No page
+  moved and nothing costs an extra tap; the heading is what tells the three apart from the two.
+- **The alerts list is a list of cards.** One card per alert instead of a two-column tile grid,
+  one column, and the list scrolls. The name is on the first line; the second carries the
+  alert's state **as glyphs** — bell for on, struck bell for off, the loop with its count and
+  interval (`3x 5s`, `inf 5s` for *until cleared*), the vibration mark, and the escalation and
+  overlay marks where those are switched on — beside **the values the alert is actually working
+  with**, read from the very settings it reads at runtime, so the card cannot disagree with the
+  behaviour. Two of them say why there is no number of yours to show: *Cell check* reads
+  *"thresholds from FC config"* unless *Cell thresholds from* is set to *Manual*, *ESC load*
+  reads *"monitoring off"* until its monitor and its limit GVAR are both set up. **The `+R +E +V +O` markers and the legend row
+  under the grid are gone** — the glyphs are the legend, and the numbers that used to be one
+  page deeper are now on the card. An alert that is off dims its card but still opens it: its
+  page is where it gets switched back on.
+- **Pages that belong together can be paged through — with the encoder too.** The eight plain
+  settings groups, the 13 alert pages and the *Colors*, *Telemetry*, *Voice* and *Shortcuts*
+  pages gained two routes between siblings. In the header, **‹ ›** arrows step one page and
+  **grey out at the ends** of the set. At the top of the page body, an **icon strip** shows one
+  cell per sibling with the current one highlighted: tap a cell to jump straight there, or turn
+  the **rotary encoder** onto it and press. The strip is not decoration for touch users — EdgeTX
+  offers the header arrows to touch only, so the strip is the encoder's *only* way across. It
+  lives in the scrolling body, which means it scrolls away with the content and comes back by
+  itself the moment encoder focus reaches it again. Where a whole set shares one glyph (the 13
+  alert pages, the three Telemetry pages) it works as a position indicator and still jumps.
+- **The Log Viewer is now in the EdgeTX Tools menu too** — **SYS ▸ Apps ▸ UltiDash Log
+  Viewer**, without going through the dashboard. It is the same viewer on the same file with
+  the same templates; the menu entry is only a launcher for the installed module, so there is
+  no second version to keep in step. Two properties come from EdgeTX and are worth knowing:
+  while *any* Tools script runs the widget is suspended (no callouts, no flight-log capture),
+  and this entry has **no auto-close on arming** — opening it is your own decision and there
+  is no running widget left for a gate to protect. The Toolbox entry inside the widget is
+  unchanged. UltiDash has to be installed on the same card; without it the entry says so.
+
+- **The fullscreen overlay becomes a warning surface: the config warning overlay.** The red
+  fullscreen box that the Main-power-lost, Voltage and Telemetry alerts use now also carries **messages that are not alerts**. The
+  first one: the ExpressLRS module's link rate and telemetry ratio against what the flight
+  controller was told the link carries. It names both sides, what the difference *does*
+  (frames back up and read stale, or bandwidth the link has and the FC never uses), and the
+  two values to set. Until now that verdict existed only for somebody who went looking on
+  *menu ▸ Diagnostics ▸ ELRS Status*. Disarmed only, lowest priority in the box, once per
+  link connect, a tap dismisses it. Switch: *Alerts ▸ Voice / mute ▸ Config warning overlay*
+  (default on).
+- **The overlay closes with an X, and only with an X.** The alert overlays and the new config
+  warning both carry an X in the box's top-right corner; a tap anywhere else on the box is
+  swallowed and does nothing. The tap-anywhere it replaces was invisible and turned every
+  mis-tap into a close — which on a message meant to be read throws it away before it has
+  been. Same change, and the same reasoning, as the detail pages earlier in 0.8.0.
+  *Overlay auto-close* is unchanged.
+- **A *Commit* row on the ELRS Status page**, beside *Firmware*.
+- **A *Link rate* row on the ELRS Status page** — the packets per second the verdict actually
+  used, beside the packet-rate name the module displays. They differ on DVDA rates, and that
+  difference is the whole point of the row.
+- ***Telem ratio = Off* is reported** as its own verdict (`TELEM OFF`) instead of being folded
+  into the rate comparison. It takes every value on the dashboard away, so it is not a
+  mismatch — it is the answer to "why is everything blank".
+
+- **The second menu level gets its own icons.** *Toolbox*, the *Colors* list and the
+  *Telemetry* / *Voice* / *Shortcuts* lists drew plain text tiles, and every page below them
+  wore its parent's glyph in the header and in the sibling strip. Seventeen new glyphs close
+  that: one per Toolbox tile, one per colour scheme, one per group page. The sibling strip on
+  those pages therefore stops being a row of position dots and becomes a map that can be read.
+  Two reuses are deliberate — *Live monitor* wears the same glyph in the Telemetry list and in
+  the Toolbox, and a skin-supplied colour scheme that ships no artwork of its own falls back to
+  the glyph of the *Skin* group. The thirteen alert pages keep their shared bell, as designed.
+
+- **The read-only pages can be driven with the ENCODER.** *Status*, *ELRS Status* and *Sensor
+  check* were built from labels alone, and a page of labels has nothing an LVGL widget's rotary
+  can move to — so those pages scrolled by finger and by nothing else, which put the newest
+  ELRS rows permanently under the fold on a radio being flown with gloves. Every section head
+  and each page's closing line is now a focus stop: turning the encoder walks them and the page
+  scrolls itself. The stops do nothing when pressed. *The Toolbox tools are unchanged and stay
+  touch-driven — they draw their own controls on purpose, and a focusable one would stand in
+  front of the long-RTN exit.*
+
+### Fixed
+
+- **The Log Viewer opened from EdgeTX's own Tools menu wore the wrong colours, and drew the
+  wrong curves on top of them.** That entry has no widget behind it, so it fell back to the
+  module's built-in dark palette — black with a cyan accent, the look the in-widget tools were
+  deliberately moved off — and the chart then chose its curve set from a palette flag that
+  fallback does not set, so the *light* curves (deep blue, dark red) were drawn on the black
+  background. It now takes a mono palette derived from the **radio's own theme**, which needs
+  no model configuration, and the curve set follows the same judgement. Consequence worth
+  knowing: this entry follows the radio theme while the same viewer inside the widget follows
+  the UltiDash colour scheme — the two look different on purpose. The Toolbox *sunlight* option
+  has no meaning in this entry and the radio's light theme replaces it.
+- **The in-widget Log Viewer and Live Monitor drew light curves on a dark chart** for anyone on
+  colour scheme *EdgeTX theme* with a dark radio theme: that scheme's toolbox palette never
+  said whether it was dark, although the widget works the answer out one function earlier.
+
+- **The ELRS *Firmware* row showed a bare commit hash instead of a version.** ExpressLRS
+  registers the field as `{version_domain, CRSF_INFO}, commit`: the **name** carries the
+  version and the frequency domain (`4.1.0 ISM2G4`), the **value** is only the short build
+  commit. UltiDash read the value. Both halves are now kept, as *Firmware* and *Commit*. The
+  offline decoder test had the two the wrong way round as well, which is what let it ship.
+- **The ELRS mismatch verdict compared the wrong thing.** It held packet rate and telemetry
+  ratio against the FC's pair for **equality**. The flight controller only ever sees the
+  quotient — it refills a token bucket at `rate ÷ ratio` slots per second — so a module on
+  500 Hz 1:16 against an FC told 250 / 1:8 is exactly right and was being reported as a
+  mismatch. The comparison is now the slot rate, cross-multiplied so it stays exact.
+- **DVDA packet rates were read off their name, which is not their rate.** `D500` and
+  `D250` repeat every packet and keep a 1000 µs interval — the link runs at **1000 Hz** in
+  both cases — and 900 MHz `D50Hz` runs at **200 Hz**. `D500`, `D250`, `F500` and `F1000`
+  carry no `"Hz"` at all, so the old parser returned nothing and the page stayed silent on
+  precisely the modules that have those rates; `D50Hz` parsed as 50 and gave a confidently
+  wrong verdict. A rate name the widget does not know now reads `-` and produces **no**
+  verdict rather than a guess.
+- **The Live Monitor's curves are legible on a light colour scheme, and thick enough to
+  see.** Three faults, all in how the page drew rather than in what it recorded. The curve
+  colours were chosen from the *Toolbox sunlight mode* switch alone, while the background
+  comes from the active colour scheme — so on the **shipped light scheme** the page drew the
+  bright set meant for a dark background: cyan and, far worse, yellow on near-white. Measured
+  on the simulator, the current strip was 791 pixels of pure yellow that could not be seen at
+  a glance. The set now follows the scheme, exactly as the Log Viewer's curves already did.
+  The curves were also a hairline **1 px on every radio**, where the Log Viewer has long
+  drawn 2 px above 300 px of screen height; they now do the same, so the two curve pages
+  finally agree. And the **arm marker** — the vertical line naming where you armed — was one
+  full-height line drawn straight through every strip's label text; it is now one segment per
+  strip, standing in the curve area only, and the same weight as the curves.
+- **The menu grids now budget against the real page header height.** The grid builder
+  reserved a flat 56 px for the EdgeTX page header, which is right on no radio — the header
+  is 62 px on the MK3 and 45 px on both 480-wide radios. The MK3 left 6 px of body unused;
+  the TX15 and MK2 gave away 11 px each. Visible effects: the TX15 Toolbox menu stops
+  scrolling, the TX15 hub keeps its full row height, and a menu grid no longer paints 2 px
+  into whatever sits under it (the MK3 Alerts grid over its legend row was the case that
+  showed it — that list has since become the card list described above).
+- **No more "2 Dashboard instances active!" after switching models.** Changing the radio's
+  model raised the dual-instance banner for about five seconds on a model that places exactly
+  **one** dashboard. Every widget on a colour radio shares one Lua state, and that state is
+  built once per boot and is *not* reset by a model change — so the freshly created instance
+  still found the destroyed one's registration and read it as a second live dashboard. The
+  test is now "I was the publisher and something displaced me" rather than "somebody else is
+  the publisher": only a genuinely live second instance can displace one, and a destroyed one
+  never publishes again. **Two placed dashboards are still detected and still warn**, one
+  publish cycle (~200 ms) later than before, against a banner that stays up for five seconds
+  anyway.
+- **Flight counter and total time now share one font and one baseline** in the flight
+  view's status panel. The two fonts were picked independently against the same height,
+  so the narrower "Flights" sample regularly came out a size larger and the pair sat
+  visibly unaligned ("passt nicht ganz ins Bild") — on all three radios.
+- **No more EdgeTX background flashing through while a page loads.** The staged page opens
+  that keep the widget under the CPU limit leave the LVGL tree empty for 2–3 frames, and
+  what showed through was whatever EdgeTX painted behind the widget. A filled rectangle in
+  the widget's own background colour now stands under every rebuild, so the gap shows
+  UltiDash's background instead.
+- **The startup cell-check is no longer silenced by the FC-served adjust table.** With
+  *Adj table from* set to a flight-controller source, that read shares one MSP queue with
+  the connect reads and holds it for some 4–5 s — but it was issued **first**, so the
+  battery configuration (cell count, full-cell voltage) landed behind it, after the check
+  had already concluded. Without a per-cell value the check takes its "no reading" verdict:
+  the bar goes amber and **nothing is spoken**. Two changes, either of which would have been
+  enough: the adjust-table read now queues **behind** the connect reads, and the check now
+  defers its verdict while no per-cell value exists at all — under the same 30 s ceiling
+  that already covered a carried-over reading, so a pack that genuinely never reports still
+  reaches its warning. Reported from the radio on the first evening the FC source was used.
+- **The bank announcement no longer chains on fast selector changes.** In the adjustment
+  tools, *Announce bank (voice)* spoke every position the Config channel passed through, and
+  since EdgeTX offers Lua no way to flush the sound queue, a sweep from bank 1 to bank 6
+  queued six announcements that were still playing long after the knob had stopped. A bank
+  now has to hold **0.3 s** before it is spoken and two announcements stay at least **1.5 s**
+  apart, so a sweep announces its destination and nothing else. A single ordinary change is
+  unaffected. (The option itself was always there — *Settings ▸ Toolbox ▸ Announce bank
+  (voice)*, on by default.)
+
+- **A spoken telemetry report, on your own switch.** Bind a shortcut slot (position or
+  toggle) to the new target *Voice: Telemetry report* and the radio reads out up to eight
+  sensors of your choice, **in the order you configured** (*Settings ▸ Voice ▸ Telemetry
+  report*). A press speaks one report; a **held** position switch repeats it at a
+  configurable interval (10–120 s). It may speak **in flight** — a warning always wins:
+  configurable per setting, the report either stops or stands back and resumes. The default
+  speaks **value and unit** through EdgeTX's own voice and needs no sound files; speaking
+  the **sensor names** is an opt-in that reads `s_<sensor>.wav` files per language, and a
+  missing file falls back to value-and-unit rather than silence — a new Status row
+  (*Report name wavs*) counts the coverage, because that fallback would otherwise make an
+  incomplete set inaudible by design. **The recordings ship for the whole sensor
+  catalogue** — 62 clips per language, English and German, in the same two voices as the
+  governor callouts. A spoken name costs ~1.8 s (EN) / ~1.9 s (DE), so a report with names
+  on runs roughly twice as long as the value-only default: raise *Repeat (switch held)*
+  accordingly if you drive it from a held switch.
+
+- **The Toolbox adjust tools can take their table from the flight controller.** A new
+  *Settings ▸ Toolbox ▸ Adj table from* option: **Manual** (the built-in table +
+  `labels.lua`, unchanged), **Flight controller**, or **FC + labels.lua** (the craft's
+  table with your renames on top). With an FC source selected, UltiDash reads the craft's
+  own `adjfunc` configuration once per connect — only then, never on opening a page, and
+  never while armed — and the Map and Editor rebuild from it: the cells show what *your*
+  craft binds where, named from a built-in table of all 83 adjustment functions. The
+  **bank now comes from the FC's real enable windows** instead of an even six-way split:
+  the standard layout leaves five dead gaps between banks, and a selector sitting in one
+  now reads **`Pos -`** instead of a wrong bank — the boundary error near every window
+  edge goes with it. A cell the editor's GVAR pulse cannot reach (adjust channel ≠ the
+  configured Value channel) keeps its name and loses its `[-]`/`[+]`. A new **Status row
+  (*Adjust table*)** names the source actually in force, because a failed or not-yet-run
+  read falls back to the manual table rather than showing an empty grid.
+- **The Adjust Editor picks the name column's font by width, not only by row height.**
+  On the 480 px radios with the ranges hint on, the name column is 123 px and MIDSIZE
+  never fit it — 10 of the 31 shipping names clipped (`Pitch P Gain` among them). The
+  build now measures the actual cell texts and drops one font size when any would clip;
+  all 83 FC-table names fit the worst case that way.
+
+- **A new *ELRS Status* page reads the transmitter module's own settings** — packet rate,
+  telemetry ratio, antenna mode, switch and link mode, model match, power — none of which any
+  telemetry sensor carries. It is read out of the module over CRSF, the same parameter
+  conversation the stock ELRS tool script has, and it is held against what the **flight
+  controller** was told the link carries: the FC's rate and ratio are a declaration nothing
+  verifies, and they pace every telemetry frame it sends. Declared faster than the link
+  actually is and the FC schedules more than the link drains — telemetry that lags and goes
+  stale rather than missing. The page says **ok** or **MISMATCH**, and `-` when it cannot know.
+  **Experimental, and deliberately frugal:** every request to the module replaces one RC
+  channel frame, so the read happens **once per connect, disarmed only**, one request per
+  background pass, and aborts if the craft arms — keeping whatever it already read. Never on
+  opening the page. After the first radio round the walk got cheaper still: a field the page
+  does not show is dropped after the first chunk named it, and once everything else is in the
+  scan jumps straight to the last field (the firmware version) instead of walking the middle.
+  The **RF band** row appears only when the module registers the parameter (dual-band
+  hardware) instead of showing a `-` that reads like a failed read, and on ExpressLRS 4.x the
+  firmware manages the antenna mode itself, so what is shown is the effective value rather
+  than the one you picked.
+
+- **The Status page shows what the flight controller itself is set to.** A new *Flight
+  controller* section: the voltage and current **meter sources**, the FC's own
+  **consumption warning**, its **LVC** and **maximum cell voltage**, the **governor** mode
+  with its spool-up / start-up / handover figures and its throttle block, the craft's
+  **telemetry mode and slot count**, its **SmartFuel mode** and the **ESC protocol** it is
+  configured for. All of it is configuration — it cannot change while you fly, so it is read
+  once at connect and never appears on the dashboard, which is for things that move.
+  The FC's own fuel warning is there **to look at**: it is shown next to your own thresholds
+  and never drives a callout. Your callout thresholds stay yours.
+- **The sensor check knows which sensors your helicopter actually sends.** UltiDash now reads
+  the flight controller's own telemetry slot list. A sensor that exists on the radio but is
+  **not in that list** is marked **N/S** — *the FC does not send it* — instead of the green
+  *OK 0.0* it used to get. That zero was a leftover, not a reading, and it was worst exactly
+  where a zero is also a legitimate value: ESC faults, arming flags, governor state. A
+  required sensor in that state now counts in the summary line as well.
+  Two things it deliberately does not do: on a craft running **NATIVE** CRSF telemetry the
+  firmware ignores the slot list entirely, so nothing is claimed at all there; and the list is
+  read once per connect, so a telemetry setting changed **without** a reboot shows the previous
+  answer until the next connect.
+
+- **The Status page names the RFTool this radio carries.** A new *RFTool API* row, showing the
+  contract version the tool publishes (`1.00` today). It is there to answer *"why does this
+  install behave differently"* and nothing more: **no** feature is switched on or off by that
+  number. An RFTool that does not report it at all is a working 2.3.0-RC1 — the row says *not
+  reported* and everything keeps running, because locking that install out to enforce a version
+  string would break a setup that works today.
+
+- **A page can now come up by itself when you arm** — *Display ▸ Behaviour ▸ "Open page on
+  arming"*: pick one of the four detail pages and it opens on the arm, once, a moment later so
+  the view switch is out of the way. Close it like any other page and it stays closed until the
+  next arm; if you already had something else on screen, nothing happens. It is greyed out
+  while *Close detail pages on arm* is on, because that option re-closes any detail page for as
+  long as you are armed — the two cannot both hold, and this is the one that would have lost
+  silently.
+
+- **Five more ESC families are decoded, and one of them was a defect.** A Scorpion/Tribunus
+  **throttle error** used to read as *"Scorpion ESC OK"* — a fault reported as health, because
+  the one bit that carries it had no branch. New decoders: **ZTW** and **XDFly** (one protocol
+  with OMP since firmware 4.6.0 — same frame, different sync byte — plus ZTW's three extra
+  throttle bits), **APD**, **Graupner** and **Kontronik**, whose twenty-four flags are ranked
+  so the worst one is what you see. The four OpenYGE braking states are named instead of
+  showing a raw `Code x09`. All of it is taken from the bit layouts the flight-controller
+  firmware documents, and checked by an offline test — but no helicopter here runs a
+  Kontronik, an APD, a Graupner, a ZTW or an XDFly, so those five have never met a real ESC.
+
+### Documentation
+
+- **Every screenshot retaken, on the radio the widget is designed for.** The
+  [Illustrated Walkthrough](docs/WALKTHROUGH.md) and the README's two composed figures were
+  grabs from a build *before 0.7.0* at **480 × 320**, and the page carried two notices
+  listing what they no longer showed — the redesigned menu, the Skin settings group, the
+  Toolbox's newer entries, the extra Status rows. All of that is gone: the set is now
+  **800 × 480 from a TX16S MK3 running 0.8.0**, taken in one session, and the two notices
+  with it.
+- **They are one helicopter at one moment, not twenty unrelated screens.** The pictures were
+  taken against a real Rotorflight 4.6 flight controller configured as a 700-class machine on
+  12S with a YGE ESC, held at a single row of one real flight — so the craft name, the
+  governor labels, the battery profiles and the cell thresholds on the Battery page are the
+  firmware's own, the Log Viewer graphs that same flight, and the Flight Log lists it.
+- **The dashboard's annotated figure is drawn from the widget's own tap rectangles**
+  (`wgt.battery_rect`, `wgt.values_rect`, …) instead of by hand, so the six outlined zones
+  cannot sit where the panels are not. The showcase animation was rebuilt from the same set.
+- **What to do when *Discover new sensors* finds nothing.** Reported from the radio: adding
+  rows to a craft's `telemetry_sensors` and discovering again can produce no new sensor and no
+  error at all, because EdgeTX caps a model at **60 sensors** and then switches discovery off
+  by itself — silently, the *telemetry full* warning being compiled for the monochrome radios
+  only. The setup guide's sensor step and a new `docs/REFERENCE.md` §6.2 now name the symptom,
+  the two causes that cannot be told apart from the outside, the remedy (clear the Telemetry
+  page and let the whole list rebuild in one pass) and what a rebuild costs. The *Sensor check*
+  page's hint and the *not sent* paragraph point at it.
+- **The ELRS Status page is described rather than shown.** It reads the transmitter module's
+  own configuration, and the module is the one thing a simulator cannot supply — a figure
+  taken there would be a page of dashes.
+
+### Changed
+
+- **The German voice pack is a separate download.** The release now ships two zips:
+  **`UltiDash-v0.8.0.zip`** — the widget plus the English WAVs, everything the dashboard needs
+  — and **`UltiDash-v0.8.0-voice-de.zip`**, which carries `SOUNDS/de/ultidash/` and nothing
+  else. Nothing changed in the widget: *Voice language* still defaults to **English**, so the
+  main download is complete on its own. What made the split worth doing is this release's own
+  sensor-name recordings: with the whole catalogue spoken in both languages, the German half
+  is now about as large as everything else put together, and most people never switch to it.
+  **If you do set *Voice language* to Deutsch without the addon installed, the callouts go
+  silent** — EdgeTX ignores a WAV that is not there, so there is no error to see. Install the
+  addon, or switch back to English.
+
+- **Detail pages and the stats page now close through a visible button, and only through it.**
+  Until now a tap **anywhere** closed them: on the detail pages a grey *"tap to close"* label
+  said so and did nothing itself, and the stats page said nothing at all. Both now carry an
+  **X** — top-right on the detail pages, in the top bar on the stats page — and a tap that hits
+  nothing does nothing. Two things this buys beyond being visible: reading a page no longer
+  ends the moment you fumble a touch, and pages whose whole surface was one close button can
+  finally carry controls of their own. **RTN, a bound shortcut switch and *Close detail pages
+  on arm* are unchanged.** A layout skin cannot remove the button — where a skin draws its own
+  header, the host places one anyway.
+
+- **Diversity is two antennas, not a sentence — and the ELRS page says which mode the module
+  runs.** The footer spelled out *"Diversity: yes"* / *"Diversity: no"* beside *"Ant 1"* on a
+  page that is otherwise bars and colour. Both are now one **pair of antenna symbols** in the
+  shape of the icon set's own antenna: a filled head on a mast means that antenna is there, and
+  the one currently carrying the link (the `ANT` sensor) is **green and radiating** — a hollow,
+  dimmed second antenna means the receiver has only one.
+  Beside them the footer names the **antenna mode of the ExpressLRS transmitter module** —
+  *Gemini*, *Ant 1*, *Ant 2*, *Switch* — as the module itself reports it during the
+  once-per-connect configuration read; a module that has no such setting (any single-radio
+  2.4 GHz module) simply shows nothing there rather than a permanent dash. The session's
+  *RQ min* keeps the footer's left half and gets the freed width.
+
+- **The Toolbox menu is grouped by what a tool is for** — *Adjustments*, *Logs*, *Flight
+  controller* — and laid out in two columns where the screen is wide enough. The headings cost
+  a row each, which is exactly what the second column pays for: on a 480×272 MK2 the six tiles
+  in one column already ran off the bottom of the page. *Battery profile* is still always
+  present and dimmed rather than hidden, and the *"available only while disarmed"* line still
+  has its reserved space.
+
+- **Units beside values belong to the layout now.** Whether a unit is worth what it costs in
+  font size depends on the layout, so — like the colour scheme before it — the switch moved
+  into the **Skin** group, with each skin free to carry its own key and default. The host's own
+  row stays and now owns the **detail pages**, which are host-drawn: *Display ▸ Units on detail
+  pages*. Under the built-in UltiDash skin both are the same switch, exactly as before, and a
+  skin that declares no key of its own keeps following the host's — **nothing to migrate and no
+  stored setting moves.**
+
+- **The connection state now comes only from where a radio actually delivers it.** UltiDash used
+  to also read a field called `rfToolState` off the RFTool — a field no installable RFTool has
+  ever had, so on a radio that read never did anything, while in the test rig it was the only
+  channel being exercised. The state now arrives exclusively through RFTool's own callback, the
+  way it always did on real hardware. Nothing changes on screen; what changes is that the path
+  under test is the path that runs.
+- **Reading the config file got about twice as fast.** The parser walked every value three times
+  — trimming spaces that were not there, testing whether it looked like a number, then converting
+  it. It now does that in one step, unchanged in what it accepts. On a fully populated
+  configuration this takes the most expensive startup frame from ~15 000 instructions to
+  ~11 000, well clear of the radio's limit.
+- **Saving settings can no longer run out of CPU budget, no matter how much you change.**
+  The config write used to put the whole file into one widget call, and its cost grew with
+  every setting the file carried — it stood close to the radio's per-call instruction limit
+  and was the reason a very full configuration could kill the widget with *CPU limit* on
+  leaving a settings page. The write now goes to the card in small batches, one per screen
+  cycle, into a temporary `.new` file that replaces the real one only after a size check —
+  so the cost per call is fixed, and switching the radio off mid-save can never leave a
+  half-written config: either the old file or the new one, nothing in between. A full save
+  takes a few invisible frames (~a third of a second at worst) instead of one overloaded one.
+- **The widget starts lighter.** The settings catalogue — every row of every settings page —
+  and the built-in data tables (colour schemes, palettes, the sensor catalogue) used to be
+  built the moment the widget loaded, inside the tightest CPU window EdgeTX gives a widget.
+  They are now built one screen cycle later, in a budget of their own. Nothing visible
+  changes; the CPU cost of the load itself drops to less than a third of what it was.
+- **The heaviest layouts build in two steps.** A skin may now hand the host the heavy half
+  of its build to run one screen cycle later, with fresh CPU budget (a new, optional part
+  of the skin API — see `docs/SKINS.md` §3). Cockpit, Dash1 and Grid use it: rings, the
+  sensor column and the tile grid arrive one invisible frame after the rest of the page,
+  and no single step of any bundled layout comes near the CPU limit any more — including
+  with every option set to its most expensive value.
+- **Opening a settings page with sensor pickers is lighter too.** The sensor pick list
+  (built from your model's real sensors) gets its own screen cycle instead of sharing one
+  with the page's other preparation — the heaviest single step the widget had left. One
+  more invisible frame at page open, on those pages only.
+- **The config file carries only what you changed.** `cfg_m_<model>.cfg` used to be written
+  with the entire settings catalogue (~200 lines) as soon as any settings page was left with
+  one edit — every value, changed or not. It now stores only the settings that differ from
+  their defaults, plus its bookkeeping stamps; a value put back to its default leaves the
+  file on the next save. This cuts the save's CPU cost roughly in half on the radio (the
+  write ran close to the widget budget's warn line and grew with every release) and makes the
+  file readable as a record of your actual choices. A file written in full by an earlier
+  version **compacts page by page**: a save only rewrites the settings of the page you were
+  on, so the redundant lines leave as you visit the pages they belong to — nothing waits on
+  that, because a line holding a default value and no line at all mean exactly the same
+  thing. Behaviour note bought deliberately: an absent line now *means* "follow the default",
+  so if a future version changes a default, an untouched setting follows it — the rule colour
+  overrides always had, widened to everything. *Reset to defaults* writes a minimal file for
+  the same reason, and clears the whole file in one go.
+
+### Fixed
+
+- **The scroll wheel now walks a settings page from top to bottom.** It did not: the wheel
+  visited every dropdown, toggle, slider and picker first, in row order, and only then every
+  plain button — the `-` / `+` of a stepper, a colour row's *Def*, an action row's button —
+  again from the top. On a page that mixes both, the focus ran to the bottom and jumped back
+  up, and the page scrolled with it. Pages built from pickers alone were unaffected, which is
+  why it only bit sometimes. The order now follows the rows as they are read.
+
+- **The `BAT#` sensor-check hint said the profile line goes blank, and it does not.** The
+  default layout's battery-profile field prefers the pack size read over MSP, so with the
+  flight controller connected that field keeps showing it. The hint now says so. `PID#` and
+  `RTE#` carry the same wording and are correct — only the battery row overstated it.
+
+### Performance
+
+A pass over the whole widget after a CPU-limit review, aimed at the two numbers that had crept
+up with every release: what a screen rebuild costs, and what a settings page costs to open.
+**Nothing here changes what you see** — the one behaviour consequence is named under *Changed*
+above, and it is the config file compacting page by page. Measured with the development budget
+harness: the worst rebuild cycle falls from **13,173 to 9,812** of the radio's 20,000-instruction
+call limit (connected: 13,276 → 9,915) — the two runs that used to carry a warning are both back
+in the clear.
+
+- **The dashboard stops re-reading your settings on every rebuild.** Every rebuild — a flip
+  between the flight and statistics views on arming, a detail page opening, each step through
+  the menu — re-read the whole ~296-entry settings catalogue and re-resolved every value,
+  although nothing had changed since the last time. It is now done once and reused until
+  something actually saves a setting, you switch model, or EdgeTX hands the widget a fresh
+  options table. That is ~1,800 instructions off *every* one of those calls at once, and it
+  is what takes the heaviest cycle back under the warning line.
+- **A settings page only loads its own settings.** Opening any settings page copied the entire
+  catalogue into the edit buffer — ~296 keys plus ~50 synthesised colour keys — for a page that
+  edits ten to thirty of them, and it was that copy, not the page itself, that made every page
+  cost the same ~11,600 instructions and grow with every release's new rows. Each page now
+  seeds only what it shows: the settings groups measure **~2,300–7,300** instead of
+  10,979–11,611, and a new row in a future release costs its own page rather than all of them.
+- **The settings catalogue is built page by page.** All fourteen flat settings groups used to
+  construct their ~120 rows — labels, value lists, formatters — during startup, in the frame
+  that reads the config file, even for pages nobody opens. A group now builds its rows the
+  first time it is opened (the shape the Alerts, Colors and Shortcuts pages already used) and
+  keeps them. Startup's heaviest frame drops **10,463 → 8,621**; a page open pays at most 267
+  instructions more, against the nine-to-fourteen thousand of headroom it has.
+- **The menus and the detail pages got cheaper to open** as a consequence of the three above:
+  the settings menu **10,045 → 3,129**, the main menu **5,091 → 1,777**, the four detail pages
+  5,483–5,804 → 2,160–2,481. On short screens the settings grid also stops re-laying-out the
+  whole page once per pixel while it shrinks to fit — it solves for the size and lays out once.
+  Same result, same floors, nothing moves visually.
+- **Less work per frame while flying.** The Live Monitor's recorder ran a full name lookup for
+  every configured sensor on every pass (~20 Hz) and asked the radio for the arming state the
+  same way; it now reads resolved sensor indices and the arming flag the widget already keeps.
+  The three-second sensor rescan stopped allocating ~40 throwaway tables each time it runs, and
+  three texts that were rebuilt on every display frame — the ESC event-log counter, the Status
+  page's *FC fuel warn* row, the throttle percentage — are rebuilt only when their value moves.
+  A handful of bars and icons dropped closures that recomputed the same build-time position on
+  every frame — measured on the simulator, on the link bars, where the resolved rectangle came
+  out identical to the pixel with the closure gone. None of this is visible; what it buys is
+  frame timing and less garbage-collector drag, which is worst exactly when the flight
+  controller is connected.
+- **The budget harness gained a correctness check.** Making the settings groups lazy created one
+  new way to lose data — a setting the page builds but the catalogue never hears about would be
+  deleted from your config file on the next save, silently and with no error anywhere. The
+  development check now builds every page on every run and holds it against the catalogue, so
+  that mistake fails the check by name on a PC instead of on a radio. It is a check that can go
+  red with every instruction count green.
+
 ## v0.7.1 — 2026-08-13
 
 ### Added

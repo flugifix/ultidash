@@ -81,6 +81,8 @@ optional setup (FC + model). Summary of the pieces:
 3. **Model — Config channel** (default CH11): a 6-position source (P/I/D/F/O/B selector).
 4. **Model — Value channel** (default CH12): encodes *which* trim is pressed (per-row
    magnitude), plus — for the **Editor** — one **GVAR pulse** mixer line on that channel.
+   The pulse line is what the Editor's `[-]`/`[+]` needs; the trim encoding is what tuning by
+   physical trim needs, and what lets the Map attribute a reported value to a row.
 5. **Widget:** *Settings ▸ Toolbox* → point *Config channel*, *Value channel* and *Adj
    editor: GVAR* at what you wired; optionally bind an open **shortcut switch**
    (*Settings ▸ Shortcuts*) so it works in flight.

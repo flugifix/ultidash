@@ -28,6 +28,13 @@ M.name = "UltiDash"   -- display name in the Dashboard-skin choice (id = file na
 -- M.schemes is assigned in M.init below.
 M.scheme_key = "ColorScheme"   -- historical key: existing cfgs keep working
 M.def_scheme = 1
+-- Units beside values, claimed as this skin's own (0.8.0) under the HISTORICAL host key,
+-- for the same reason the scheme key is historical: every existing cfg keeps working and
+-- nothing resets. Under this skin the Skin row and the host's "Units on detail pages" row
+-- are therefore one switch — which is what it was before the split. A skin that wants the
+-- dashboard and the detail pages to differ declares a key of its own instead.
+M.units_key = "ShowUnits"
+M.def_units = 0
 -- The skin's OWN settings rows (menu group "Skin"): the rows that describe THIS
 -- layout — top bar content/toggles and the left panel's top slot.
 M.items = {

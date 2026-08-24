@@ -1,7 +1,8 @@
 -- =====================================================================
 --  UltiDash Toolbox: Flight-log data core
 --  Small companion module for the flight log / battery management:
---    * fltlog/batteries.cfg  -- user-maintained battery registry (PC-edited)
+--    * fltlog/batteries.cfg  -- user-maintained battery registry, editable on
+--      the radio (Flight Log > Batteries / battpick "+ New") and on the PC
 --    * fltlog/flights.csv    -- append-only flight log (one line per flight)
 --  LAZY-loaded by the host on first use (a few KB; unlike the big viewer it
 --  may stay resident for the session -- the disarm write needs it while the
@@ -216,6 +217,41 @@ function M.parse_stats(rest)
     return out
 end
 
+-- ATOMIC replace, shared by every registry writer (factored out of mark_used).
+-- batteries.cfg is the user's hand-maintained file: a plain in-place "w"
+-- rewrite truncates it FIRST, so SD-full / card removal / power loss in the
+-- post-flight moment left an empty or partial file (total loss). Instead:
+-- write batteries.new -> verify the size landed (fstat) -> park the original
+-- as batteries.bak -> rename new into place. Every failure exit leaves the
+-- original untouched; on a failed final rename the .bak still holds the data.
+-- `allow_create` (create_battery only): a MISSING original skips the .bak
+-- parking instead of failing -- the file is created with the first pack.
+local function atomic_replace(path, out, allow_create)
+    local newp = path .. ".new"
+    local bakp = path .. ".bak"
+    local f = io.open(newp, "w")       -- truncates a stale .new from an earlier failure
+    if f == nil then return false end
+    io.write(f, out)
+    io.close(f)
+    -- verify the full content landed BEFORE touching the original (io.write on a
+    -- full card reports no error here; the size check is the reliable signal)
+    local st = fstat ~= nil and fstat(newp) or nil
+    if st == nil or st.size ~= #out then return false end
+    if rename == nil then return false end
+    local parked = not (allow_create and fstat ~= nil and fstat(path) == nil)
+    if parked then
+        -- del/rename return FRESULT (0 = FR_OK) — verified against the 2.12 source
+        -- (api_filesystem.cpp: lua_pushinteger/lua_pushunsigned of f_unlink/f_rename)
+        if del ~= nil then del(bakp) end   -- FatFS rename refuses an existing target
+        if rename(path, bakp) ~= 0 then return false end
+    end
+    if rename(newp, path) ~= 0 then
+        if parked then rename(bakp, path) end  -- restore; on failure .bak still holds the data
+        return false
+    end
+    return true
+end
+
 -- Bump a battery's usage counter (cycles+1) and stamp last=<date> in
 -- batteries.cfg, keeping every other byte of the user's file as-is (comments
 -- and unknown fields survive; missing cycles/last fields are appended).
@@ -267,32 +303,178 @@ function M.mark_used(batt_id, dt)
         lines[#lines + 1] = out
     end
     if not changed then return false end
-    -- ATOMIC replace. batteries.cfg is the user's hand-maintained file: a plain
-    -- in-place "w" rewrite truncates it FIRST, so SD-full / card removal / power
-    -- loss in the post-flight moment left an empty or partial file (total loss).
-    -- Instead: write batteries.new -> verify the size landed (fstat) -> park the
-    -- original as batteries.bak -> rename new into place. Every failure exit
-    -- leaves the original untouched; the cycle count is simply lost (cosmetic).
+    -- atomic replace via the shared helper (see atomic_replace above); a failed
+    -- stamp just loses the cycle count (cosmetic)
     local out = table.concat(lines, "\n") .. "\n"
-    local newp = path .. ".new"
-    local bakp = path .. ".bak"
-    local f = io.open(newp, "w")       -- truncates a stale .new from an earlier failure
-    if f == nil then return false end
-    io.write(f, out)
-    io.close(f)
-    -- verify the full content landed BEFORE touching the original (io.write on a
-    -- full card reports no error here; the size check is the reliable signal)
-    st = fstat ~= nil and fstat(newp) or nil
-    if st == nil or st.size ~= #out then return false end
-    -- del/rename return FRESULT (0 = FR_OK) — verified against the 2.12 source
-    -- (api_filesystem.cpp: lua_pushinteger/lua_pushunsigned of f_unlink/f_rename)
-    if del ~= nil then del(bakp) end   -- FatFS rename refuses an existing target
-    if rename == nil or rename(path, bakp) ~= 0 then return false end
-    if rename(newp, path) ~= 0 then
-        rename(bakp, path)             -- restore; on failure .bak still holds the data
-        return false
+    return atomic_replace(path, out)
+end
+
+-- ---------------------------------------------------------------------
+-- Registry EDITING (Flight Log battery editor / battpick "+ New").
+-- Line surgery, never file generation: only the edited pack's line is
+-- rewritten; comments, unknown fields and every other line stay
+-- byte-identical (the promise mark_used has always made). All writers:
+--   * refuse a file above READ_CAP with the DISTINCT value "toobig" (a
+--     truncated read must never be written back as the whole file, and
+--     unlike mark_used's silent skip an edit needs an explanation);
+--   * return "notfound" when the id's line is gone (file replaced between
+--     open and save), "collision" when an id would stop being unique,
+--     plain false on an io failure, true on success;
+--   * go through atomic_replace, so a failure exit loses nothing.
+-- ---------------------------------------------------------------------
+
+-- read the registry for a rewrite; second return is the distinct refusal
+local function guarded_read(path)
+    local st = fstat ~= nil and fstat(path) or nil
+    if st ~= nil and (st.size or 0) > READ_CAP then return nil, "toobig" end
+    return read_all(path, READ_CAP), nil
+end
+
+-- Walk physical lines by byte offset and find the first non-comment line whose
+-- id= field equals `want` (trimmed). Returns content start, content end
+-- (EXCLUDING the \r\n / \n terminator) and line end INCLUDING the terminator --
+-- offsets, not extracted strings, so the splice around them preserves the
+-- file's own line endings verbatim (mark_used's gmatch loop normalises them;
+-- an editor must not).
+local function find_line(data, want)
+    local pos = 1
+    while pos <= #data do
+        local nl = string.find(data, "\n", pos, true)
+        local lend = nl ~= nil and nl or #data
+        local cend = nl ~= nil and nl - 1 or #data
+        if cend >= pos and string.sub(data, cend, cend) == "\r" then cend = cend - 1 end
+        local line = string.sub(data, pos, cend)
+        if string.match(line, "^%s*#") == nil then
+            -- id= anchored to the line start or a ';' (same as mark_used): a field
+            -- that merely CONTAINS "id=" can never be mistaken for the key
+            local id = string.match(line, "^%s*[iI][dD]%s*=%s*([^;]*)")
+                or string.match(line, ";%s*[iI][dD]%s*=%s*([^;]*)")
+            if id ~= nil and trim(id) == want then return pos, cend, lend end
+        end
+        if nl == nil then break end
+        pos = nl + 1
     end
-    return true
+    return nil
+end
+
+-- serialised field values: ';' would end the field, CR/LF the line -- strip
+-- them here so no caller can corrupt the file format (the UI sanitises more)
+local function clean_val(v)
+    if type(v) == "number" then return string.format("%d", math.floor(v)) end
+    return string.gsub(tostring(v or ""), "[;\r\n]", "")
+end
+
+-- the known keys, in the order create/append serialise them
+local WKEYS = { "id", "name", "cap", "models", "profile", "cycles", "last" }
+
+-- Rewrite ONE line's content. `e` maps a lower-case known key to: a value to
+-- WRITE (string/number), false to REMOVE the key, or nil/absent to leave the
+-- field verbatim -- callers pass only the touched fields, so an untouched
+-- field keeps its exact bytes (spacing and case included). Fields are split
+-- on ';' and a value can never contain ';' (parser contract), so unlike a
+-- pattern search this can never mistake text INSIDE a value for a key.
+-- Unknown keys and the line's own key order survive verbatim; known-but-new
+-- keys append at the end. Duplicate keys: the first occurrence is the one
+-- edited, later ones stay verbatim (mark_used's gsub-count-1 behaviour).
+local function edit_line(line, e)
+    local segs, done = {}, {}
+    local pos = 1
+    while true do
+        local sep = string.find(line, ";", pos, true)
+        local seg = string.sub(line, pos, sep ~= nil and sep - 1 or #line)
+        local k = string.match(seg, "^%s*([%w_]+)%s*=")
+        if k ~= nil then k = string.lower(k) end
+        if k ~= nil and not done[k] and e[k] ~= nil then
+            done[k] = true
+            if e[k] ~= false then
+                segs[#segs + 1] = k .. "=" .. clean_val(e[k])
+            end
+            -- false: segment dropped -> the key is removed
+        else
+            segs[#segs + 1] = seg
+        end
+        if sep == nil then break end
+        pos = sep + 1
+    end
+    for i = 1, #WKEYS do
+        local k = WKEYS[i]
+        if e[k] ~= nil and e[k] ~= false and not done[k] then
+            segs[#segs + 1] = k .. "=" .. clean_val(e[k])
+        end
+    end
+    return table.concat(segs, ";")
+end
+
+-- one new registry line: id=..;name=..[;cap=..][;models=..][;profile=..];cycles=..
+-- (no last= at creation; optional fields are simply absent when unset)
+local function serialize_entry(e)
+    local line = "id=" .. clean_val(e.id) .. ";name=" .. clean_val(e.name)
+    if type(e.cap) == "number" and e.cap > 0 then line = line .. ";cap=" .. clean_val(e.cap) end
+    if e.models ~= nil and e.models ~= false and clean_val(e.models) ~= "" then
+        line = line .. ";models=" .. clean_val(e.models)
+    end
+    if type(e.profile) == "number" and e.profile >= 1 then line = line .. ";profile=" .. clean_val(e.profile) end
+    line = line .. ";cycles=" .. clean_val(type(e.cycles) == "number" and e.cycles or 0)
+    return line
+end
+
+-- Append a new pack at EOF. e = { id, name, cap?, models? (the serialised
+-- comma list, or nil for "all"), profile?, cycles? }. A MISSING file is not
+-- an error: it is created with the first pack (append_flight's behaviour).
+function M.create_battery(e)
+    local path = M.registry_path()
+    local data, err = guarded_read(path)
+    if err ~= nil then return err end
+    local id = trim(e ~= nil and e.id or "")
+    if id == "" then return false end
+    if data ~= nil and find_line(data, id) ~= nil then return "collision" end
+    local line = serialize_entry(e)
+    local out
+    if data == nil then
+        out = line .. "\n"
+    else
+        out = data .. (string.sub(data, -1) == "\n" and "" or "\n") .. line .. "\n"
+    end
+    return atomic_replace(path, out, true)
+end
+
+-- Line surgery on the pack whose id= is old_id. `e` follows edit_line's
+-- touched-fields contract (value / false = remove / nil = keep verbatim);
+-- an id change is e.id, refused with "collision" when the new id already
+-- belongs to another line.
+function M.update_battery(old_id, e)
+    local path = M.registry_path()
+    local data, err = guarded_read(path)
+    if err ~= nil then return err end
+    if data == nil then return "notfound" end
+    local want = trim(old_id)
+    if want == "" then return "notfound" end
+    if type(e) ~= "table" then return false end
+    local new_id = (e.id ~= nil and e.id ~= false) and trim(e.id) or nil
+    if new_id ~= nil and new_id ~= want and find_line(data, new_id) ~= nil then
+        return "collision"
+    end
+    local s, c = find_line(data, want)
+    if s == nil then return "notfound" end
+    local out = string.sub(data, 1, s - 1)
+        .. edit_line(string.sub(data, s, c), e)
+        .. string.sub(data, c + 1)
+    return atomic_replace(path, out)
+end
+
+-- Plain line removal (B12) -- the line and its terminator go, everything else
+-- stays byte-identical. No tombstone: sync semantics are the sync tool's.
+function M.delete_battery(id)
+    local path = M.registry_path()
+    local data, err = guarded_read(path)
+    if err ~= nil then return err end
+    if data == nil then return "notfound" end
+    local want = trim(id)
+    if want == "" then return "notfound" end
+    local s, _, t = find_line(data, want)
+    if s == nil then return "notfound" end
+    local out = string.sub(data, 1, s - 1) .. string.sub(data, t + 1)
+    return atomic_replace(path, out)
 end
 
 return M

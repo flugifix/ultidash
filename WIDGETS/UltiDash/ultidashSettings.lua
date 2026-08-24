@@ -73,7 +73,8 @@ local sealed = false           -- true once every skin has been offered the chan
 local SCHEMA_VER = 1
 
 -- Defaults are handed in by ultidash.lua (derived from the settings-page group
--- tables — the single source of truth; the EdgeTX option list is empty).
+-- tables — the single source of truth). The EdgeTX option list is NOT empty: it carries
+-- `Target`, which is deliberately absent from `defaults` so apply() never writes it.
 function M.set_defaults(t)
     defaults = t or {}
 end
@@ -276,15 +277,20 @@ local function read_table(path)
     -- emits for an empty string) the `%s*` after the `=` ate the newline and the value
     -- pattern then swallowed the WHOLE NEXT LINE -- two settings lost per empty one. The
     -- anchor also stops a comment line ("# note=x") from being read as a setting.
+    -- The INTEGER case is tried first and in ONE pattern, because it is the overwhelming
+    -- majority of a cfg and the three-step shape it replaces walked every value three times:
+    -- a trailing-space gsub that changes nothing on a file this widget wrote itself, an
+    -- integer test that scans the digits, and a tonumber that scans them again. Measured on
+    -- the harness's 300-key worst case: 25.0 -> 12.1 instructions per line. The string path
+    -- below is unchanged in meaning -- `(.-)%s*$` trims the same trailing whitespace the
+    -- gsub did, and an empty value still lands as "".
     for line in string.gmatch(data, "[^\r\n]+") do
-        local k, v = string.match(line, "^%s*([%w_]+)%s*=%s*(.*)$")
+        local k, n = string.match(line, "^%s*([%w_]+)%s*=%s*(%-?%d+)%s*$")
         if k then
-            v = string.gsub(v, "%s+$", "")
-            if string.match(v, "^%-?%d+$") then
-                t[k] = tonumber(v)
-            else
-                t[k] = v
-            end
+            t[k] = tonumber(n)
+        else
+            local sk, sv = string.match(line, "^%s*([%w_]+)%s*=%s*(.-)%s*$")
+            if sk then t[sk] = sv end
         end
     end
     return t
@@ -526,16 +532,36 @@ function M.load()
     return cache
 end
 
--- Merge `values` into the saved settings and persist. Returns true on success.
-function M.save(values)
+-- The shared front half of every save: merge `values` into the loaded settings, stamp,
+-- and sweep. Writes NOTHING -- the one-shot M.save and the chunked save_begin/save_step
+-- both build on it. Returns the merged table and the target path (captured HERE, so a
+-- model switch mid-write cannot retarget a chunked job half way through).
+local function prepare_save(values)
     local t = M.load() or {}
     for k, v in pairs(values) do
         if type(v) == "number" or type(v) == "string" then
-            -- "unset" colour roles (default -1 -> follow the scheme built-in) are NOT persisted:
-            -- the autosave/snapshot hands us all ~57 Clr* keys, and writing them as -1 into every
-            -- model cfg (~0.7 kB) rebuilds exactly the cfg-parse load that caused the CPU-limit
-            -- crashes. Drop the key (also clears a prior override when the user taps "Def").
-            if defaults[k] == -1 and v == -1 then
+            -- A value that EQUALS its default is not persisted. This began as the "unset"
+            -- colour rule (default -1 -> follow the scheme built-in), which existed because
+            -- writing all ~57 Clr* keys as -1 into every model cfg rebuilds exactly the
+            -- cfg-parse load that caused the CPU-limit crashes -- and the same argument holds
+            -- for every other key: the autosave used to hand the WHOLE catalogue regardless
+            -- of what was edited, so a single toggle inflated the file to ~209 lines and cost
+            -- the full write every time. Dropping the defaults makes the file, the write and
+            -- the parse proportional to what the user actually changed. Setting nil rather
+            -- than skipping is what also COMPACTS a file already carrying them.
+            -- CORRECTED 2026-08-17: `values` is no longer the whole catalogue --
+            -- build_settings_view seeds the working copy from the OPEN PAGE's items alone
+            -- (its ~11.6k full-catalogue walk was the cost of every settings page open). The
+            -- delta rule is unchanged for everything the user edits; what narrowed is the
+            -- COMPACTION of a file written by an older version -- it now happens per page,
+            -- as the user visits them, rather than for the whole catalogue on any one save.
+            -- Nothing reads the two states differently: an absent key and a key at its
+            -- default both resolve to the default in apply(), unconditionally. Reset to
+            -- defaults still compacts the whole file in one step.
+            -- NOTE the semantic this buys into: a default that CHANGES between versions moves
+            -- an untouched setting with it. That is the existing colour-role contract widened
+            -- to the catalogue; an intentional default change is a migration (ClrSchemeV).
+            if v == defaults[k] then
                 t[k] = nil
             else
                 t[k] = v
@@ -566,16 +592,17 @@ function M.save(values)
     -- discovery finishes): a failed skin never registered its own option keys, so the
     -- sweep's premise -- "defaults hold every valid key" -- is false for that session and
     -- the sweep would delete the user's settings for a skin that is merely half-copied.
-    -- Everything else here, the -1 colour drop and the ClrSchemeV stamp included, runs
-    -- unchanged; the stamp and the CfgPerCraft retirement resume the next session in
-    -- which every skin loads.
+    -- Everything else here, the default-value drop and the ClrSchemeV stamp included,
+    -- runs unchanged; the stamp and the CfgPerCraft retirement resume the next session
+    -- in which every skin loads.
     -- The hold is NOT free, contrary to what its spec assumed: the orphans it preserves
-    -- are then written, so the cfg write grows with their number. Measured in the budget
-    -- harness, whose fixture carries 300 deliberately-orphaned keys, the write goes
-    -- 13125 -> 18489 of 20000 -- still inside the radio's limit, but past the harness's
-    -- own 16000 warn line. A real file's orphan set is the handful of retired keys plus
-    -- the broken skin's own rows, so this is a worst case by construction; it only ever
-    -- applies in a session that already has a broken skin.
+    -- are then written, so the cfg write grows with their number. (Historically that
+    -- pushed the one-call write from 13125 to 18489 of 20000 with the harness's 300
+    -- planted orphans -- past the 16000 warn line. The chunked write bounds the per-call
+    -- cost now, so the growth costs extra CALLS rather than budget; the point that the
+    -- hold is not free stands.) A real file's orphan set is the handful of retired keys
+    -- plus the broken skin's own rows, so this is a worst case by construction; it only
+    -- ever applies in a session that already has a broken skin.
     -- HELD A SECOND WAY, for the skin that is not on the card AT ALL. To the sweep's test
     -- an absent skin's keys look exactly like a broken one's -- nobody declared them -- but
     -- sweep_hold only ever saw skins that were discovered and then failed. Since the four
@@ -604,32 +631,169 @@ function M.save(values)
             end
         end
     end
-    local ok, written = pcall(function()
-        return write_table(model_path(), t)
-    end)
-    if not ok or written ~= true then return false end
+    return t, model_path()
+end
+
+-- The shared tail of a landed save.
+local function save_done(t, path)
     -- a full save just persisted the merged state (which includes any adopted
     -- values) — a still-pending adoption write would clobber it with stale data
     adopt_pending = nil
     cache = t
     cache_loaded = true
-    loaded_model_path = model_path()
+    loaded_model_path = path
+end
+
+-- Merge `values` into the saved settings and persist IN ONE CALL. Returns true on
+-- success. This is the one-shot form, right for the small writes that run in a cycle
+-- of their own (the migration snapshot, SetupSeen). The settings autosave goes through
+-- save_begin/save_step below instead, which bound the cost per widget call.
+function M.save(values)
+    local t, path = prepare_save(values)
+    local ok, written = pcall(function()
+        return write_table(path, t)
+    end)
+    if not ok or written ~= true then return false end
+    save_done(t, path)
+    return true
+end
+
+-- The CHUNKED save (the E1 hardening item): the same write as M.save, but bounded per
+-- widget call no matter how many settings differ from their defaults. The whole-file
+-- write grew with every key (it stood at the harness's warn line before the delta
+-- rule, and a user who changes everything is back there), and the ~20k budget is per
+-- CALL -- so the write is cut into batches and each batch runs in its own call.
+--
+-- Shape: save_begin merges/stamps/sweeps (prepare_save) and TRUNCATES <cfg>.new; each
+-- save_step opens .new in APPEND mode (liolib maps "a" to FA_OPEN_APPEND), writes up
+-- to SAVE_LINES_PER_TICK lines and closes -- no file handle survives a call, so a
+-- teardown between batches leaks nothing. The last step verifies the on-disk size
+-- against the summed line lengths and renames .new over the target: the proven
+-- atomic sequence of write_table_atomic above, stretched over calls. A powerdown at
+-- ANY point leaves an orphaned .new beside an INTACT cfg, never a truncated cfg --
+-- which answers the abort-state question the staggering item was opened with.
+-- Nothing ever reads a .new; the next save_begin truncates it.
+--
+-- The job lives on the CALLER's table (per widget instance), not in this module: two
+-- placements must not pump each other's write.
+local SAVE_LINES_PER_TICK = 50
+
+-- Stage the chunked write. Returns a job table for save_step, or nil when .new
+-- cannot be opened (the caller shows the same banner as a failed one-shot save).
+function M.save_begin(values)
+    local t, path = prepare_save(values)
+    local keys = {}
+    for k in pairs(t) do keys[#keys + 1] = k end
+    table.sort(keys)
+    local newp = path .. ".new"
+    local f = io.open(newp, "w")   -- create/truncate; the batches append
+    if f == nil then return nil end
+    io.close(f)
+    return { t = t, path = path, newp = newp, keys = keys, i = 1, want = 0 }
+end
+
+-- One batch of the chunked write, in the current call's budget. Returns "more" while
+-- batches remain, true when the file has been verified and renamed into place, false
+-- on any failure (the target is left exactly as it was).
+function M.save_step(job)
+    local keys, t = job.keys, job.t
+    local f = io.open(job.newp, "a")
+    if f == nil then
+        if del ~= nil then pcall(del, job.newp) end
+        return false
+    end
+    local last = job.i + SAVE_LINES_PER_TICK - 1
+    if last > #keys then last = #keys end
+    for i = job.i, last do
+        local line = keys[i] .. "=" .. tostring(t[keys[i]]) .. "\n"
+        io.write(f, line)
+        job.want = job.want + #line
+    end
+    io.close(f)
+    job.i = last + 1
+    if job.i <= #keys then return "more" end
+    -- finished -- verify and swap, the write_table_atomic sequence
+    if fstat ~= nil then
+        local st = fstat(job.newp)
+        if st == nil or st.size ~= job.want then
+            if del ~= nil then pcall(del, job.newp) end
+            return false
+        end
+    end
+    if rename == nil then
+        if del ~= nil then pcall(del, job.newp) end
+        return false
+    end
+    if fstat ~= nil and fstat(job.path) ~= nil then
+        -- FatFS rename refuses an existing target (same as the adoption write)
+        if del == nil then return false end
+        pcall(del, job.path)
+    end
+    if rename(job.newp, job.path) ~= 0 then return false end
+    save_done(t, job.path)
+    return true
+end
+
+-- Stage 1 of the host's deferred settings write, whole: consume the pending flags,
+-- run a reset or begin/continue the chunked save, and flag stage 2 (apply) when the
+-- write is done. Lives HERE rather than as twin blocks in refresh()/background()
+-- because the host's main chunk is at Lua's 200-locals limit and this needs none of
+-- its locals beyond what wgt carries. The host still gates on skin_defaults_done
+-- before calling (the orphan-drop needs the full key set). `logf` is the host's
+-- debug-log line writer. Returns true when it consumed the call's budget.
+-- The job hangs on WGT (per instance), so two placements never pump each other's
+-- write; the instance that opened the settings page owns its save to the end.
+function M.write_stage1(wgt, logf)
+    local function fail_banner(msg)
+        if logf ~= nil then logf(msg) end
+        wgt.cfg_save_failed_text = nil                        -- default banner wording
+        wgt.cfg_save_failed_until = (getTime() or 0) + 1000   -- ~10 s sticky warn banner
+    end
+    -- a chunked write in flight owns the call; a new pending waits behind it (order
+    -- preserved: the newer save re-merges on top once this one has landed)
+    if wgt.settings_write_job then
+        local r = M.save_step(wgt.settings_write_job)
+        if r == "more" then return true end
+        wgt.settings_write_job = nil
+        if r ~= true then fail_banner("settings save FAILED (cfg file not writable)") end
+        -- flagged on failure too (as before): the apply re-reads the file that IS on
+        -- the card, so the screen never shows values the save did not land
+        wgt.settings_apply_pending = true
+        return true
+    end
+    if not (wgt.settings_save_pending or wgt.settings_reset_pending) then return false end
+    local pending = wgt.settings_save_pending
+    wgt.settings_save_pending = nil
+    if wgt.settings_reset_pending then
+        -- a reset flagged beside a save wins and the save is dropped (as before).
+        -- reset writes the stamps alone — one line, no chunking needed; the LIVE
+        -- values come back in stage 2, where apply() resolves every absent key to
+        -- its default, colour roles included
+        wgt.settings_reset_pending = nil
+        if not M.reset() then fail_banner("settings reset FAILED (cfg file not writable)") end
+        wgt.settings_apply_pending = true
+        return true
+    end
+    -- begin the chunked write: merge + stamp + sweep + truncate .new. The batches
+    -- run in the NEXT calls, one each
+    wgt.settings_write_job = M.save_begin(pending)
+    if wgt.settings_write_job == nil then
+        fail_banner("settings save FAILED (cfg file not writable)")
+        wgt.settings_apply_pending = true
+    end
     return true
 end
 
 -- Replace the saved settings with the defaults.
 function M.reset()
-    local t = {}
-    for k, v in pairs(defaults) do
-        -- Same rule as M.save: "unset" colour roles (default -1 = follow the scheme
-        -- built-in) are NOT persisted. Writing all ~57 Clr* roles per scheme as -1 is
-        -- what save() deliberately avoids -- it inflates every model cfg and rebuilds
-        -- exactly the cfg-parse load that once caused the CPU-limit crashes. Skipping
-        -- them also brings the reset WRITE back under budget (measured 17.0k -> 8.5k)
-        -- and makes a reset file identical in shape to a saved one.
-        if v ~= -1 then t[k] = v end
-    end
-    t.ClrSchemeV = SCHEMA_VER   -- reset produces a current-version file (no re-migration)
+    -- Same rule as M.save, taken to its conclusion: a value that equals its default is not
+    -- persisted, and a reset makes EVERY value its default -- so the file a reset produces
+    -- carries the stamps and nothing else. It used to write every non-(-1) default
+    -- explicitly, which was already a shrink (17.0k -> 8.5k, when only the colour roles were
+    -- skipped) and is now simply redundant: apply() resolves an absent key to the default
+    -- unconditionally. A reset file stays identical in shape to a saved one, which is what
+    -- the old rule was after.
+    local t = { ClrSchemeV = SCHEMA_VER }   -- current-version file (no re-migration)
     local ok, written = pcall(function()
         return write_table(model_path(), t)
     end)
@@ -640,21 +804,14 @@ function M.reset()
     return true
 end
 
--- The LIVE counterpart of M.reset, called by the host on the same stage: put every "unset"
--- colour role back to its default on an instance's options. Those keys are deliberately not
--- written by reset (see there), and apply() never downgrades a key the file does not carry
--- -- so the file was correct after a reset and the screen was not, until the next boot. That
--- reads as "Reset to defaults does not reset the colours", and it was reported as exactly
--- that. Cheap: one walk of the defaults, once per reset.
-function M.reset_options(wgt)
-    if wgt == nil or wgt.options == nil then return end
-    for k, def in pairs(defaults) do
-        if def == -1 then wgt.options[k] = -1 end
-    end
-end
+-- (M.reset_options is GONE. It restored the "unset" colour roles live after a reset,
+-- because apply() never downgraded a key the file did not carry -- that guard fell with
+-- the delta rule, apply() now resolves EVERY absent key to its default, colour roles
+-- included, so the reset's stage 2 does the whole job and the special case had nothing
+-- left to do.)
 
--- Resolve this instance's effective options: file value > existing option value >
--- default. Call after wgt.options is (re)assigned (i.e. in update()). Never raises.
+-- Resolve this instance's effective options: file value > default. Call after
+-- wgt.options is (re)assigned (i.e. in update()). Never raises.
 function M.apply(wgt)
     if wgt.options == nil then return end
     local ok, t = pcall(M.load)
@@ -669,14 +826,36 @@ function M.apply(wgt)
                 v = tonumber(v) or def
             end
             wgt.options[k] = v
-        elseif wgt.options[k] == nil then
+        else
+            -- UNCONDITIONAL, and it has to be: since save() no longer persists a value that
+            -- equals its default, "key absent from the file" now MEANS "default" and is the
+            -- ordinary case rather than the cold-boot one. The former `elseif options[k] ==
+            -- nil` guard would have made a setting reset to its default keep the old value
+            -- until the next boot. Safe against the OTHER writer of wgt.options -- EdgeTX --
+            -- because the two key sets are disjoint: EdgeTX writes exactly one key, `Target`
+            -- (ultidashOptions.lua), and that key is deliberately NOT a `defaults` entry, so
+            -- this loop never reaches it. Were it one, apply() would overwrite the pilot's
+            -- choice with a default on the first update() of every session.
             wgt.options[k] = def
         end
     end
     if t then
+        -- `Target` is EdgeTX's alone -- the craft target is chosen where the widget is
+        -- PLACED, not in the settings menu, and this module never writes it to a file. A
+        -- `Target=` line can therefore only be stale or hand-edited (a cfg copied from
+        -- another radio, an export from a later version), and the pass-through below would
+        -- otherwise let it override the dialog on every update() with nothing on screen
+        -- saying so. EdgeTX wins; the line is ignored.
+        -- Excluded by carrying the value ACROSS the loop rather than by a `k ~= "Target"`
+        -- test inside it: this loop walks every key of the file on every update(), and the
+        -- extra comparison measured +301 instructions on each of the two heaviest cycles
+        -- (2026-08-17). Restoring nil is correct too -- an option EdgeTX does
+        -- not carry must stay absent so normalize_target sees it.
+        local edgetx_target = wgt.options.Target
         for k, v in pairs(t) do
             if defaults[k] == nil then wgt.options[k] = v end
         end
+        wgt.options.Target = edgetx_target
     end
 end
 

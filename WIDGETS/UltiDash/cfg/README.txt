@@ -24,6 +24,19 @@ one config file: give a copied model its own name if it needs its own config.
 These are plain text (key=value). Safe to back up or copy between cards.
 Deleting a model's file just resets that model to defaults on next start.
 
+The file lists only the settings you actually changed, plus a couple of
+bookkeeping lines UltiDash needs. A setting you never touched has no line
+at all, and one you put back to its default loses its line again the next
+time that model saves -- a line that is not there simply means "default".
+So the file is short and reads as a record of your own choices: open it on
+a PC to see what you changed on that model, compare two models with a diff,
+or edit a value by hand. Delete a line and that setting returns to its
+default.
+
+A file ending in .new is a save that was interrupted (radio switched off
+mid-write). It is harmless: your real config file is untouched, nothing
+reads the .new file, and the next save replaces it. Delete it or leave it.
+
 Files named cfg_m_model7.cfg are from UltiDash before 0.7.0. They are read
 once and rewritten under the model name; the old file is left in place.
 

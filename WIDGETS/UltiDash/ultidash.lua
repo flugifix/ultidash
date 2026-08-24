@@ -1,7 +1,17 @@
 local script_dir = "/WIDGETS/UltiDash/"
 local ultidash_functions = loadScript(script_dir .. "ultidashFunctions.lua")()
 local ultidash_values = loadScript(script_dir .. "ultidashValues.lua")()
-local rf_service = loadScript(script_dir .. "ultidashRf.lua")()
+-- Rotorflight MSP/telemetry client. Resident once loaded, but loaded LAZILY in
+-- ensure_rf_service and only for a craft whose declared target is Rotorflight -- so a
+-- later target skips it with a condition instead of a refactor. At module level its 90
+-- instructions sat in create(), the one call 0.8.0 spent three commits emptying. The
+-- local STAYS: this chunk is at Lua's 200-active-locals wall (tools/check_locals).
+local rf_service = nil
+-- ELRS TX module configuration client. Resident once loaded (it runs from
+-- background(), not from an open page), but loaded LAZILY in ensure_rf_service --
+-- at module level it put its 137 instructions into create(), which is the one call
+-- 0.8.0 spent three commits emptying.
+local elrs_cfg = nil
 local ultidash_settings = loadScript(script_dir .. "ultidashSettings.lua")()
 -- Toolbox tool pages (RF adjustment map/editor), ALL lazy-loaded + pcall'd so a
 -- missing file degrades gracefully (the Toolbox menu entries just won't appear).
@@ -22,6 +32,14 @@ local tb_common = nil
 -- .mod = viewer module (lazy, released on close), .data = data core (lazy,
 -- stays resident once loaded), .avail/.data_avail = boot fstat flags.
 local fltlog = { mod = nil, data = nil, avail = false, data_avail = false }
+-- M5: the Live Monitor's namespace table -- ONE local for the whole feature (the main
+-- chunk stands 4 below Lua's 200-active-locals wall, measured by tools/check_locals).
+-- The DATA lives on wgt.lm (ultidashFunctions lm_sample); this holds the lazy module.
+local livemon = { mod = nil, avail = false }
+-- The RFSuite adapter (toolbox/rfscfg.lua). ONE local for the whole feature,
+-- same trick as livemon -- the main chunk stands at 184/200 active locals and a pair
+-- of tb_*/tb_*_avail locals is exactly what that wall is there to prevent.
+local rfscfg = { mod = nil, avail = false }
 do
     local okc, m = pcall(function() return loadScript(script_dir .. "toolbox/common.lua")() end)
     if okc then tb_common = m end
@@ -30,56 +48,141 @@ do
     -- ~650 -> ~900 kB and the extra GC mark/sweep work dropped the whole UI
     -- loop from ~19 to ~15 Hz (debug_03 vs debug_04 PERF lines). At boot only
     -- check the files EXIST (menu entry visibility); missing -> no entry.
-    tb_adjmap_avail  = fstat(script_dir .. "toolbox/adjmap.lua") ~= nil
-    tb_adjed_avail   = fstat(script_dir .. "toolbox/adjed.lua") ~= nil
-    tb_logview_avail = fstat(script_dir .. "toolbox/logview.lua") ~= nil
-    tb_rf2cfg_avail  = fstat(script_dir .. "toolbox/rf2cfg.lua") ~= nil
-    fltlog.avail      = fstat(script_dir .. "toolbox/fltlog.lua") ~= nil
-    fltlog.data_avail = fstat(script_dir .. "toolbox/fltdata.lua") ~= nil
+    -- The flags are LOAD TRIES LEFT (number, truthy) rather than booleans: a
+    -- failed load used to latch `false` for the whole session, but load failures
+    -- can be TRANSIENT -- an out-of-memory at a bloated heap killed one adjed
+    -- load on 2026-08-16 and the latch then dead-ended the switch shortcut AND
+    -- the menu entry until reboot. Now a failure logs, decrements, and the entry
+    -- only disappears after the tries are used up (a truly broken file still
+    -- cannot fail forever). Every read site keeps working: number = truthy.
+    tb_adjmap_avail  = fstat(script_dir .. "toolbox/adjmap.lua") ~= nil and 3
+    tb_adjed_avail   = fstat(script_dir .. "toolbox/adjed.lua") ~= nil and 3
+    tb_logview_avail = fstat(script_dir .. "toolbox/logview.lua") ~= nil and 3
+    tb_rf2cfg_avail  = fstat(script_dir .. "toolbox/rf2cfg.lua") ~= nil and 3
+    rfscfg.avail     = fstat(script_dir .. "toolbox/rfscfg.lua") ~= nil and 3
+    fltlog.avail      = fstat(script_dir .. "toolbox/fltlog.lua") ~= nil and 3
+    fltlog.data_avail = fstat(script_dir .. "toolbox/fltdata.lua") ~= nil and 3
+    fltlog.batted_avail = fstat(script_dir .. "toolbox/fltbatt.lua") ~= nil and 3
+    livemon.avail     = fstat(script_dir .. "toolbox/livemon.lua") ~= nil and 3
+end
+
+-- One line to the debug log per failed load: the 2026-08-16 field report -- "the
+-- switch did nothing, only a reboot helped" -- was undiagnosable because the
+-- failed pcall left no trace. Hangs off `fltlog` (declared above, so in scope
+-- here) because the main chunk is at Lua's 200-local limit.
+fltlog.load_err = function(name, err)
+    local d = ultidash_functions.dbg
+    if d then d.logf("TB", "%s load failed: %s", name, tostring(err)) end
 end
 
 -- load a big toolbox module on first OPEN (disarmed-only pages, so the one-off
 -- compile hiccup happens on a menu tap, never in flight); the module ref is
--- dropped again on CLOSE so nothing stays resident during flight. A failed
--- load clears the avail flag (entry disappears instead of failing repeatedly).
+-- dropped again on CLOSE so nothing stays resident during flight. A failed load
+-- logs, burns one try, and only after the last try does the entry disappear
+-- (see the avail-flag note above); a success resets the tries.
 local function tb_load_adjmap()
     if tb_adjmap == nil and tb_adjmap_avail then
         local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/adjmap.lua")() end)
         -- init inside the protection too: a raising init left a half-set-up
         -- module resident and crashed the widget state instead of degrading
-        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then tb_adjmap = m
-        else tb_adjmap_avail = false end
+        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then
+            tb_adjmap, tb_adjmap_avail = m, 3
+        else
+            tb_adjmap_avail = tb_adjmap_avail > 1 and tb_adjmap_avail - 1 or false
+            fltlog.load_err("adjmap", ok and "no module/init" or m)
+        end
     end
     return tb_adjmap
 end
 local function tb_load_adjed()
     if tb_adjed == nil and tb_adjed_avail then
         local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/adjed.lua")() end)
-        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then tb_adjed = m
-        else tb_adjed_avail = false end
+        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then
+            tb_adjed, tb_adjed_avail = m, 3
+        else
+            tb_adjed_avail = tb_adjed_avail > 1 and tb_adjed_avail - 1 or false
+            fltlog.load_err("adjed", ok and "no module/init" or m)
+        end
     end
     return tb_adjed
 end
 local function tb_load_logview()
     if tb_logview == nil and tb_logview_avail then
         local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/logview.lua")() end)
-        if ok then tb_logview = m else tb_logview_avail = false end
+        if ok then tb_logview, tb_logview_avail = m, 3
+        else
+            tb_logview_avail = tb_logview_avail > 1 and tb_logview_avail - 1 or false
+            fltlog.load_err("logview", m)
+        end
     end
     return tb_logview
 end
 local function tb_load_rf2cfg()
     if tb_rf2cfg == nil and tb_rf2cfg_avail then
         local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/rf2cfg.lua")() end)
-        if ok then tb_rf2cfg = m else tb_rf2cfg_avail = false end
+        if ok then tb_rf2cfg, tb_rf2cfg_avail = m, 3
+        else
+            tb_rf2cfg_avail = tb_rf2cfg_avail > 1 and tb_rf2cfg_avail - 1 or false
+            fltlog.load_err("rf2cfg", m)
+        end
     end
     return tb_rf2cfg
+end
+-- RFSuite adapter, livemon's lazy pattern (function on the namespace table,
+-- a failed load logs and burns one try). No init hand-off: the adapter takes nothing
+-- from the host but wgt.
+rfscfg.load = function()
+    if rfscfg.mod == nil and rfscfg.avail then
+        local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/rfscfg.lua")() end)
+        if ok and m ~= nil then rfscfg.mod, rfscfg.avail = m, 3
+        else
+            rfscfg.avail = rfscfg.avail > 1 and rfscfg.avail - 1 or false
+            fltlog.load_err("rfscfg", ok and "no module" or m)
+        end
+    end
+    return rfscfg.mod
+end
+-- M5: same lazy pattern as the adjust tools (init handed tb_common for the palettes,
+-- a failed load logs and burns one try). A field on the namespace table, not a local.
+livemon.load = function()
+    if livemon.mod == nil and livemon.avail then
+        local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/livemon.lua")() end)
+        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then
+            livemon.mod, livemon.avail = m, 3
+        else
+            livemon.avail = livemon.avail > 1 and livemon.avail - 1 or false
+            fltlog.load_err("livemon", ok and "no module/init" or m)
+        end
+    end
+    return livemon.mod
 end
 function fltlog.load_viewer()
     if fltlog.mod == nil and fltlog.avail then
         local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/fltlog.lua")() end)
-        if ok then fltlog.mod = m else fltlog.avail = false end
+        -- init hands tb_common over for the palettes (the adj tools' pattern)
+        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then
+            fltlog.mod, fltlog.avail = m, 3
+        else
+            fltlog.avail = fltlog.avail > 1 and fltlog.avail - 1 or false
+            fltlog.load_err("fltlog", ok and "no module/init" or m)
+        end
     end
     return fltlog.mod
+end
+-- battery detail/editor (fltbatt): loaded by the HOST only for the battery
+-- query's "+ New" flow -- the Flight Log viewer loads its own copy for the
+-- Batteries tab. Same lazy/tries pattern as the viewer.
+function fltlog.load_batted()
+    if fltlog.batted == nil and fltlog.batted_avail then
+        local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/fltbatt.lua")() end)
+        if ok and m ~= nil and (m.init == nil or pcall(m.init, tb_common)) then
+            fltlog.batted, fltlog.batted_avail = m, 3
+        else
+            fltlog.batted_avail = fltlog.batted_avail > 1 and fltlog.batted_avail - 1 or false
+            fltlog.load_err("fltbatt", ok and "no module/init" or m)
+        end
+    end
+    return fltlog.batted
 end
 -- flight-log data core: unlike the big viewer it STAYS resident once loaded --
 -- the disarm write needs it while the craft is still connected, and it is only
@@ -88,7 +191,13 @@ end
 function fltlog.load_data()
     if fltlog.data == nil and fltlog.data_avail then
         local ok, m = pcall(function() return loadScript(script_dir .. "toolbox/fltdata.lua")() end)
-        if ok then fltlog.data = m else fltlog.data_avail = false end
+        -- same transient-failure story as the tool loaders, and the stakes are
+        -- higher: a latched false here silently loses the flight log for the session
+        if ok then fltlog.data, fltlog.data_avail = m, 3
+        else
+            fltlog.data_avail = fltlog.data_avail > 1 and fltlog.data_avail - 1 or false
+            fltlog.load_err("fltdata", m)
+        end
     end
     return fltlog.data
 end
@@ -111,24 +220,15 @@ local COLOR_THEME_WARNING    = COLOR_THEME_WARNING
 local COLOR_THEME_DISABLED   = COLOR_THEME_DISABLED
 
 -- originals (follow active EdgeTX theme)
-local THEME_PALETTE = {
-    COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2,
-    COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED,
-}
+local THEME_PALETTE = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 -- static "Clean Theme" (Mate Soos) values
-local CLEAN_PALETTE = {
-    lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
-    lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
-}
+local CLEAN_PALETTE = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 -- static "UltiDash dark" high-contrast palette (bright text + NEON accents on black).
 -- Slots map the same way as CLEAN/THEME: 1 PRIMARY1, 2 PRIMARY2, 3 SECONDARY1,
 -- 4 SECONDARY2, 5 SECONDARY3, 6 FOCUS, 7 WARNING, 8 DISABLED. Text roles (PRIMARY1,
 -- SECONDARY1) stay near-white for readability; the accents (SECONDARY2 neon green,
 -- FOCUS neon cyan, WARNING neon red, DISABLED neon amber) glow against the black panel.
-local DARK_PALETTE = {
-    lcd.RGB(0xFF, 0xFF, 0xFF), lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0xF0, 0xF4, 0xF8), lcd.RGB(0x39, 0xFF, 0x14),
-    lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0x00, 0xE5, 0xFF), lcd.RGB(0xFF, 0x1A, 0x40), lcd.RGB(0xFF, 0xC4, 0x00),
-}
+local DARK_PALETTE = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 
 -- panel background used when BGFilled is on. For the Clean palette this is WHITE to match
 -- the Clean theme's actual wallpaper (which is solid white, not SECONDARY3); for the EdgeTX
@@ -204,8 +304,18 @@ local function picker_color_to_rgb24(c)
 end
 
 -- 0..255 luminance of an EdgeTX colour value, to judge how bright a surface is.
+-- ONLY VALID FOR AN RGB VALUE (lcd.RGB / a stored override). A COLOR_THEME_* constant is an
+-- INDEX flag -- the LcdColorIndex in bits 16.., no RGB_FLAG -- and running it through the
+-- 565 decoder reads the index itself as a colour: every theme index lands under 42/255 and
+-- therefore reads as "dark". Use theme_luma below for those.
 local function color_luma(c)
     local n = color_to_rgb24(c)
+    return 0.299 * ((n >> 16) & 0xFF) + 0.587 * ((n >> 8) & 0xFF) + 0.114 * (n & 0xFF)
+end
+-- The same number for a THEME colour, resolved through lcd.getColor first (that is what
+-- picker_color_to_rgb24 does, and the only reason it exists).
+local function theme_luma(c)
+    local n = picker_color_to_rgb24(c)
     return 0.299 * ((n >> 16) & 0xFF) + 0.587 * ((n >> 8) & 0xFF) + 0.114 * (n & 0xFF)
 end
 -- Below this luminance the surface under our text counts as "dark" -> use the neon semantic
@@ -235,25 +345,8 @@ local settings_gen = 0
 --                 flagged `theme` are user-configurable (role_in_scheme)
 --   pal           8-slot base palette (required); sem/chrome/batt/stat/toolbox
 --                 are optional — absent parts are derived from pal + the flags
-local SCHEMES = {
-    { id = "ulti", name = "UltiDash", tag = "U", pal = CLEAN_PALETTE,
-      -- Toolbox palette, UltiDash clean (light): mono black/grey, values in the accent
-      toolbox = { bg = lcd.RGB(248,250,248), accent = lcd.RGB(24,24,24), hint = lcd.RGB(216,96,0), line = lcd.RGB(180,184,190),
-                  text = lcd.RGB(24,24,24), textDim = lcd.RGB(130,130,130),
-                  valText = lcd.RGB(48,90,144), valHi = lcd.RGB(192,48,56), bannerBg = lcd.RGB(192,48,40), bannerFg = lcd.RGB(255,255,255),
-                  btnBg = lcd.RGB(208,212,218), btnPressed = lcd.RGB(184,190,200), btnDim = lcd.RGB(226,228,231), btnFg = lcd.RGB(24,24,24) } },
-    { id = "dark", name = "UltiDash dark", tag = "D", dark = true, pal = DARK_PALETTE,
-      -- Toolbox palette, UltiDash dark: mono white/grey, values in the neon accent;
-      -- the Log Viewer picks its dark neon curve colours off the `dark` flag
-      toolbox = { bg = lcd.RGB(0,0,0), accent = lcd.RGB(240,240,240), hint = lcd.RGB(255,122,26), line = lcd.RGB(56,60,64),
-                  text = lcd.RGB(240,240,240), textDim = lcd.RGB(150,156,162),
-                  valText = lcd.RGB(0,229,255), valHi = lcd.RGB(255,176,0), bannerBg = lcd.RGB(255,68,56), bannerFg = lcd.RGB(0,0,0),
-                  btnBg = lcd.RGB(48,52,58), btnPressed = lcd.RGB(74,80,88), btnDim = lcd.RGB(34,36,40), btnFg = lcd.RGB(235,235,235),
-                  dark = true } },
-    { id = "theme", name = "EdgeTX theme", tag = "E", follows_theme = true, pal = THEME_PALETTE },
-}
+local SCHEMES = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 -- named lookups (SCHEMES.ulti/.dark/.theme) — string keys don't disturb #SCHEMES
-for i = 1, #SCHEMES do SCHEMES[SCHEMES[i].id] = SCHEMES[i] end
 
 -- ============================================================================
 -- SKIN REGISTRY (skin system): the selectable dashboard LAYOUTS.
@@ -292,39 +385,7 @@ end
 -- traffic-light key; `chrome` = a neutral-chrome key. `theme = true` marks the roles offered
 -- even in EdgeTX-theme mode (the ones the EdgeTX theme does NOT itself define — only the
 -- traffic-light colours). `grp` drives the section headers on the page.
-local COLOR_ROLES = {
-    { grp = "Palette",       k = "P1", slot = 1, lbl = "Text / foreground" },
-    { grp = "Palette",       k = "P2", slot = 2, lbl = "Base background" },
-    { grp = "Palette",       k = "S1", slot = 3, lbl = "Strong lines / text" },
-    { grp = "Palette",       k = "S2", slot = 4, lbl = "Accent fill" },
-    { grp = "Palette",       k = "S3", slot = 5, lbl = "Panel surface" },
-    { grp = "Palette",       k = "FC", slot = 6, lbl = "Accent / headings" },
-    { grp = "Palette",       k = "WN", slot = 7, lbl = "Warning accent" },
-    { grp = "Palette",       k = "DS", slot = 8, lbl = "Dim / disabled accent" },
-    { grp = "Traffic-light", k = "SG", sem = "green", lbl = "Good (green)",     theme = true },
-    { grp = "Traffic-light", k = "SY", sem = "yell",  lbl = "Warning (yellow)", theme = true },
-    { grp = "Traffic-light", k = "SR", sem = "red",   lbl = "Critical (red)",   theme = true },
-    { grp = "Traffic-light", k = "SN", sem = "neut",  lbl = "Neutral (quiet)",  theme = true },
-    -- statusbar arm-state text. UNSET they follow what the text always followed (armed =
-    -- the EFFECTIVE traffic-light green incl. its override, disarmed = the resolved
-    -- WARNING slot 7) — see set_palette; the built-ins here only feed the picker swatch.
-    { grp = "Status text",   k = "AR", stat = "armed",    lbl = "Armed",    theme = true },
-    { grp = "Status text",   k = "DA", stat = "disarmed", lbl = "Disarmed", theme = true },
-    { grp = "Chrome",        k = "BG", chrome = "bg",    lbl = "Panel background (fill)" },
-    { grp = "Chrome",        k = "TR", chrome = "track", lbl = "Bar track / empty" },
-    { grp = "Chrome",        k = "TK", chrome = "tick",  lbl = "Tick marks" },
-    { grp = "Chrome",        k = "DM", chrome = "dim",   lbl = "Dim secondary text" },
-    -- battery fills: the main battery bar (ePowerbar levels) + the top-bar TX battery icon.
-    -- These were historically FIXED (never theme-driven), so their built-ins are the same for
-    -- every scheme and they are offered in EdgeTX-theme mode too (theme = true).
-    { grp = "Battery",       k = "BO", batt = "ok",    lbl = "Battery bar OK",           theme = true },
-    { grp = "Battery",       k = "BW", batt = "warn",  lbl = "Battery bar not full",     theme = true },
-    { grp = "Battery",       k = "BL", batt = "low",   lbl = "Battery bar low",          theme = true },
-    { grp = "Battery",       k = "BC", batt = "crit",  lbl = "Battery bar critical",     theme = true },
-    { grp = "Battery",       k = "BK", batt = "check", lbl = "Battery bar cell check",   theme = true },
-    { grp = "Battery",       k = "XO", batt = "vtx_ok",  lbl = "TX battery OK",          theme = true },
-    { grp = "Battery",       k = "XL", batt = "vtx_low", lbl = "TX battery low",         theme = true },
-}
+local COLOR_ROLES = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 -- a role is offered for a scheme when: own-palette schemes (UltiDash light/dark) -> all
 -- roles; theme-following schemes -> only the roles flagged `theme` (the traffic-light
 -- colours the EdgeTX theme itself doesn't define). Takes a SCHEMES descriptor.
@@ -520,7 +581,13 @@ end
 -- plain view switch (same scheme, no save) skips the ~57-role override scan and the resolve.
 -- The cheap file-local / SEM assignments in set_palette still run on every rebuild (another
 -- instance may have repainted them since).
-local pal_memo = { scheme = nil, gen = -1, neutral = nil, b = nil, ovr = nil }
+-- `theme_dark` is the odd one out and rides here rather than in a top-level local of its own
+-- (the locals wall; check_locals names this exact pattern as the relief). It answers "is the
+-- RADIO's theme dark", which no scheme change and no settings save can move, so it is filled
+-- once and never invalidated -- deliberately, and with the same limit builtins_cache already
+-- carries: switching the EdgeTX theme without a reboot leaves it stale. Measured reason for
+-- the memo: resolving it per rebuild costs ~35 instructions on EVERY cycle.
+local pal_memo = { scheme = nil, gen = -1, neutral = nil, b = nil, ovr = nil, theme_dark = nil }
 
 -- Palette for the Toolbox tool pages so they FIT the dashboard's look. The tools are kept
 -- MONOCHROME like the detail pages (light = black on light-grey, dark = white on dark-grey):
@@ -541,10 +608,19 @@ local function toolbox_palette(def)
     if def.follows_theme then
         -- EdgeTX theme: mono theme fg/bg, values in the theme focus colour (reads the
         -- CURRENT resolved palette locals, incl. the user's colour overrides, as before)
+        if pal_memo.theme_dark == nil then
+            pal_memo.theme_dark = theme_luma(COLOR_THEME_SECONDARY3) < DARK_LUMA_THRESHOLD
+        end
         return { bg = COLOR_THEME_SECONDARY3, accent = COLOR_THEME_PRIMARY1, hint = COLOR_THEME_DISABLED, line = COLOR_THEME_SECONDARY1,
                  text = COLOR_THEME_PRIMARY1, textDim = COLOR_THEME_DISABLED,
                  valText = COLOR_THEME_FOCUS, valHi = COLOR_THEME_WARNING, bannerBg = COLOR_THEME_WARNING, bannerFg = COLOR_THEME_PRIMARY2,
-                 btnBg = COLOR_THEME_SECONDARY2, btnPressed = COLOR_THEME_SECONDARY1, btnDim = COLOR_THEME_SECONDARY3, btnFg = COLOR_THEME_PRIMARY2 }
+                 btnBg = COLOR_THEME_SECONDARY2, btnPressed = COLOR_THEME_SECONDARY1, btnDim = COLOR_THEME_SECONDARY3, btnFg = COLOR_THEME_PRIMARY2,
+                 -- `dark` is what the Log Viewer and the Live Monitor pick their CURVE set
+                 -- from, and this branch used to omit it -- so a pilot on this scheme with a
+                 -- DARK radio theme got the light curves (deep blue, dark red) on a dark
+                 -- chart. Judged from bg, the surface the chart is drawn on, and through
+                 -- theme_luma rather than color_luma because bg is a theme INDEX here.
+                 dark = pal_memo.theme_dark or nil }
     end
     -- own-palette descriptor WITHOUT explicit toolbox data (a skin-supplied scheme):
     -- derive the same mono look from the descriptor's own builtins — deliberately NOT
@@ -573,14 +649,7 @@ local STATS_VIEW_MODE_DISCONNECTED = 3
 local DEFAULT_STATS_VIEW_MODE = STATS_VIEW_MODE_DISARMED
 local SIM_VIEW_SWITCH_INTERVAL = 12 * 100
 
-local FONT_CONSTANTS = {
-    TINSIZE = TINSIZE,
-    SMLSIZE = SMLSIZE,
-    STDSIZE = STDSIZE,
-    MIDSIZE = MIDSIZE,
-    DBLSIZE = DBLSIZE,
-    XXLSIZE = XXLSIZE
-}
+local FONT_CONSTANTS = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 
 local xlsize = _G["XLSIZE"]
 local has_xlsize = (type(xlsize) == "number")
@@ -642,6 +711,13 @@ local function get_target_view(widget)
         -- would undo a just-made manual dismiss ("stats closes then reopens instantly").
         -- A REAL arm clears the dismiss via the ARM sensor (armed_now) in the 5 Hz pass.
         return "flight"
+    end
+    -- C3: a deliberate tap on the flight view's status panel opened the page. It wins
+    -- over StatsViewMode ("Never" governs the AUTOMATIC route only — a tap is a second,
+    -- manual one), over ever_armed and over a standing manual dismiss. Cleared by the
+    -- page's own X and by the next real arm (the ARM-sensor edge), nowhere else.
+    if widget.stats_tap_open then
+        return "stats"
     end
     if mode == STATS_VIEW_MODE_NEVER or view.ever_armed ~= true then
         return "flight"
@@ -762,10 +838,50 @@ end
 --- picked up on a normal cycle after create, in that cycle's own budget.
 local function ensure_rf_service(widget)
     if widget.rf_service_ready then return end
+    -- The RF service is the one part of the widget that is target-specific, so the
+    -- declared craft target gates its LOAD. For 0.8.0 the condition is always true
+    -- (Rotorflight is the only realised target and normalize_target maps everything
+    -- onto it) -- it is structure for a second target, not a saving anyone sees.
+    -- Not pcall'd, unlike the elrs_cfg block below: a missing ultidashRf.lua was fatal
+    -- while this load sat at module level and stays fatal. Degrading the whole RF
+    -- service to silence would hide the cause of a dashboard full of dashes.
+    if rf_service == nil then
+        if not (widget.opt_mod and widget.target == widget.opt_mod.TARGET_RF) then return end
+        rf_service = loadScript(script_dir .. "ultidashRf.lua")()
+    end
     -- 3rd arg: the ARM-sensor predicate for the MSP read gate — the
     -- service must never fire reads while the craft is armed, whatever the
     -- RFTool connection state claims
-    rf_service.init(widget, handle_telemetry_state_change, ultidash_functions.is_armed)
+    -- 4th arg: a GETTER for the file logger, not the logger — ultidashDebug is lazy-loaded
+    -- and ultidash_functions.dbg is nil until the DebugLog option is first turned on, so a
+    -- reference captured here would stay nil for the whole session.
+    -- 5th arg: the ELRS TX configuration client, loaded here rather than at module
+    -- level so its load lands in THIS cycle's budget and not in create()'s. The RF
+    -- service drives it because that is where the connect trigger and the ARM-sensor
+    -- gate already are — a CRSF push costs an RC channel frame exactly like an MSP
+    -- one does. pcall'd: a card without the file loses the ELRS Status page and
+    -- nothing else.
+    if elrs_cfg == nil then
+        local ok, m = pcall(function() return loadScript(script_dir .. "ultidashElrs.lua")() end)
+        if ok and type(m) == "table" then
+            elrs_cfg = m
+            elrs_cfg.init(function() return ultidash_functions.dbg end)
+        end
+    end
+    -- 6th arg: a LOADER for the RFSuite MSP service back end, not the module. The RF service
+    -- calls it the first time it sees `rfsuite.msp` published in this Lua state and never
+    -- otherwise, so a card with RFTool -- or with neither -- pays nothing for the second
+    -- provider. pcall'd like the ELRS client: a card without the file loses that provider
+    -- and nothing else.
+    rf_service.init(widget, handle_telemetry_state_change, ultidash_functions.is_armed,
+                    function() return ultidash_functions.dbg end, elrs_cfg,
+                    function()
+                        local ok, m = pcall(function()
+                            return loadScript(script_dir .. "ultidashRfs.lua")()
+                        end)
+                        if ok and type(m) == "table" then return m end
+                        return nil
+                    end)
     widget.sync_active_battery_capacity = rf_service.sync_active_battery_capacity
     widget.rf_service_ready = true
 end
@@ -899,87 +1015,12 @@ local RAW_SENTINEL = "~raw"
 -- It is the STABLE, unique reference: EdgeTX can create a same-named native CRSF sensor
 -- (RxBt/Curr/Capa/Bat% …), so name lookups are ambiguous; the app-id resolver reads the RIGHT
 -- sensor by this ID. ELRS link + name-only sensors carry no appId (no RF custom sensor).
-local SENSOR_INFO = {
-    -- battery / cells
-    Vbat     = { lbl = "Battery", cap = "Batt",      dec = 2, unit = "V",   appId = 0x1011 },
-    Curr     = { lbl = "Current", cap = "Current",      dec = 1, unit = "A",   appId = 0x1012 },
-    Capa     = { lbl = "Energy Used", cap = "Used",  dec = 0, unit = "mAh", appId = 0x1013 },
-    ["Bat%"] = { lbl = "Fuel", cap = "Fuel",         dec = 0, unit = "%",   appId = 0x1014 },
-    ["Cel#"] = { lbl = "Cells", cap = "Cell#",        dec = 0, unit = "",    appId = 0x1020 },
-    Vcel     = { lbl = "Cell",         dec = 2, unit = "V",   appId = 0x1021 },
-    Cels     = { lbl = "Cell V", cap = "Cells",       dec = 2, unit = "V" },   -- composite (no single appId)
-    Thr      = { lbl = "Throttle",     dec = 0, unit = "%",   appId = 0x1035 },
-    -- ESC #1
-    EscV     = { lbl = "ESC Voltage", cap = "ESC V",  dec = 2, unit = "V",   appId = 0x1041 },
-    EscI     = { lbl = "ESC Current", cap = "ESC A",  dec = 1, unit = "A",   appId = 0x1042 },
-    EscC     = { lbl = "ESC Used", cap = "ESC Used",     dec = 0, unit = "mAh", appId = 0x1043 },
-    EscR     = { lbl = "ESC RPM", cap = "ESC RPM",      dec = 0, unit = "rpm", appId = 0x1044 },
-    EscP     = { lbl = "ESC PWM", cap = "ESC PWM",      dec = 1, unit = "%",   appId = 0x1045 },
-    ["Esc%"] = { lbl = "ESC Load", cap = "ESC Load",     dec = 1, unit = "%",   appId = 0x1046 },
-    EscT     = { lbl = "ESC Temp", cap = "ESC T",     dec = 0, unit = "°C",  appId = 0x1047 },
-    BecT     = { lbl = "BEC T (ESC)", cap = "BEC T",  dec = 0, unit = "°C",  appId = 0x1048 },
-    BecV     = { lbl = "BEC V (ESC)", cap = "BEC V",  dec = 2, unit = "V",   appId = 0x1049 },
-    BecI     = { lbl = "BEC I (ESC)", cap = "BEC A",  dec = 1, unit = "A",   appId = 0x104A },
-    -- ESC #2
-    Es2V     = { lbl = "ESC2 Voltage", cap = "ESC2 V", dec = 2, unit = "V",   appId = 0x1051 },
-    Es2I     = { lbl = "ESC2 Current", cap = "ESC2 A", dec = 1, unit = "A",   appId = 0x1052 },
-    Es2C     = { lbl = "ESC2 Used", cap = "ESC2 Used",    dec = 0, unit = "mAh", appId = 0x1053 },
-    Es2R     = { lbl = "ESC2 RPM", cap = "ESC2 RPM",     dec = 0, unit = "rpm", appId = 0x1054 },
-    Es2T     = { lbl = "ESC2 Temp", cap = "ESC2 T",    dec = 0, unit = "°C",  appId = 0x1057 },
-    -- rails / currents
-    Vesc     = { lbl = "ESC Rail V", cap = "ESC V",   dec = 2, unit = "V",   appId = 0x1080 },
-    Vbec     = { lbl = "BEC Voltage", cap = "BEC",  dec = 2, unit = "V",   appId = 0x1081 },
-    Vbus     = { lbl = "Bus Voltage", cap = "Bus V",  dec = 2, unit = "V",   appId = 0x1082 },
-    Vmcu     = { lbl = "MCU Voltage", cap = "MCU V",  dec = 2, unit = "V",   appId = 0x1083 },
-    Iesc     = { lbl = "ESC Rail I", cap = "ESC A",   dec = 1, unit = "A",   appId = 0x1090 },
-    Ibec     = { lbl = "BEC Current", cap = "BEC A",  dec = 1, unit = "A",   appId = 0x1091 },
-    Ibus     = { lbl = "Bus Current", cap = "Bus A",  dec = 1, unit = "A",   appId = 0x1092 },
-    Imcu     = { lbl = "MCU Current", cap = "MCU A",  dec = 1, unit = "A",   appId = 0x1093 },
-    -- temperatures
-    Tesc     = { lbl = "ESC Temp", cap = "ESC T",     dec = 0, unit = "°C",  appId = 0x10A0 },
-    Tbec     = { lbl = "BEC Temp", cap = "BEC T",     dec = 0, unit = "°C",  appId = 0x10A1 },
-    Tmcu     = { lbl = "MCU Temp", cap = "MCU T",     dec = 0, unit = "°C",  appId = 0x10A3 },
-    Tair     = { lbl = "Air Temp", cap = "Air T",     dec = 0, unit = "°C" },   -- name-only (not in the
-    Tmtr     = { lbl = "Motor Temp", cap = "Mtr T",   dec = 0, unit = "°C" },   -- RF2 sensor table; harmless
-    Tbat     = { lbl = "Batt Temp", cap = "Batt T",    dec = 0, unit = "°C" },   -- if a model reports them
-    -- rotor / speeds / MCU loads
-    Hspd     = { lbl = "Headspeed",    dec = 0, unit = "rpm", appId = 0x10C0 },
-    Tspd     = { lbl = "Tailspeed", cap = "Tail",    dec = 0, unit = "rpm", appId = 0x10C1 },
-    ["CPU%"] = { lbl = "CPU Load", cap = "CPU",     dec = 0, unit = "%",   appId = 0x1141 },
-    ["SYS%"] = { lbl = "SYS Load", cap = "SYS",     dec = 0, unit = "%",   appId = 0x1142 },
-    ["RT%"]  = { lbl = "RT Load", cap = "RT",      dec = 0, unit = "%",   appId = 0x1143 },
-    -- altitude / attitude / GPS
-    Alt      = { lbl = "Altitude",     dec = 1, unit = "m",   appId = 0x10B2 },
-    Var      = { lbl = "Vario",        dec = 1, unit = "m/s", appId = 0x10B3 },
-    Hdg      = { lbl = "Heading",      dec = 1, unit = "°",   appId = 0x10B1 },
-    Sats     = { lbl = "GPS Sats",     dec = 0, unit = "",    appId = 0x1121 },
-    GSpd     = { lbl = "GPS Speed", cap = "GPS Spd",    dec = 1, unit = "m/s", appId = 0x1128 },
-    GAlt     = { lbl = "GPS Alt", cap = "GPS Alt",      dec = 1, unit = "m",   appId = 0x1126 },
-    GDis     = { lbl = "GPS Dist", cap = "Dist",     dec = 1, unit = "m",   appId = 0x1129 },
-    CPtc     = { lbl = "Ctrl Pitch", cap = "C Ptch",   dec = 1, unit = "°",   appId = 0x1031 },
-    CRol     = { lbl = "Ctrl Roll", cap = "C Roll",    dec = 1, unit = "°",   appId = 0x1032 },
-    CYaw     = { lbl = "Ctrl Yaw", cap = "C Yaw",     dec = 1, unit = "°",   appId = 0x1033 },
-    CCol     = { lbl = "Ctrl Coll", cap = "C Coll",    dec = 1, unit = "°",   appId = 0x1034 },
-    Ptch     = { lbl = "Pitch",        dec = 1, unit = "°",   appId = 0x1101 },
-    Roll     = { lbl = "Roll",         dec = 1, unit = "°",   appId = 0x1102 },
-    Yaw      = { lbl = "Yaw",          dec = 1, unit = "°",   appId = 0x1103 },
-    -- ELRS link quality (name-based; no RF custom appId)
-    RQly     = { lbl = "Link Qual",    dec = 0, unit = "%" },
-    TQly     = { lbl = "Uplink Qual",  dec = 0, unit = "%" },
-    RSNR     = { lbl = "SNR",          dec = 0, unit = "dB" },
-    TPWR     = { lbl = "TX Power",     dec = 0, unit = "mW" },
-    -- virtual (computed) sensor: UltiDash's Curr/limit ESC utilisation (distinct from the
-    -- telemetry-reported Esc% "ESC Load")
-    ["~escl"] = { lbl = "ESC Util",    dec = 0, unit = "%" },
-}
+local SENSOR_INFO = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 
 -- appId -> canonical SENSOR_INFO name (built from the table above), for the app-id resolver:
 -- a scanned sensor whose model-sensor `id` matches an appId is our known sensor, even if the
 -- user renamed it or a native CRSF sensor stole the name.
 local NAME_BY_APPID = {}
-for name, info in pairs(SENSOR_INFO) do
-    if info.appId then NAME_BY_APPID[info.appId] = name end
-end
 
 -- precision learned live from model.getSensor (used only for unknown sensors)
 local sensor_prec_cache = {}
@@ -988,14 +1029,7 @@ local sensor_prec_cache = {}
 -- plausibility filtering AND simulator demo data). Prefer those fields over a raw
 -- getSourceValue read: correct on hardware and populated in the simulator, where
 -- getSourceValue has no real sensors. Other sensors fall back to the 5 Hz cache.
-local SENSOR_VALUE_FIELD = {
-    Vbat = "vbat", Vcel = "vcel", ["Cel#"] = "cel_count",
-    Curr = "curr", Capa = "capa", ["Bat%"] = "capa_percent",
-    -- Curr follows the CurrSrc setting: the Current row / value.curr shows the
-    -- CONFIGURED source (Curr/EscI/Iesc), not necessarily the raw Curr sensor.
-    Tesc = "esc_temp", Vbec = "vbec", Hspd = "headspeed",
-    ["~escl"] = "esc_load_pct",   -- virtual: computed by update_esc_load_warning
-}
+local SENSOR_VALUE_FIELD = {}   -- filled IN PLACE by SETTINGS_GROUPS._build (stage 2a0); see there
 
 -- keys of all configurable value slots (5 panel + 12 detail)
 local PANEL_SLOT_KEYS  = { "PanelV1", "PanelV2", "PanelV3", "PanelV4", "PanelV5" }
@@ -1046,10 +1080,66 @@ shortcut.targets = {
     -- WRITES to the flight controller, so it replicates the tap's full condition rather than
     -- just the disarmed rule -- see shortcut.open.
     { id = "battprofile", lbl = "FC battery profile", kind = "tool", disarmed = true, msp = true },
+    -- D3: the spoken telemetry report. kind = "action" opens no page: the "open" fires
+    -- the report (armed included -- the user's decision; the callout engine keeps
+    -- precedence), a HELD position slot repeats it at TsayInt, the release stops the
+    -- repeat but never cuts a running report (a momentary press is one report).
+    { id = "telemsay", lbl = "Voice: Telemetry report", kind = "action" },
+    -- M2: the menu (options) on a switch. Its armed rule is the MENU GLYPH's own,
+    -- shared through shortcut.menu_allowed rather than copied -- the user's requirement
+    -- ("genauso wie der tap auf die zone"): blocked only while GENUINELY flying.
+    { id = "menu", lbl = "Page: Menu / settings", kind = "menu" },
+    -- M5: the Live Monitor. NO disarmed and NO msp on purpose -- reading it in flight
+    -- is the tool's point, and it touches EdgeTX telemetry sources only.
+    { id = "tb_livemon", lbl = "Toolbox: Live Monitor", kind = "tool" },
+    -- RFSuite. APPENDED, never inserted -- the cfg stores the INDEX, so an
+    -- entry anywhere above would silently repoint every saved shortcut. Disarmed-only
+    -- like RF2 Config; no msp flag, because RFSuite brings its own MSP stack and
+    -- rf_service.refresh_data would be the wrong queue to prime.
+    -- The "(exp.)" the Toolbox tile carries, on the shortcut picker too -- a switch is the
+    -- other way in, and it must not be the way in that says nothing. 23 characters, the
+    -- length of the longest entry above it, so the picker's value column is unchanged.
+    { id = "tb_rfscfg", lbl = "Toolbox: RFSuite (exp.)", kind = "tool", disarmed = true, load = "rfscfg" },
 }
+
+-- The one armed condition the menu glyph and the M2 shortcut share: the menu is
+-- refused only while the craft is genuinely flying -- armed by the ARM sensor AND not
+-- disconnected. A field, not a local (the main chunk is at Lua's 200-local limit),
+-- and ONE definition so the two entry points can never drift apart.
+shortcut.menu_allowed = function(wgt)
+    return not (ultidash_functions.is_armed(wgt)
+        and wgt.values.rf_connection_state ~= "disconnected")
+end
 -- choice-row labels for the shortcut settings (built once, mirrors shortcut.targets)
 shortcut.tlabels = {}
 for i = 1, #shortcut.targets do shortcut.tlabels[i] = shortcut.targets[i].lbl end
+
+-- The "open a page on arming" choice (Display ▸ Behaviour) reuses THIS list, filtered to
+-- Off + the four detail overlays: they are the only targets that can open while armed, a
+-- Toolbox tool being disarmed-only by construction. The filter PRESERVES the order, so
+-- the append-only rule above covers the filtered list too -- a fifth detail page appended
+-- to targets lands at the end of this list as well and shifts no stored value. The two
+-- helpers are FIELDS on this table, not module locals: the main chunk is at Lua's 200.
+shortcut.detail_labels = function()
+    local v = {}
+    for i = 1, #shortcut.targets do
+        local t = shortcut.targets[i]
+        if t.kind == "none" or t.kind == "detail" then v[#v + 1] = t.lbl end
+    end
+    return v
+end
+shortcut.detail_choice = function(n)
+    if n == nil or n <= 1 then return nil end   -- 1 = Off
+    local k = 0
+    for i = 1, #shortcut.targets do
+        local t = shortcut.targets[i]
+        if t.kind == "none" or t.kind == "detail" then
+            k = k + 1
+            if k == n then return t end
+        end
+    end
+    return nil
+end
 
 local function is_off_sensor(name)
     return name == nil or name == SENSOR_OFF or name == ""
@@ -1114,21 +1204,43 @@ end
 -- per frame.
 local function resolve_sensor_indices(wgt)
     if model == nil or type(model.getSensor) ~= "function" then return end
-    local scan, name_count = {}, {}     -- model_index -> {name,id};  name -> count (for anchor)
+    -- Cheap change signature over the sensor list: the expensive derivation below only
+    -- reruns when the model's sensors actually changed (discovery, delete, reorder).
+    -- Renames keep the slot+id, so a stale map stays CORRECT (index reads are rename-immune
+    -- by design).
+    --
+    -- SCRATCH TABLES REUSED ACROSS CALLS. This function runs every 3 s for the whole
+    -- session, connected and disconnected, and it used to build a FRESH `scan` with ~40
+    -- {name,id} entries plus two containers on every run -- then, on the overwhelmingly
+    -- common unchanged path, throw all of it away again at the signature test below. That
+    -- was ~33 table allocations per second amortised, the largest steady allocator in the
+    -- widget's own files and a standing contributor to the GC duty cycle that rides the
+    -- widget's budget. Now the entries are filled IN PLACE and outlive the call, so the
+    -- steady state allocates nothing at all here.
+    -- The obvious alternative -- signature first, build the scan only after it moved --
+    -- was measured and rejected: it needs a SECOND pass of 60 model.getSensor probes on
+    -- the change path, +1 085 instructions on that cycle (differential run, everything
+    -- else unmoved), for exactly the same steady-state saving.
+    -- The 60 probes themselves are API-imposed: each returns an EdgeTX-allocated table and
+    -- there is no way to ask for the id alone. That garbage stays.
+    local scan = wgt.sensor_scan
+    if scan == nil then scan = {}; wgt.sensor_scan = scan end
+    local name_count = wgt.sensor_ncount
+    if name_count == nil then name_count = {}; wgt.sensor_ncount = name_count end
+    for k in pairs(name_count) do name_count[k] = nil end
+    local sig = 0
     for i = 0, 59 do
         local ok, s = pcall(model.getSensor, i)
         if ok and type(s) == "table" and type(s.name) == "string" and s.name ~= "" then
-            scan[i] = { name = s.name, id = s.id }
+            local e = scan[i]
+            if e == nil then e = {}; scan[i] = e end
+            e.name, e.id = s.name, s.id
+            sig = (sig * 33 + (type(s.id) == "number" and s.id or 1) + i) & 0x7FFFFFFF
             name_count[s.name] = (name_count[s.name] or 0) + 1
+        else
+            -- a slot that went away must not survive as a ghost entry in the reused table
+            scan[i] = nil
         end
-    end
-    -- Cheap change signature over the sensor list: the expensive derivation below only reruns
-    -- when the model's sensors actually changed (discovery, delete, reorder). Renames keep the
-    -- slot+id, so a stale map stays CORRECT (index reads are rename-immune by design).
-    local sig = 0
-    for i = 0, 59 do
-        local e = scan[i]
-        if e then sig = (sig * 33 + (type(e.id) == "number" and e.id or 1) + i) & 0x7FFFFFFF end
     end
     if sig == wgt.sensor_sig and wgt.sensor_idx ~= nil then return end
     wgt.sensor_sig = sig
@@ -1167,6 +1279,41 @@ local function resolve_sensor_indices(wgt)
     -- diagnostic (only when the outcome changes; needs DebugLog on): how many sensors resolved
     -- by app-id, or a safe fall-back to name reads
     local cnt = 0; if map then for _ in pairs(map) do cnt = cnt + 1 end end
+    -- CAPABILITY SET, derived from what the radio actually carries -- never from the declared
+    -- target. An abstract flag can be wrong; a derived set cannot disagree with the radio, and
+    -- keeping both and comparing them is what turns a wrong setting into a sentence on screen
+    -- (see `norf` below). Built here, inside the signature gate above, so it costs nothing per
+    -- cycle: this function only gets past that gate when the model's sensors changed, and the
+    -- pass it rides on returns without doing anything else (~500 instr in a ~3400 cycle).
+    -- Read out of the SCAN's app-ids, not out of `map`: NAME_BY_APPID is built from
+    -- SENSOR_INFO, and the arming state (0x1202), the governor state (0x1205) and the two ESC
+    -- status words (0x104F signature / 0x104E flags) are not SENSOR_INFO rows -- they are read
+    -- by NAME. `map` can therefore never carry them, and a caps built from it would report
+    -- "no governor" for every craft that has one. The scan holds the same evidence, and it
+    -- holds it whether or not the app-id base resolved.
+    local cgov, cesc, carm, nsen = false, false, false, 0
+    for i = 0, 59 do
+        local e = scan[i]
+        if e then
+            nsen = nsen + 1
+            if e.id == 0x1205 then cgov = true
+            elseif e.id == 0x1202 then carm = true
+            elseif e.id == 0x104F or e.id == 0x104E then cesc = true end
+        end
+    end
+    wgt.caps = {
+        gov = cgov, esc = cesc, arm = carm,
+        msp = wgt.target == (wgt.opt_mod and wgt.opt_mod.TARGET_RF),
+        -- `norf` is cross-check STATE, not a capability: the three conditions of the target
+        -- cross-check that this pass can observe -- the model carries telemetry sensors, the
+        -- app-id base was derived AND validated (`map` exists, so this is not the name-read
+        -- fallback), and not one curated Rotorflight app-id resolved. The fourth condition,
+        -- "telemetry is connected", moves between two of these scans and is read live at the
+        -- display sites. All four together are the POSITIVE CONTROL: "no Rotorflight sensor"
+        -- is equally true before discovery, with the link down and when the base could not be
+        -- derived, so firing on absence alone would alarm on every cold radio.
+        norf = map ~= nil and nsen > 0 and cnt == 0,
+    }
     if cnt ~= wgt.sensor_idx_n then
         wgt.sensor_idx_n = cnt
         if ultidash_functions.dbg then
@@ -1208,10 +1355,22 @@ local function build_sensor_list(wgt)
     -- keep a currently-chosen KNOWN sensor selectable even offline (before
     -- model.getSensor has (re)discovered it). Raw picks are NOT added — they show
     -- via the ‹ Raw › entry, so the curated list stays short.
-    local src = wgt.settings_working or wgt.options or {}
-    local function add_known(name) if name and SENSOR_INFO[name] then add(name) end end
-    for i = 1, #PANEL_SLOT_KEYS  do add_known(src[PANEL_SLOT_KEYS[i]])  end
-    for i = 1, #DETAIL_SLOT_KEYS do add_known(src[DETAIL_SLOT_KEYS[i]]) end
+    -- Read the open page's UNSAVED edits first and fall back to the live options PER KEY.
+    -- This used to be one `wgt.settings_working or wgt.options` pick, which was equivalent
+    -- while the working copy carried the whole catalogue. Since the seed became
+    -- page-scoped (ultidashMenu.lua, 2026-08-17) a working copy exists that holds only the
+    -- open page's slots, and a whole-table pick would hand `nil` for every slot configured
+    -- on another page -- silently dropping those sensors from the pick list while a
+    -- telemetry page is open, which is exactly when the list is looked at.
+    local work = wgt.settings_working
+    local opts = wgt.options or {}
+    local function add_known(k)
+        local name = work and work[k]
+        if name == nil then name = opts[k] end
+        if name and SENSOR_INFO[name] then add(name) end
+    end
+    for i = 1, #PANEL_SLOT_KEYS  do add_known(PANEL_SLOT_KEYS[i])  end
+    for i = 1, #DETAIL_SLOT_KEYS do add_known(DETAIL_SLOT_KEYS[i]) end
     -- trailing display state for a raw pick (selecting it is inert — pick the raw
     -- sensor in the raw field beside the dropdown)
     labels[#labels + 1] = sensor_pick_label(RAW_SENTINEL)
@@ -1499,10 +1658,14 @@ local function build_flight_values_panel(container, wgt, x, y, c_w, c_h)
     -- panel: smart voltage, headspeed, current, ESC temp, BEC. VOLT_AUTO keeps the
     -- cell/battery toggle + warn colour; a plain sensor uses the cheap cache getter;
     -- an Off slot renders blank.
-    -- Units are opt-in (Display ▸ "Units beside values"): with them off every row keeps
-    -- the full value column and therefore the biggest font that fits -- the original
-    -- formatting, and the readable one on the small screens.
-    local units_on = (wgt.options.ShowUnits == 1)
+    -- Units are opt-in: with them off every row keeps the full value column and
+    -- therefore the biggest font that fits -- the original formatting, and the readable
+    -- one on the small screens. The KEY belongs to the active skin since 0.8.0 (see
+    -- SKINS._units_key): whether a unit is worth its font size is a property of the
+    -- layout, exactly like the colour scheme, and the same value that reads well on the
+    -- MK3's default panel does not on a 480 px card layout. A skin that declares no key
+    -- of its own falls back to the host's, which is also what the detail pages read.
+    local units_on = (wgt.options[SKINS._units_key or "ShowUnits"] == 1)
     local rows = {}
     for i = 1, 5 do
         local name = wgt.options[PANEL_SLOT_KEYS[i]] or SENSOR_OFF
@@ -1910,11 +2073,16 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
     local thr_w = inner_w - gov_w
 
     -- fonts: flight totals
+    -- M1: the pair shares ONE font and ONE glyph height. The two picks used to run
+    -- independently against the same height budget, and the Flights sample ("9999") is
+    -- less than half as wide as the time's -- so wherever the ladder had a step in
+    -- between, Flights came out a size larger and the two baselines (each stacked
+    -- field centres its OWN value_h) drifted apart. pick_smallest_font existed for
+    -- exactly this and had never been called.
     local flights_font = select_font(h_meta - header_h, half_w, "9999")
-    local flights_font_h = measure_font(flights_font)
     local time_font = select_font(h_meta - header_h, inner_w - half_w, "999:59:59")
-    local time_font_h = measure_font(time_font)
-    local meta_value_h = math.max(flights_font_h, time_font_h)
+    local meta_font = pick_smallest_font(flights_font, time_font)
+    local meta_value_h = measure_font(meta_font)
     local meta_pad = math.max(0, math.floor((h_meta - header_h - meta_value_h) / 2))
 
     -- fonts: governor + throttle headline row
@@ -1964,7 +2132,12 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
             w = inner_w, h = timer_font_h,
             text = wgt.values.timer_str_formatted,
             font = timer_font,
-            color = function() return wgt.values.timer_color() end,
+            -- the reference, not a wrapper around it: timer_color is a stable per-widget
+            -- closure in the values table, exactly like timer_str_formatted on the line
+            -- above and arm_state_color further down, both of which are already passed
+            -- straight through. The wrapper was one extra Lua call per LVGL frame for
+            -- nothing.
+            color = wgt.values.timer_color,
             align = CENTER
         }
     else
@@ -1981,9 +2154,9 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
 
     -- flight totals directly under the image
     add_stacked_field(status_children, pad, y_meta, half_w, meta_pad,
-        wgt.values.label_total_flights, wgt.values.rf_total_flights_display_formatted, flights_font, flights_font_h)
+        wgt.values.label_total_flights, wgt.values.rf_total_flights_display_formatted, meta_font, meta_value_h)
     add_stacked_field(status_children, pad + half_w, y_meta, inner_w - half_w, meta_pad,
-        "Total Time", wgt.values.rf_total_flight_time_display_formatted, time_font, time_font_h)
+        "Total Time", wgt.values.rf_total_flight_time_display_formatted, meta_font, meta_value_h)
 
     -- headline status row: Governor State (left) + Throttle (right)
     add_stacked_field(status_children, pad, y_gt, gov_w, gt_pad,
@@ -1995,6 +2168,10 @@ local function build_flight_status_panel(container, wgt, x, y, c_w, c_h)
     -- Tapping it (fullscreen) opens the status detail page — remember its rect
     -- in widget coords for the hit-test in refresh().
     wgt.estatus_rect = { x = x + pad, y = y + y_esc, w = inner_w, h = h_esc }
+    -- C3: the whole status panel is the tap zone that opens the STATISTICS page — it
+    -- already shows the flight counter and total time, so it is the stats surface. The
+    -- status LINE keeps its own estatus_rect; the tap dispatcher checks that one first.
+    wgt.statspage_rect = { x = x, y = y, w = c_w, h = c_h }
     status_children[#status_children + 1] = {
         type = "label",
         x = pad,
@@ -2601,6 +2778,25 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         date_x = box_x + box_w + 4
     end
 
+    -- STATS PAGE ONLY: the one visible way out. Since 0.8.0 no page closes on a tap
+    -- anywhere, so the page that never even had the "tap to close" hint needs a real
+    -- control. It goes in the TOP BAR rather than over the table because the bar is
+    -- host-owned on every skin -- a skin that draws it gets the button without knowing
+    -- about it, and the host does not have to guess at a free corner in someone else's
+    -- layout. Fullscreen only, exactly like the menu glyph beside it: a widget zone
+    -- gets no touch, and a control that cannot be pressed is worse than none.
+    -- Placed left of the TX voltage / battery pill, the one gap the stats top bar has
+    -- (its link bars are suppressed).
+    if in_fs and init_view_state(wgt).current == "stats" then
+        local cx, csz = ultidash_functions.close_control(container,
+            ((wgt.options.ShowTxV == 1) and volt_text_x or icon_x) - 6, y + 1,
+            COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY1, c_h - 2)
+        -- deliberately larger than the glyph, and anchored to the bar's own top edge
+        -- rather than to the box: the container's origin is the skin's, not ours (the
+        -- same reason settings_icon_rect above spans the whole corner)
+        wgt.close_rect = { x = cx - 6, y = 0, w = csz + 12, h = c_h + 6 }
+    end
+
     -- left: clock (date + time, or time only via ClockMode), width MEASURED (a
     -- fixed 30% left a huge gap on the 800x480 TX16S and pushed the bars right)
     local time_only = wgt.options.ClockMode == 2
@@ -2652,7 +2848,7 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         local C_NEUT  = SEM_NEUT
         local TICK    = COLOR_DIM
         local quiet   = wgt.options.BarsQuiet == 1
-        -- Fallbacks match the DECLARED defaults (SETTINGS_THRESHOLDS: 80/50/15/8). They used
+        -- Fallbacks match the DECLARED defaults (the Thresholds group: 80/50/15/8). They used
         -- to read 50/30/50/25, which agreed with nothing: an RSSI fallback of 50 % against a
         -- declared 15 % would have warned permanently. Dead code either way -- apply() fills
         -- every default before the first read, which is precisely why nobody noticed -- but
@@ -2710,10 +2906,17 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
                 local fx, fy, fh = center_x + 1, by + 1, bar_h - 2
                 local fw_max = bar_w - 2
                 elems[#elems + 1] = { type = "rectangle", x = center_x, y = by, w = bar_w, h = bar_h, thickness = 1, rounded = 2, color = COLOR_THEME_SECONDARY1 }
+                -- NO `pos` closure: x/y are build-time constants and only the WIDTH is
+                -- reactive. It used to carry `pos = function() return fx, fy end`, a closure
+                -- LVGL invoked every frame to be handed the same two numbers it was built
+                -- with. MEASURED on the simulator 2026-08-17 (harness scenario `h5pos`, the
+                -- link bars at 800x480): with and without the closure, all 12 resolved
+                -- rectangles -- 3 bands x 4 RQly steps -- are identical to the pixel, x0/y0
+                -- never move, and band 0's width does change across the sweep, which is the
+                -- positive control that the run could have seen a difference.
                 elems[#elems + 1] = {
                     type = "rectangle", x = fx, y = fy, w = 1, h = fh, filled = true, rounded = 1,
                     color = fill_color(get, warn, crit),
-                    pos = function() return fx, fy end,
                     size = function()
                         local v = get() or 0
                         if v < 0 then v = 0 elseif v > 100 then v = 100 end
@@ -2725,10 +2928,15 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
                 elems[#elems + 1] = { type = "rectangle", x = center_x + math.floor(bar_w * warn / 100), y = by + bar_h - nh, w = 2, h = nh, filled = true, color = TICK }
             else
                 elems[#elems + 1] = { type = "rectangle", x = center_x, y = by, w = bar_w, h = bar_h, filled = true, color = TRACK }
+                -- same as the outlined branch above, and NOT separately measured: this is the
+                -- thin-bar branch (bar_h < 6), which no supported radio reaches at its
+                -- fullscreen zone, so the simulator could not drive it. It is the same element
+                -- type on the same container:build path, and what was measured there is a
+                -- property of that path -- the binding updates w/h through its own setter and
+                -- never touches x/y without a `pos`.
                 elems[#elems + 1] = {
                     type = "rectangle", x = center_x, y = by, w = 1, h = bar_h, filled = true,
                     color = fill_color(get, warn, crit),
-                    pos = function() return center_x, by end,
                     size = function()
                         local v = get() or 0
                         if v < 0 then v = 0 elseif v > 100 then v = 100 end
@@ -2802,7 +3010,11 @@ local function build_top_bar_element(container, wgt, x, y, c_w, c_h, show_link)
         filled = true,
         rounded = math.max(1, icon_r - 2),
         color = function() return wgt.values.vtx_fill_color() end,
-        pos = function() return icon_x + 1, icon_y + 1 end,
+        -- constant `pos` dropped, same reasoning as the link bars -- and NOT separately
+        -- measured either: this fill is driven by the RADIO's own battery
+        -- (vtx_fill_ratio), which the simulator harness cannot move, so a run there would
+        -- have watched a size that never changes and proved nothing about position under a
+        -- changing one. Covered by the measured property of the binding, not by its own run.
         size = function() return math.max(0, math.floor((icon_w - 2) * wgt.values.vtx_fill_ratio())), icon_h - 2 end
     }
     icon_elems[#icon_elems + 1] = {
@@ -2961,6 +3173,22 @@ local function build_status_view(wgt, zone)
         -- running" was unanswerable without pulling the card. A plain string: neither the
         -- version nor the build reference can change while the widget runs.
         { lbl = "Version", val = version_text() },
+        -- The craft target this instance was PLACED with (EdgeTX widget options), plus the
+        -- cross-check against what the sensors say. The message states the OBSERVATION and
+        -- not a diagnosis -- a model with renamed sensors and a wrongly declared target look
+        -- exactly alike from here, and only the pilot can tell them apart. Silent unless all
+        -- four positive-control conditions hold (caps.norf covers three, `connected` the
+        -- fourth); see the caps build in resolve_sensor_indices.
+        { lbl = "Craft target", val = memo(
+            function() return shared.connected, wgt.caps and wgt.caps.msp,
+                              wgt.caps and wgt.caps.norf end,
+            function()
+                local n = wgt.opt_mod and wgt.opt_mod.target_name(wgt.target) or "-"
+                if shared.connected and wgt.caps and wgt.caps.msp and wgt.caps.norf then
+                    return n .. "  (no " .. n .. " sensors found)"
+                end
+                return n
+            end) },
         -- WHICH cfg file this radio is actually reading and writing, by name. The key is
         -- the model name LATCHED AT BOOT (ultidashSettings model_key), and a connected
         -- craft renames the EdgeTX model underneath us -- Rotorflight's own RF2 background
@@ -2977,6 +3205,17 @@ local function build_status_view(wgt, zone)
                 if not shared.ready then return "-" end
                 return (shared.model_name or "-") .. (shared.connected and "  (conn)" or "  (disc)")
             end) },
+        -- WHICH RFTool this radio carries, by its own contract version. It is the answer to
+        -- "why does this install behave differently", and it is reported rather than acted
+        -- on: nothing in the widget branches on the number (see ultidashRf note_tool_api).
+        -- "not reported" is a working RFTool 2.3.0-RC1, not a fault; "-" means no RFTool.
+        { lbl = "RFTool API", val = function() return wgt.values.rf_tool_api_text or "-" end },
+        -- WHO is serving MSP, and -- for the RFSuite service -- whether anybody is pumping
+        -- it. Two providers can publish into this Lua state and they share the radio's one
+        -- CRSF transmit slot, so UltiDash picks RFTool and says the other was seen rather
+        -- than arbitrating silently. "(idle)" is a published surface nobody drives, which
+        -- is the one case where the values are missing and nothing looks wrong.
+        { lbl = "MSP provider", val = function() return wgt.values.rf_provider_text or "-" end },
         { section = "Battery" },
         { lbl = "Cell source", val = function() return th.source or "-" end },
         { lbl = "Cell full / low / crit", val = memo(
@@ -2988,6 +3227,74 @@ local function build_status_view(wgt, zone)
         { lbl = "Reserve", val = memo(
             function() return shared.ready, th.reserve end,
             function() if not shared.ready then return "-" end return num(th.reserve, "%d %%") end) },
+        -- What the FLIGHT CONTROLLER itself is configured for (MSP, read at connect/disarm).
+        -- All of it is configuration: it cannot change while the craft flies, so one read
+        -- holds all session and every row is a PLAIN closure over a string the RF service
+        -- built once per read (ultidashRf on_*_received) -- no memo, no per-frame concat.
+        -- Deliberately none of this is on the dashboard: a dashboard is for what moves.
+        { section = "Flight controller" },
+        -- voltage / current meter source. current = None is the third condition of the
+        -- SmartFuel bat_capacity trap, which is why it is worth a row of its own.
+        { lbl = "Meters  V / I", val = function() return wgt.values.rf_meter_src_text or "-" end },
+        -- The FC's OWN consumption warning, shown so the pilot can compare it with the
+        -- UltiDash fuel thresholds two sections up. It drives NOTHING here, by decision:
+        -- the callout thresholds are the pilot's and are set in this widget.
+        -- The one row in this block that FORMATS rather than reading a string the RF service
+        -- built once, so it is the one that needs the memo its neighbours two sections up
+        -- use: without it, string.format ran per LVGL frame for a number that moves at most
+        -- once per connect.
+        { lbl = "FC fuel warn (info)", val = memo(
+            function() return wgt.values.rf_fc_fuel_warn_pct end,
+            function()
+                local v = wgt.values.rf_fc_fuel_warn_pct
+                return v and string.format("%d %%", v) or "-"
+            end) },
+        { lbl = "LVC / cell max", val = function() return wgt.values.rf_batt_limits_text or "-" end },
+        { lbl = "Gov mode", val = function() return wgt.values.rf_gov_mode_name or "-" end },
+        { lbl = "Gov spool / start / hand", val = function() return wgt.values.rf_gov_timing_text or "-" end },
+        { lbl = "Gov throttle", grow = true, val = function() return wgt.values.rf_gov_throttle_text or "-" end },
+        -- The FC's own telemetry slot list -- the row that explains an N/S on the sensor
+        -- check. In NATIVE mode there is no slot count, because the firmware ignores the
+        -- list entirely in that mode.
+        { lbl = "Telemetry", val = function() return wgt.values.rf_crsf_text or "-" end },
+        { lbl = "SmartFuel", val = function() return wgt.values.rf_smartfuel_mode_name or "-" end },
+        { lbl = "ESC protocol", val = function() return wgt.values.rf_esc_protocol_name or "-" end },
+        -- M4: the EFFECTIVE adjust-table source. The option can say FC while a refused,
+        -- failed or never-triggered walk leaves the hand table in force -- that state is
+        -- silent by design everywhere else, so this row is where it becomes checkable.
+        { lbl = "Adjust table", val = memo(
+            function()
+                return settings_gen, wgt.values.rf_adj_state,
+                    wgt.rf and wgt.rf.adj_gen or 0, wgt.rf and wgt.rf.adj_table ~= nil
+            end,
+            function()
+                local src = wgt.options and wgt.options.TbSource or 1
+                if src < 2 then return "manual" end
+                local lbl = (src >= 3) and "FC + labels" or "FC"
+                local t = wgt.rf and wgt.rf.adj_table
+                if t ~= nil then return string.format("%s - %d slots", lbl, #t) end
+                local st = wgt.values.rf_adj_state
+                if st == "reading" then return lbl .. " - reading..." end
+                if st == "failed" then return lbl .. " - read failed, manual in use" end
+                return lbl .. " - waiting for connect, manual in use"
+            end) },
+        -- M4 for M5: whether the live monitor's ring is actually RUNNING. The option
+        -- rows can name sensors while every read returns nil (renamed sensor, wrong
+        -- model) -- the strips would sit at their baseline with no error anywhere,
+        -- so the sampled state is made checkable here.
+        { lbl = "Live monitor", val = memo(
+            function()
+                local lm = wgt.lm
+                return settings_gen, lm ~= nil and lm.n or 0,
+                    lm ~= nil and lm.head or 0
+            end,
+            function()
+                local lm = wgt.lm
+                if lm == nil then return "off (no sensors configured)" end
+                if lm.head == 0 then return string.format("%d sensor(s), no samples yet", lm.n) end
+                return string.format("%d sensor(s), ring at %d s of 60",
+                    lm.n, math.min(60, math.floor(lm.head / 5)))
+            end) },
         { section = "Link" },
         { lbl = "RQly warn / crit", val = memo(
             function() return shared.ready, th.rq_warn, th.rq_crit end,
@@ -3033,6 +3340,17 @@ local function build_status_view(wgt, zone)
                 return (al.mute and "ALL MUTED" or "none") .. "  /  " .. (al.escalating and "ACTIVE" or "idle")
             end) },
         { lbl = "Sounds off", val = sounds_off },
+        -- M4 (D3): name-wav coverage of the spoken report. The decided fallback speaks
+        -- value-and-unit, so an incomplete recording set cannot be HEARD -- this row is
+        -- where that state becomes checkable. "off" = the names option itself is off.
+        { lbl = "Report name wavs", val = memo(
+            function() return settings_gen end,
+            function()
+                local f, t, lang = ultidash_functions.tsay_wav_state(wgt)
+                if f == nil then return "off (values only)" end
+                if t == 0 then return "no slots configured" end
+                return string.format("%d/%d found (%s)", f, t, lang)
+            end) },
         { section = "Volume" },
         { lbl = "Callout / voice", val = memo(
             function() return shared.ready, vol ~= nil and vol.callout or nil, vol ~= nil and vol.voice or nil end,
@@ -3055,10 +3373,10 @@ local function build_status_view(wgt, zone)
 
     -- scrollable page (menu -> Status): sections + rows, everything fits via scroll
     local pg = lvgl.page({
-        title = "UltiDash", subtitle = "Status",
+        -- M5: the header wears the glyph of the hub tile that leads here
+        title = "UltiDash", subtitle = "Diagnostics > Status", icon = "/WIDGETS/UltiDash/img/ud_status.png",
         back = function() wgt.menu_view = "menu"; init_view_state(wgt).dirty = true end,
     })
-    local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
     -- row height + label boxes MEASURED (rule 8): the hardcoded 26/22 clipped the
     -- descenders of the taller STDSIZE on the 800x480 MK3 -- the very bug that was
     -- already fixed in the settings renderer (see ultidashMenu build_settings_view)
@@ -3070,9 +3388,13 @@ local function build_status_view(wgt, zone)
     for i = 1, #items do
         local it = items[i]
         if it.section then
+            -- FOCUS STOP, not a label: an lvgl.page reacts to the encoder only through
+            -- focusable objects, so a page built from labels alone cannot be scrolled
+            -- without a finger at all. ultidash_functions.focus_stop carries the mechanism
+            -- and the reason the closing line below is one too.
             y = y + 6
-            pg:label({ x = 10, y = y, w = w - 40, h = sml_h + 2, text = it.section, font = SMLSIZE, color = COLOR_THEME_FOCUS, align = LEFT })
-            y = y + sml_h + 4
+            y = y + ultidash_functions.focus_stop(pg, y, w, it.section,
+                                                  SMLSIZE, COLOR_THEME_FOCUS) + 2
         else
             -- `it.grow`: a row whose value is GENERATED and whose length is not bounded by
             -- anything the layout knows -- the Repeat summary grows with the number of
@@ -3100,9 +3422,12 @@ local function build_status_view(wgt, zone)
             y = y + math.max(row_h, vh + 2)
         end
     end
-    pg:label({ x = 10, y = y + 8, w = w - 34, h = sml_h + 2, font = SMLSIZE, color = COLOR_DIM, align = LEFT,
+    -- The metrics line is the LAST focus stop, and that is what makes the section above it
+    -- reachable: a stop only ever reveals what sits ABOVE it (see focus_stop), so without
+    -- one past the last section that section's rows stay under the fold for the encoder.
+    ultidash_functions.focus_stop(pg, y + 8, w,
         -- memoized on wgt.dbg_win (metrics refresh together once per second)
-        text = (function()
+        (function()
             local last_win, last_s, primed
             return function()
                 local win = wgt.dbg_win
@@ -3112,7 +3437,7 @@ local function build_status_view(wgt, zone)
                     .. " kB   UI " .. (wgt.dbg_hz or "-") .. " Hz"
                 return last_s
             end
-        end)() })
+        end)(), SMLSIZE, COLOR_DIM)
 end
 
 
@@ -3128,7 +3453,500 @@ local function fmt_decivolt(v) return string.format("%.1f V", v / 10) end
 
 -- Order/grouping is presentation only (section headers); the keys are unchanged so cfg
 -- files are unaffected.
-local SETTINGS_DISPLAY = {
+-- The settings ITEM CATALOGUE is built by SETTINGS_GROUPS._build in its own staged
+-- cycle (stage 2a0, drained by the stage-2a gates right before register_skin_defaults)
+-- instead of at module level: the constructors cost ~5.7k instructions, which used to
+-- be the largest single block inside create()'s budget. Forward locals only here.
+-- The two tables whose REFERENCE other code captures (SETTINGS_GROUPS via the menu
+-- env, ALERT_PAGES the same way) are created here and filled IN PLACE by the builder,
+-- so a captured reference can never go stale; the item tables are only ever reached
+-- through SETTINGS_GROUPS rows the builder itself writes.
+-- Since 2026-08-17 the fourteen flat group tables are LAZY (builder + keys() on the
+-- group row, see MK/KEYS in the builder) and need no forward locals at all -- which is
+-- also 13 of them back under the 200-local wall.
+local ALERT_PAGES = {}
+
+
+-- Switch shortcuts: bind switch positions / toggle presses to any detail page or
+-- Toolbox tool (targets come from SHORTCUT_TARGETS). Two mechanisms:
+--   * 6 POSITION slots: while the picked switch position is held the page is open
+--     ("hold = open, leave = close"). A stability delay (SwDelay) means passing
+--     through an intermediate position on the way to another doesn't fire it.
+--   * 2 TOGGLE slots: each press of the picked switch steps opt1 -> opt2 -> ... -> close.
+-- Switch + position are picked in ONE native EdgeTX switch picker (kind="swpos",
+-- lvgl.switch: "SA-up" etc., incl. logical switches) — the value is a swsrc index read
+-- via getSwitchValue. Keys (per slot): Sc<i>Sp / Sc<i>Tgt (positions), Tg<j>Sp /
+-- Tg<j>O1..O4 (toggles). (The pre-picker keys Sc<i>Sw/Sc<i>Pos/Tg<j>Sw from the first
+-- 0.6.0 WIP builds are ignored — re-pick once.) Rows are generated so the slot count is
+-- a one-line change. All slots READ the switch only — the model's mixer/arming logic
+-- stays untouched.
+-- The Shortcuts group is SUBMENU PAGES (not a flat list): the position slots and the
+-- toggle slots each get their own page. The flat 39-row page built ~14 dropdowns + 8
+-- switch pickers in ONE refresh() call and overran EdgeTX's ~20k-instruction widget budget
+-- ("CPU limit" mid-build); split, each page's build stays well within budget.
+-- The item tables build LAZILY on first open (page.build — same idea as the colour
+-- pages): building both pages at module load ran inside create()'s budget for rows the
+-- user may never open. page.keys hands for_each_setting_item the key/def pairs WITHOUT
+-- building the rows — keep keys() and the builders in sync when adding a slot.
+function shortcut.pos_items()
+    -- page 1: switch delay + the 6 hold-to-open position slots
+    local pos = {}
+    pos[#pos + 1] = { key = "SwDelay", lbl = "Switch delay (ms)", kind = "num", def = 300,
+                      min = 0, max = 1000, step = 10, big = 100,
+                      fmt = function(v) return v == 0 and "instant" or (v .. " ms") end }
+    pos[#pos + 1] = { kind = "info", lbl = "Position slots: hold the picked switch position to show the page, leave it to close. The delay above filters passing through a position." }
+    for i = 1, 6 do
+        local swk = "Sc" .. i .. "Sp"
+        local function off(w) return (w[swk] or 0) == 0 end
+        pos[#pos + 1] = { kind = "section", lbl = "Position slot " .. i }
+        pos[#pos + 1] = { key = swk, lbl = "Switch position", kind = "swpos", def = 0 }
+        pos[#pos + 1] = { key = "Sc" .. i .. "Tgt", lbl = "Opens", kind = "choice",
+                          def = 1, vals = shortcut.tlabels, dim = off }
+    end
+    return pos
+end
+function shortcut.tgl_items()
+    -- page 2: the 2 press-to-step toggle slots
+    local tgl = {}
+    tgl[#tgl + 1] = { kind = "info", lbl = "Toggle switches: each press (switch into the picked position) steps to the next option, after the last it closes." }
+    for j = 1, 2 do
+        local swk = "Tg" .. j .. "Sp"
+        local function off(w) return (w[swk] or 0) == 0 end
+        tgl[#tgl + 1] = { kind = "section", lbl = "Toggle switch " .. j }
+        tgl[#tgl + 1] = { key = swk, lbl = "Switch position", kind = "swpos", def = 0 }
+        for k = 1, 4 do
+            tgl[#tgl + 1] = { key = "Tg" .. j .. "O" .. k, lbl = "Option " .. k,
+                              kind = "choice", def = 1, vals = shortcut.tlabels, dim = off }
+        end
+    end
+    return tgl
+end
+-- attached to the existing shortcut table, not a new module local (200-locals limit)
+shortcut.pages = {
+    { name = "Position slots",  icon = "positions", build = shortcut.pos_items, keys = function(fn)
+        fn("SwDelay", 300)
+        for i = 1, 6 do
+            fn("Sc" .. i .. "Sp", 0); fn("Sc" .. i .. "Tgt", 1)
+        end
+    end },
+    { name = "Toggle switches", icon = "toggles", build = shortcut.tgl_items, keys = function(fn)
+        for j = 1, 2 do
+            fn("Tg" .. j .. "Sp", 0)
+            for k = 1, 4 do fn("Tg" .. j .. "O" .. k, 1) end
+        end
+    end },
+}
+
+-- items are built LAZILY on first open (open_page in build_colors_menu_view) — building all
+-- three pages here at module load happened inside create()'s instruction budget (~57 rows of
+-- item tables) and pushed it toward the CPU limit. The defaults/working-copy walk derives the
+-- colour keys straight from COLOR_ROLES (see for_each_setting_item), so nothing needs .items
+-- until the user actually opens a colour page.
+-- Since stage 3b the colour pages follow the ACTIVE SKIN's scheme list, and the "Skin"
+-- settings group shows the active skin's own option rows. Both are IN-PLACE refreshed
+-- tables (refresh_skin_menus below): the menu module and SETTINGS_GROUPS hold their
+-- references from module load, only the contents swap on a skin change.
+local COLOR_PAGES = {}
+local SETTINGS_SKIN = {}
+local menus_skin = nil   -- the SKINS entry the two tables currently reflect
+local function refresh_skin_menus(reg)
+    if menus_skin == reg then return end
+    menus_skin = reg
+    local schemes = reg.schemes or SCHEMES
+    -- Colors pages: only the OVERRIDABLE schemes (with a tag). Tag-less schemes are
+    -- fixed by the skin file — nothing for the user to edit, so no page.
+    for i = #COLOR_PAGES, 1, -1 do COLOR_PAGES[i] = nil end
+    for i = 1, #schemes do
+        if schemes[i].tag ~= nil then
+            -- M1/M5 one level down: the page carries its OWN glyph instead of the Colors
+            -- group's palette. A skin-supplied scheme brings none and falls back to the
+            -- glyph the Skin group already owns -- one meaning, one picture, and it keeps
+            -- a skin from having to ship artwork before it may offer a scheme.
+            COLOR_PAGES[#COLOR_PAGES + 1] = { name = schemes[i].name, scheme = schemes[i],
+                                              icon = schemes[i].icon or "layers" }
+        end
+    end
+    for i = #SETTINGS_SKIN, 1, -1 do SETTINGS_SKIN[i] = nil end
+    -- row 1 is always the skin's OWN scheme choice (synthesised per skin: its key,
+    -- its default, its scheme names — colour settings belong to the skin). ALL
+    -- schemes are choosable here, fixed ones included.
+    if reg.scheme_key ~= nil then
+        local names = {}
+        for i = 1, #schemes do names[i] = schemes[i].name end
+        SETTINGS_SKIN[1] = { key = reg.scheme_key, lbl = "Color scheme", kind = "choice",
+                             def = reg.def_scheme or 1, vals = names }
+    end
+    -- row 2, when the skin claims the units switch: whether a unit is worth the font
+    -- size it costs is a LAYOUT property (the reason the key ships off is itself one),
+    -- so it belongs beside the colour scheme rather than in the host's Display group.
+    -- Absent = the skin reads the host key and the host row alone governs it.
+    if reg.units_key ~= nil then
+        SETTINGS_SKIN[#SETTINGS_SKIN + 1] = { key = reg.units_key, lbl = "Units beside values",
+                                              kind = "bool", def = reg.def_units or 0 }
+    end
+    -- what the flight panel and env.sensor_slot read per build (a plain field, not a
+    -- module local: the main chunk is at Lua's 200-local limit)
+    SKINS._units_key = reg.units_key
+    local items = reg.items
+    if items ~= nil then
+        local base = #SETTINGS_SKIN
+        for i = 1, #items do SETTINGS_SKIN[base + i] = items[i] end
+    end
+    -- does this skin want the session extrema of its sensor slots? (opt-in: they cost two
+    -- extra source reads per slot per 5 Hz pass — see update_user_sensors). Stored as a
+    -- FIELD, not a local: the main chunk sits at the 200-local limit.
+    SKINS._want_extrema = (reg.wants_extrema == true)
+    -- collect this skin's sensor-slot keys so the 5 Hz pass fills their live values
+    local sk = SKINS._sensor_keys
+    for i = #sk, 1, -1 do sk[i] = nil end
+    if items ~= nil then
+        for i = 1, #items do
+            if items[i].kind == "sensor" and items[i].key then
+                sk[#sk + 1] = items[i].key
+            end
+        end
+    end
+    -- the threshold service's pull list goes with them: the names in it were registered by
+    -- the OUTGOING skin's build, and a skin that no longer asks for Tmcu must stop paying
+    -- for the read. env.threshold_for re-registers on the next build.
+    local ex = SKINS._extra_names
+    if ex ~= nil then
+        for i = #ex, 1, -1 do ex[i] = nil end
+    end
+end
+-- NOTE deliberately NOT called at module load anymore: the manifests only exist after
+-- register_skin_defaults ran (first settings-apply cycle); update() refreshes the
+-- menus right after resolving the scheme, which is always past that point.
+
+-- Ordered so that each consecutive run of 3 groups forms one themed row of the settings
+-- grid; .sections names those rows (counts must add up to the group count — keep both in
+-- sync when adding a group: extend a section to 6 entries / two rows, or add a section).
+-- "Telemetry" and "Voice" are two-page submenus purely to keep the grid at 3x4: their
+-- inline page lists are plain {name, items}, walked by the generic build_sub_menu_view
+-- and for_each_setting_item like the Alerts pages. (NB main chunk is at the 200-locals
+-- limit — the page lists/section table are inline/attached, NOT new module locals.)
+local SETTINGS_GROUPS = {}
+
+-- Visit every settings item across all groups AND alert sub-pages. Used for the
+-- defaults table and the working-copy snapshot so both cover the submenu items.
+local color_setting_scratch = { def = -1 }   -- reused scratch row for synthesised keys (fn must only READ it; key AND def are (re)set per row)
+local function for_each_setting_item(fn)
+    for g = 1, #SETTINGS_GROUPS do
+        local grp = SETTINGS_GROUPS[g]
+        if grp.items then
+            for i = 1, #grp.items do fn(grp.items[i]) end
+        elseif grp.keys then
+            -- lazy GROUP (the fourteen flat ones since 2026-08-17): its rows build on
+            -- first open, so keys() hands the key/def pairs over without constructing
+            -- them -- same shape and the same reused scratch row as the lazy PAGES
+            -- below. Once a group has been opened its .items exist and the branch above
+            -- takes over, which is why this one comes second.
+            grp.keys(function(key, def)
+                color_setting_scratch.key = key
+                color_setting_scratch.def = def
+                fn(color_setting_scratch)
+            end)
+        elseif grp.submenu then
+            for p = 1, #grp.submenu do
+                local page = grp.submenu[p]
+                if page.scheme then
+                    -- colour page: its rows are built lazily on open, so synthesise the keyed
+                    -- rows straight from COLOR_ROLES (def -1 = unset) instead of walking .items —
+                    -- keeps the item tables off the module-load / create() budget.
+                    for r = 1, #COLOR_ROLES do
+                        local role = COLOR_ROLES[r]
+                        if role_in_scheme(role, page.scheme) then
+                            color_setting_scratch.key = color_key(page.scheme, role)
+                            color_setting_scratch.def = -1
+                            fn(color_setting_scratch)
+                        end
+                    end
+                elseif page.items == nil and page.keys then
+                    -- lazy page (Shortcuts): rows build on first open — page.keys hands the
+                    -- key/def pairs over without building them (same reused scratch row)
+                    page.keys(function(key, def)
+                        color_setting_scratch.key = key
+                        color_setting_scratch.def = def
+                        fn(color_setting_scratch)
+                    end)
+                else
+                    local items = page.items
+                    for i = 1, #items do fn(items[i]) end
+                end
+            end
+        end
+    end
+end
+
+-- defaults derived from the group tables (single source of truth now that the
+-- EdgeTX option list no longer carries these values) — handed to the settings
+-- layer so apply() can fill anything missing from the file
+local SETTINGS_DEFAULTS = {}
+-- EVERY skin's own rows and scheme overrides must be known to the defaults, not only
+-- the active skin's: save()'s orphan-drop removes any key missing from the defaults,
+-- which would silently wipe an INACTIVE skin's stored options/colour overrides. Since
+-- skins are SELF-CONTAINED (manifest in the skin file), collecting the keys means
+-- loading every skin once — far too heavy for module level (create()'s budget), so it
+-- runs ONCE in a settings-apply cycle: register_skin_defaults is called right before
+-- ultidash_settings.apply/save at each call site — always before the first apply that
+-- overlays skin keys and long before any save's orphan-drop. SETTINGS_DEFAULTS is the
+-- very table set_defaults holds, so the late mutation is visible immediately.
+-- FORWARD-DECLARED: the body needs skin_load (defined with the skin system below).
+local skin_defaults_done = false
+local register_skin_defaults
+ultidash_settings.set_defaults(SETTINGS_DEFAULTS)
+
+-- Stage 2a0: the whole settings item catalogue, in one place and one budget.
+-- Self-clearing -- it runs exactly once per session. Body kept verbatim from the
+-- old module-level block (helpers and ALERTS_SPEC become builder-locals; the row
+-- closures keep them alive).
+SETTINGS_GROUPS._build = function()
+    -- ultidashFunctions' own deferred data rides this stage (its reference tables --
+    -- flight-mode info, arming-disable names, the voice maps -- moved off ITS module
+    -- level for the same reason everything here did; self-clearing on its side)
+    if ultidash_functions.deferred_init ~= nil then ultidash_functions.deferred_init() end
+    -- Is the RADIO's theme dark? A constant of the radio, so it is answered HERE, in the
+    -- one-off stage that already has a cycle of its own, rather than lazily inside
+    -- toolbox_palette -- which would put its ~35 instructions into whichever ordinary
+    -- refresh happened to be the first to build a tool palette. That was visible: on the
+    -- 480x272 layout run it pushed one refresh cycle across the harness's 12k INFO line.
+    -- toolbox_palette keeps its nil-guard, so nothing depends on this stage having run.
+    pal_memo.theme_dark = theme_luma(COLOR_THEME_SECONDARY3) < DARK_LUMA_THRESHOLD
+    -- The shared DATA TABLES first: palettes, schemes, colour roles, font constants and
+    -- the sensor catalogue -- ~2.7k instructions of constructors that used to run at
+    -- module level, inside create()'s budget. Filled IN PLACE (temp constructor + copy),
+    -- because their references are captured elsewhere (the menu env takes SENSOR_INFO,
+    -- the skin env takes SCHEMES as standard_schemes) and a reassignment would strand
+    -- those captures on the empty shell. Order preserved: SCHEMES rows reference the
+    -- palettes, the two derivation loops run after their tables.
+    do local __t = {
+        COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2,
+        COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED,
+    }
+    for k, v in pairs(__t) do THEME_PALETTE[k] = v end end
+    do local __t = {
+        lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0xF8, 0xFC, 0xF8), lcd.RGB(0x00, 0x00, 0x00), lcd.RGB(0x98, 0xB4, 0xE8),
+        lcd.RGB(0xD8, 0xE0, 0xE8), lcd.RGB(0xC0, 0x30, 0x38), lcd.RGB(0xE8, 0x30, 0x30), lcd.RGB(0xF8, 0x3C, 0x00),
+    }
+    for k, v in pairs(__t) do CLEAN_PALETTE[k] = v end end
+    do local __t = {
+        lcd.RGB(0xFF, 0xFF, 0xFF), lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0xF0, 0xF4, 0xF8), lcd.RGB(0x39, 0xFF, 0x14),
+        lcd.RGB(0x08, 0x0A, 0x0C), lcd.RGB(0x00, 0xE5, 0xFF), lcd.RGB(0xFF, 0x1A, 0x40), lcd.RGB(0xFF, 0xC4, 0x00),
+    }
+    for k, v in pairs(__t) do DARK_PALETTE[k] = v end end
+    do local __t = {
+        { id = "ulti", name = "UltiDash", tag = "U", icon = "sun", pal = CLEAN_PALETTE,
+          -- Toolbox palette, UltiDash clean (light): mono black/grey, values in the accent
+          toolbox = { bg = lcd.RGB(248,250,248), accent = lcd.RGB(24,24,24), hint = lcd.RGB(216,96,0), line = lcd.RGB(180,184,190),
+                      text = lcd.RGB(24,24,24), textDim = lcd.RGB(130,130,130),
+                      valText = lcd.RGB(48,90,144), valHi = lcd.RGB(192,48,56), bannerBg = lcd.RGB(192,48,40), bannerFg = lcd.RGB(255,255,255),
+                      btnBg = lcd.RGB(208,212,218), btnPressed = lcd.RGB(184,190,200), btnDim = lcd.RGB(226,228,231), btnFg = lcd.RGB(24,24,24) } },
+        { id = "dark", name = "UltiDash dark", tag = "D", icon = "moon", dark = true, pal = DARK_PALETTE,
+          -- Toolbox palette, UltiDash dark: mono white/grey, values in the neon accent;
+          -- the Log Viewer picks its dark neon curve colours off the `dark` flag
+          toolbox = { bg = lcd.RGB(0,0,0), accent = lcd.RGB(240,240,240), hint = lcd.RGB(255,122,26), line = lcd.RGB(56,60,64),
+                      text = lcd.RGB(240,240,240), textDim = lcd.RGB(150,156,162),
+                      valText = lcd.RGB(0,229,255), valHi = lcd.RGB(255,176,0), bannerBg = lcd.RGB(255,68,56), bannerFg = lcd.RGB(0,0,0),
+                      btnBg = lcd.RGB(48,52,58), btnPressed = lcd.RGB(74,80,88), btnDim = lcd.RGB(34,36,40), btnFg = lcd.RGB(235,235,235),
+                      dark = true } },
+        { id = "theme", name = "EdgeTX theme", tag = "E", icon = "contrast", follows_theme = true, pal = THEME_PALETTE },
+    }
+    for k, v in pairs(__t) do SCHEMES[k] = v end end
+    for i = 1, #SCHEMES do SCHEMES[SCHEMES[i].id] = SCHEMES[i] end
+    do local __t = {
+        { grp = "Palette",       k = "P1", slot = 1, lbl = "Text / foreground" },
+        { grp = "Palette",       k = "P2", slot = 2, lbl = "Base background" },
+        { grp = "Palette",       k = "S1", slot = 3, lbl = "Strong lines / text" },
+        { grp = "Palette",       k = "S2", slot = 4, lbl = "Accent fill" },
+        { grp = "Palette",       k = "S3", slot = 5, lbl = "Panel surface" },
+        { grp = "Palette",       k = "FC", slot = 6, lbl = "Accent / headings" },
+        { grp = "Palette",       k = "WN", slot = 7, lbl = "Warning accent" },
+        { grp = "Palette",       k = "DS", slot = 8, lbl = "Dim / disabled accent" },
+        { grp = "Traffic-light", k = "SG", sem = "green", lbl = "Good (green)",     theme = true },
+        { grp = "Traffic-light", k = "SY", sem = "yell",  lbl = "Warning (yellow)", theme = true },
+        { grp = "Traffic-light", k = "SR", sem = "red",   lbl = "Critical (red)",   theme = true },
+        { grp = "Traffic-light", k = "SN", sem = "neut",  lbl = "Neutral (quiet)",  theme = true },
+        -- statusbar arm-state text. UNSET they follow what the text always followed (armed =
+        -- the EFFECTIVE traffic-light green incl. its override, disarmed = the resolved
+        -- WARNING slot 7) — see set_palette; the built-ins here only feed the picker swatch.
+        { grp = "Status text",   k = "AR", stat = "armed",    lbl = "Armed",    theme = true },
+        { grp = "Status text",   k = "DA", stat = "disarmed", lbl = "Disarmed", theme = true },
+        { grp = "Chrome",        k = "BG", chrome = "bg",    lbl = "Panel background (fill)" },
+        { grp = "Chrome",        k = "TR", chrome = "track", lbl = "Bar track / empty" },
+        { grp = "Chrome",        k = "TK", chrome = "tick",  lbl = "Tick marks" },
+        { grp = "Chrome",        k = "DM", chrome = "dim",   lbl = "Dim secondary text" },
+        -- battery fills: the main battery bar (ePowerbar levels) + the top-bar TX battery icon.
+        -- These were historically FIXED (never theme-driven), so their built-ins are the same for
+        -- every scheme and they are offered in EdgeTX-theme mode too (theme = true).
+        { grp = "Battery",       k = "BO", batt = "ok",    lbl = "Battery bar OK",           theme = true },
+        { grp = "Battery",       k = "BW", batt = "warn",  lbl = "Battery bar not full",     theme = true },
+        { grp = "Battery",       k = "BL", batt = "low",   lbl = "Battery bar low",          theme = true },
+        { grp = "Battery",       k = "BC", batt = "crit",  lbl = "Battery bar critical",     theme = true },
+        { grp = "Battery",       k = "BK", batt = "check", lbl = "Battery bar cell check",   theme = true },
+        { grp = "Battery",       k = "XO", batt = "vtx_ok",  lbl = "TX battery OK",          theme = true },
+        { grp = "Battery",       k = "XL", batt = "vtx_low", lbl = "TX battery low",         theme = true },
+    }
+    for k, v in pairs(__t) do COLOR_ROLES[k] = v end end
+    do local __t = {
+        TINSIZE = TINSIZE,
+        SMLSIZE = SMLSIZE,
+        STDSIZE = STDSIZE,
+        MIDSIZE = MIDSIZE,
+        DBLSIZE = DBLSIZE,
+        XXLSIZE = XXLSIZE
+    }
+    for k, v in pairs(__t) do FONT_CONSTANTS[k] = v end end
+    do local __t = {
+        -- battery / cells
+        Vbat     = { lbl = "Battery", cap = "Batt",      dec = 2, unit = "V",   appId = 0x1011 },
+        Curr     = { lbl = "Current", cap = "Current",      dec = 1, unit = "A",   appId = 0x1012 },
+        Capa     = { lbl = "Energy Used", cap = "Used",  dec = 0, unit = "mAh", appId = 0x1013 },
+        ["Bat%"] = { lbl = "Fuel", cap = "Fuel",         dec = 0, unit = "%",   appId = 0x1014 },
+        ["Cel#"] = { lbl = "Cells", cap = "Cell#",        dec = 0, unit = "",    appId = 0x1020 },
+        Vcel     = { lbl = "Cell",         dec = 2, unit = "V",   appId = 0x1021 },
+        Cels     = { lbl = "Cell V", cap = "Cells",       dec = 2, unit = "V" },   -- composite (no single appId)
+        Thr      = { lbl = "Throttle",     dec = 0, unit = "%",   appId = 0x1035 },
+        -- ESC #1
+        EscV     = { lbl = "ESC Voltage", cap = "ESC V",  dec = 2, unit = "V",   appId = 0x1041 },
+        EscI     = { lbl = "ESC Current", cap = "ESC A",  dec = 1, unit = "A",   appId = 0x1042 },
+        EscC     = { lbl = "ESC Used", cap = "ESC Used",     dec = 0, unit = "mAh", appId = 0x1043 },
+        EscR     = { lbl = "ESC RPM", cap = "ESC RPM",      dec = 0, unit = "rpm", appId = 0x1044 },
+        EscP     = { lbl = "ESC PWM", cap = "ESC PWM",      dec = 1, unit = "%",   appId = 0x1045 },
+        ["Esc%"] = { lbl = "ESC Load", cap = "ESC Load",     dec = 1, unit = "%",   appId = 0x1046 },
+        EscT     = { lbl = "ESC Temp", cap = "ESC T",     dec = 0, unit = "°C",  appId = 0x1047 },
+        BecT     = { lbl = "BEC T (ESC)", cap = "BEC T",  dec = 0, unit = "°C",  appId = 0x1048 },
+        BecV     = { lbl = "BEC V (ESC)", cap = "BEC V",  dec = 2, unit = "V",   appId = 0x1049 },
+        BecI     = { lbl = "BEC I (ESC)", cap = "BEC A",  dec = 1, unit = "A",   appId = 0x104A },
+        -- ESC #2
+        Es2V     = { lbl = "ESC2 Voltage", cap = "ESC2 V", dec = 2, unit = "V",   appId = 0x1051 },
+        Es2I     = { lbl = "ESC2 Current", cap = "ESC2 A", dec = 1, unit = "A",   appId = 0x1052 },
+        Es2C     = { lbl = "ESC2 Used", cap = "ESC2 Used",    dec = 0, unit = "mAh", appId = 0x1053 },
+        Es2R     = { lbl = "ESC2 RPM", cap = "ESC2 RPM",     dec = 0, unit = "rpm", appId = 0x1054 },
+        Es2T     = { lbl = "ESC2 Temp", cap = "ESC2 T",    dec = 0, unit = "°C",  appId = 0x1057 },
+        -- rails / currents
+        Vesc     = { lbl = "ESC Rail V", cap = "ESC V",   dec = 2, unit = "V",   appId = 0x1080 },
+        Vbec     = { lbl = "BEC Voltage", cap = "BEC",  dec = 2, unit = "V",   appId = 0x1081 },
+        Vbus     = { lbl = "Bus Voltage", cap = "Bus V",  dec = 2, unit = "V",   appId = 0x1082 },
+        Vmcu     = { lbl = "MCU Voltage", cap = "MCU V",  dec = 2, unit = "V",   appId = 0x1083 },
+        Iesc     = { lbl = "ESC Rail I", cap = "ESC A",   dec = 1, unit = "A",   appId = 0x1090 },
+        Ibec     = { lbl = "BEC Current", cap = "BEC A",  dec = 1, unit = "A",   appId = 0x1091 },
+        Ibus     = { lbl = "Bus Current", cap = "Bus A",  dec = 1, unit = "A",   appId = 0x1092 },
+        Imcu     = { lbl = "MCU Current", cap = "MCU A",  dec = 1, unit = "A",   appId = 0x1093 },
+        -- temperatures
+        Tesc     = { lbl = "ESC Temp", cap = "ESC T",     dec = 0, unit = "°C",  appId = 0x10A0 },
+        Tbec     = { lbl = "BEC Temp", cap = "BEC T",     dec = 0, unit = "°C",  appId = 0x10A1 },
+        Tmcu     = { lbl = "MCU Temp", cap = "MCU T",     dec = 0, unit = "°C",  appId = 0x10A3 },
+        Tair     = { lbl = "Air Temp", cap = "Air T",     dec = 0, unit = "°C" },   -- name-only (not in the
+        Tmtr     = { lbl = "Motor Temp", cap = "Mtr T",   dec = 0, unit = "°C" },   -- RF2 sensor table; harmless
+        Tbat     = { lbl = "Batt Temp", cap = "Batt T",    dec = 0, unit = "°C" },   -- if a model reports them
+        -- rotor / speeds / MCU loads
+        Hspd     = { lbl = "Headspeed",    dec = 0, unit = "rpm", appId = 0x10C0 },
+        Tspd     = { lbl = "Tailspeed", cap = "Tail",    dec = 0, unit = "rpm", appId = 0x10C1 },
+        ["CPU%"] = { lbl = "CPU Load", cap = "CPU",     dec = 0, unit = "%",   appId = 0x1141 },
+        ["SYS%"] = { lbl = "SYS Load", cap = "SYS",     dec = 0, unit = "%",   appId = 0x1142 },
+        ["RT%"]  = { lbl = "RT Load", cap = "RT",      dec = 0, unit = "%",   appId = 0x1143 },
+        -- altitude / attitude / GPS
+        Alt      = { lbl = "Altitude",     dec = 1, unit = "m",   appId = 0x10B2 },
+        Var      = { lbl = "Vario",        dec = 1, unit = "m/s", appId = 0x10B3 },
+        Hdg      = { lbl = "Heading",      dec = 1, unit = "°",   appId = 0x10B1 },
+        Sats     = { lbl = "GPS Sats",     dec = 0, unit = "",    appId = 0x1121 },
+        GSpd     = { lbl = "GPS Speed", cap = "GPS Spd",    dec = 1, unit = "m/s", appId = 0x1128 },
+        GAlt     = { lbl = "GPS Alt", cap = "GPS Alt",      dec = 1, unit = "m",   appId = 0x1126 },
+        GDis     = { lbl = "GPS Dist", cap = "Dist",     dec = 1, unit = "m",   appId = 0x1129 },
+        CPtc     = { lbl = "Ctrl Pitch", cap = "C Ptch",   dec = 1, unit = "°",   appId = 0x1031 },
+        CRol     = { lbl = "Ctrl Roll", cap = "C Roll",    dec = 1, unit = "°",   appId = 0x1032 },
+        CYaw     = { lbl = "Ctrl Yaw", cap = "C Yaw",     dec = 1, unit = "°",   appId = 0x1033 },
+        CCol     = { lbl = "Ctrl Coll", cap = "C Coll",    dec = 1, unit = "°",   appId = 0x1034 },
+        Ptch     = { lbl = "Pitch",        dec = 1, unit = "°",   appId = 0x1101 },
+        Roll     = { lbl = "Roll",         dec = 1, unit = "°",   appId = 0x1102 },
+        Yaw      = { lbl = "Yaw",          dec = 1, unit = "°",   appId = 0x1103 },
+        -- ELRS link quality (name-based; no RF custom appId)
+        RQly     = { lbl = "Link Qual",    dec = 0, unit = "%" },
+        TQly     = { lbl = "Uplink Qual",  dec = 0, unit = "%" },
+        RSNR     = { lbl = "SNR",          dec = 0, unit = "dB" },
+        TPWR     = { lbl = "TX Power",     dec = 0, unit = "mW" },
+        -- virtual (computed) sensor: UltiDash's Curr/limit ESC utilisation (distinct from the
+        -- telemetry-reported Esc% "ESC Load")
+        ["~escl"] = { lbl = "ESC Util",    dec = 0, unit = "%" },
+    }
+    for k, v in pairs(__t) do SENSOR_INFO[k] = v end end
+    for name, info in pairs(SENSOR_INFO) do
+        if info.appId then NAME_BY_APPID[info.appId] = name end
+    end
+    do local __t = {
+        Vbat = "vbat", Vcel = "vcel", ["Cel#"] = "cel_count",
+        Curr = "curr", Capa = "capa", ["Bat%"] = "capa_percent",
+        -- Curr follows the CurrSrc setting: the Current row / value.curr shows the
+        -- CONFIGURED source (Curr/EscI/Iesc), not necessarily the raw Curr sensor.
+        Tesc = "esc_temp", Vbec = "vbec", Hspd = "headspeed",
+        ["~escl"] = "esc_load_pct",   -- virtual: computed by update_esc_load_warning
+    }
+    for k, v in pairs(__t) do SENSOR_VALUE_FIELD[k] = v end end
+
+    -- D3: the spoken report's DATA half, handed to ultidashFunctions as a closure --
+    -- SENSOR_INFO / SENSOR_VALUE_FIELD are locals here, and the engine owns only the
+    -- audio half. Returns value, UNIT const, decimals (capped at 2 -- PREC2 is the
+    -- deepest playNumber speaks), and the name-wav key (lowercased, % -> pct, # -> n,
+    -- everything non-alphanumeric dropped: Vbat -> vbat, Bat% -> batpct).
+    do
+        local TSAY_UNITS = {
+            ["V"] = UNIT_VOLTS, ["A"] = UNIT_AMPS, ["mAh"] = UNIT_MAH,
+            ["%"] = UNIT_PERCENT, ["rpm"] = UNIT_RPMS, ["°C"] = UNIT_CELSIUS,
+            ["m"] = UNIT_METERS, ["m/s"] = UNIT_METERS_PER_SECOND,
+            ["°"] = UNIT_DEGREE, ["dB"] = UNIT_DB, ["mW"] = UNIT_MILLIWATTS,
+        }
+        ultidash_functions.telemsay_init(function(wgt, name)
+            local info = SENSOR_INFO[name]
+            local field = SENSOR_VALUE_FIELD[name]
+            local v
+            if field then v = wgt.values[field] end
+            if v == nil then
+                -- a slot also shown on the dashboard sits in the 5 Hz cache
+                -- (index-verified read); anything else is read at speak time --
+                -- one read per spoken item, not per pass
+                local us = wgt.values.user_sensors
+                v = us and us[name]
+            end
+            if v == nil then
+                local ok, r = pcall(ultidash_functions.read_src, wgt, name)
+                if ok then v = r end
+            end
+            local dec = info and info.dec or 0
+            if dec > 2 then dec = 2 end
+            local wav = string.gsub(string.gsub(string.gsub(string.lower(name),
+                "%%", "pct"), "#", "n"), "%W", "")
+            return v, (info and TSAY_UNITS[info.unit]) or 0, dec, wav
+        end)
+    end
+
+-- The fourteen flat settings groups, LAZY since 2026-08-17 (finding L-3 of the CPU
+-- review). They used to be constructed right here: ~120 item rows across the fourteen
+-- tables, most of them carrying an `fmt` and/or a `dim` closure -- spent at a point
+-- that only needs KEY/DEF PAIRS (SETTINGS_DEFAULTS, the save's orphan-drop, the
+-- one-time cfg snapshot). Labels, value lists and closures are first needed when a page
+-- BUILDS, and a page the user never opens never needed them at all.
+-- So each group becomes { name, build = MK.<x>, keys = KEYS.<x> } -- the shape
+-- shortcut.pages, ALERT_PAGES and the colour pages already use. open_group (the menu
+-- module) materialises grp.items on first open and caches it there.
+-- MEASURED (the budget harness, this tree): the catalogue stage (refresh #1) falls
+-- 10,463 -> 8,621, and what moved out is 1,866 instructions of row construction spread
+-- over sixteen lazy nodes, worst single page 267 -- against 9-14k of headroom in the
+-- call a page open actually gets. The lasting half is that the stage stops growing
+-- row-for-row per release: a new settings row now costs its own page, not every boot.
+-- (The review's ~5.7k estimate for this block was high; the number above is the run.)
+-- TWO tables, not fourteen locals: the builders and the key stubs are parked on MK and
+-- KEYS because the main chunk sits at the 200-local wall (197 measured) -- and _build
+-- has the same wall of its own.
+-- THE TRADEOFF, and it is the one that costs data if it slips: keys() and the builder
+-- of a group must stay in sync. A key the builder writes and keys() omits is missing
+-- from SETTINGS_DEFAULTS, and prepare_save's orphan sweep then DELETES it from the
+-- user's cfg file -- a silently lost setting, not a visible error. That is why keys()
+-- sits directly under its builder here, and why the budget harness materialises
+-- every group and compares the two sets against SETTINGS_DEFAULTS on every run
+-- ("catalogue: lazy groups"). Keep them adjacent when adding a row.
+local MK, KEYS = {}, {}
+
+MK.display = function() return {
     { kind = "section", lbl = "Layout & theme" },
     -- dashboard layout skin. Skins are DISCOVERED (skins/*.lua), so both lists are
     -- functions resolved at page-build time (after discovery); `ids` makes the menu
@@ -3150,11 +3968,28 @@ local SETTINGS_DISPLAY = {
     -- gets the full column, so it keeps the BIGGEST font that fits. Switching them on
     -- costs font size — on a 480x320 (TX15) or 480x272 (TX16S MK2) screen that is the
     -- difference between readable at arm's length and not.
-    { key = "ShowUnits",     lbl = "Units beside values",   kind = "bool", def = 0 },
+    -- The HOST's units key. Since 0.8.0 the dashboard's own units follow the ACTIVE
+    -- SKIN's key (Skin ▸ "Units beside values"); this row keeps the four detail pages,
+    -- which are host-owned and must not lose their setting when a skin claims its own.
+    -- The default skin declares THIS key as its own, so under it the two rows are one
+    -- switch — which is exactly what it was before the split.
+    { key = "ShowUnits",     lbl = "Units on detail pages", kind = "bool", def = 0 },
     { key = "StatsViewMode", lbl = "Stats page",            kind = "choice", def = 3, vals = { "Never", "On disarmed", "On disconnected" } },
     { key = "VoltageDisplay",lbl = "Voltage shown as",      kind = "choice", def = 1, vals = { "Cell voltage", "Battery voltage" } },
     { kind = "section", lbl = "Behaviour" },
     { key = "ArmClose",      lbl = "Close detail pages on arm", kind = "bool", def = 0 },
+    -- A page that comes up BY ITSELF on the arm edge -- the counterpart to the row above
+    -- and to StatsViewMode, which is the only other automatic view switch and governs the
+    -- DISARMED side. Only a detail overlay can be the target: a Toolbox tool is
+    -- disarmed-only by construction. It opens once per arm and is closed like any other
+    -- page (the X, RTN, or the switch that would have opened it) -- it does not come back
+    -- until the next arm, deliberately.
+    -- DIMMED while "Close detail pages on arm" is on, because that option re-closes any
+    -- detail page on EVERY armed pass, not just on the edge: the two cannot both hold, and
+    -- the auto-open would be the one silently losing.
+    { key = "ArmOpen",       lbl = "Open page on arming",   kind = "choice", def = 1,
+                             vals = shortcut.detail_labels(),
+                             dim = function(w) return w.ArmClose == 1 end },
     { key = "TapDetails",    lbl = "Tap zones for detail pages", kind = "bool", def = 1 },
     -- The radio's backlight timeout (Radio Setup > "Backlight off after", g_eeGeneral
     -- .lightAutoOff, 10 s at the shipped default of 2) costs the pilot his next tap: with
@@ -3174,14 +4009,19 @@ local SETTINGS_DISPLAY = {
     -- every skin's own items. `TxPwrMax` is not a bar option but the ELRS dynamic-power
     -- ceiling of this TX/region (also the ELRS detail page's 100 % reference) -> it
     -- moved to Thresholds > Link & signal. Both KEYS are unchanged (no cfg migration).
-}
+} end
+KEYS.display = function(fn)
+    fn("Skin", "default"); fn("BGFilled", 1); fn("ShowUnits", 0); fn("StatsViewMode", 3)
+    fn("VoltageDisplay", 1); fn("ArmClose", 0); fn("ArmOpen", 1); fn("TapDetails", 1)
+    fn("KeepLit", 1)
+end
 
 -- (The default skin's own settings rows — top bar & left panel — live in its skin
 -- file, skins/default.lua M.items, like every skin's. Keys unchanged, no migration.)
 
 local function fmt_pctval(v) return v .. " %" end
 
-local SETTINGS_BATTERY = {
+MK.battery = function() return {
     { kind = "section", lbl = "Fuel callouts" },
     { key = "Reserve",      lbl = "Reserve (%)",            kind = "num", def = 20,  min = 0,   max = 40,  step = 1, big = 5 },
     -- Fuel-callout density (value-driven descending %): quiet up high, denser near the end.
@@ -3222,7 +4062,13 @@ local SETTINGS_BATTERY = {
     { kind = "section", lbl = "Data sources" },
     { key = "CurrSrc",      lbl = "Current sensor",         kind = "choice", def = 1, vals = { "Curr", "EscI", "Iesc" } },
     { kind = "info", lbl = "Feeds the Current row, ESC load and current min/max. Curr = FC battery current; EscI/Iesc = ESC-reported current." },
-}
+} end
+KEYS.battery = function(fn)
+    fn("Reserve", 20); fn("FuelStart", 100); fn("FuelStep", 10); fn("FuelDense", 15)
+    fn("FuelStepFine", 5); fn("FuelSay", 1); fn("VSay1", 0); fn("VSay2", 0); fn("VSayHold", 3)
+    fn("CellSource", 1); fn("CellFull", 412); fn("CellLow", 345); fn("CellCritical", 330)
+    fn("StartupDelay", 4); fn("VoltVoice", 1); fn("CurrSrc", 1)
+end
 
 local function fmt_pctdrop(v) return v .. " %" end
 local function fmt_temp(v) return (v == 0) and "Off" or (v .. " C") end
@@ -3231,7 +4077,7 @@ local function fmt_temp(v) return (v == 0) and "Off" or (v .. " C") end
 -- (kind="info" rows). ESC-load thresholds live in their own "ESC load" group;
 -- the TX power limit (TxPwrMax) lives here under "Link & signal" — it is a per-TX /
 -- per-region ELRS setting, not a bar option (see the comment on the row).
-local SETTINGS_THRESHOLDS = {
+MK.thresholds = function() return {
     { kind = "section", lbl = "Link & signal" },
     { key = "RQlyWarn",   lbl = "Link warn (%)",          kind = "num", def = 80, min = 0,  max = 100,  step = 1,  big = 5 },
     { key = "RQlyCrit",   lbl = "Link critical (%)",      kind = "num", def = 50, min = 0,  max = 100,  step = 1,  big = 5 },
@@ -3261,7 +4107,13 @@ local SETTINGS_THRESHOLDS = {
     { key = "TescCrit",   lbl = "ESC critical (C)",       kind = "num", def = 110, min = 0, max = 150, step = 5, big = 10, fmt = fmt_temp },
     { key = "TmcuWarn",   lbl = "MCU warn (C)",           kind = "num", def = 75,  min = 0, max = 150, step = 5, big = 10, fmt = fmt_temp },
     { key = "TmcuCrit",   lbl = "MCU critical (C)",       kind = "num", def = 90,  min = 0, max = 150, step = 5, big = 10, fmt = fmt_temp },
-}
+} end
+KEYS.thresholds = function(fn)
+    fn("RQlyWarn", 80); fn("RQlyCrit", 50); fn("RssWarn", 15); fn("RssCrit", 8)
+    fn("RssHold", 2); fn("SkpLimit", 50); fn("TxPwrMax", 0); fn("PwrSrc", 1); fn("PwrCellV", 30)
+    fn("PwrWarnV", 90); fn("BecWarn", 8); fn("BecCrit", 15); fn("TescWarn", 90)
+    fn("TescCrit", 110); fn("TmcuWarn", 75); fn("TmcuCrit", 90)
+end
 
 -- ESC continuous-current LOAD monitor (own settings group). The FC writes the ESC's
 -- continuous-current limit (amps) into the configured GVAR after connect;
@@ -3273,7 +4125,7 @@ local SETTINGS_THRESHOLDS = {
 --     alert's Active (key EscLoad) under Alerts > ESC load — and is itself gated by
 --     EscMon (monitoring off = alarm silent). EscHold gates how long the load must
 --     stay high before it fires (alarm is armed-only).
-local SETTINGS_ESC = {
+MK.esc = function() return {
     { key = "EscMon",   lbl = "ESC load monitoring",   kind = "bool", def = 0 },
     { key = "EscGvar",  lbl = "ESC limit: GVAR (A)",   kind = "num", def = 0, min = 0, max = 15, step = 1, big = 1,
                         fmt = function(v) return (v == 0) and "Off" or ("GV" .. v) end,
@@ -3287,7 +4139,11 @@ local SETTINGS_ESC = {
     { key = "EscBar",   lbl = "Load bar",              kind = "choice", def = 1, vals = { "Current row", "Battery gauge" },
                         dim = function(w) return w.EscMon ~= 1 end },
     { kind = "info", lbl = "Monitoring off = feature off. GVAR holds the ESC continuous-current limit (A), written by the FC. Alarm on/off is under Alerts > ESC load." },
-}
+} end
+KEYS.esc = function(fn)
+    fn("EscMon", 0); fn("EscGvar", 0); fn("EscWarn", 80); fn("EscCrit", 100); fn("EscHold", 5)
+    fn("EscBar", 1)
+end
 
 local function fmt_pct(v) return tostring(v) .. " %" end
 
@@ -3296,7 +4152,8 @@ local function fmt_pct(v) return tostring(v) .. " %" end
 --   * the per-callout WIDGET volume (Volume 1..5, passed to playFile/playNumber), and
 --   * the GVAR MASTER-volume bridge (VolGvar drives a model "Volume" special function).
 -- Normal vs. escalation % (VolFlight / VolEscal) only apply in the GVAR world.
-local SETTINGS_VOLUME = {
+MK.volume = function()
+    local t = {
     { key = "Volume",     lbl = "Callout volume",            kind = "num", def = 0, min = 0, max = 5, step = 1, big = 1,
                           fmt = function(v)
                               if v == 0 then return "System" end
@@ -3313,11 +4170,28 @@ local SETTINGS_VOLUME = {
                           dim = function(w) return (w.VolGvar or 0) == 0 end },
     { key = "VolEscal",   lbl = "Escalation volume (%)",      kind = "slider", def = 100, min = 0, max = 100, step = 5, big = 10, fmt = fmt_pct,
                           dim = function(w) return (w.VolGvar or 0) == 0 end },
-}
+    }
+    -- "Test callout / Play" row: preview a callout with the page's WORKING values (see
+    -- test_callout). Deliberately never dimmed — previewing an alert that is still off is
+    -- exactly the point. Volume page: hear the working widget volume; Voice page: hear the
+    -- working language. Appended rather than inlined so the literal above stays the plain
+    -- key/def block it always was (it used to be appended from below the alert specs, which
+    -- a lazy builder can no longer reach).
+    t[#t + 1] = { kind = "action", lbl = "Test callout", btn = "Play",
+        act = function(wgt, working)
+            ultidash_functions.test_callout(wgt, working, { files = { "battry" }, num = { 70, UNIT_PERCENT } })
+        end }
+    return t
+end
+KEYS.volume = function(fn)
+    fn("Volume", 0); fn("VolWhen", 1); fn("VolGvar", 0); fn("VolFlight", 80)
+    fn("VolEscal", 100)
+end
 
 -- Global voice settings (language + master mute), reached via the Alerts submenu's
 -- first entry ("Voice / mute"). Separate from the per-alert pages.
-local SETTINGS_VOICE = {
+MK.voice = function()
+    local t = {
     { key = "VoiceLang",  lbl = "Voice language",            kind = "choice", def = 1, vals = { "English", "Deutsch" } },
     { key = "Mute",       lbl = "Mute (master)",             kind = "choice", def = 1, vals = { "None", "All" } },
     -- separate haptic master: "Mute: All" silences AUDIO only; vibration has its own switch
@@ -3326,7 +4200,24 @@ local SETTINGS_VOICE = {
     -- TelemOvl pages); 0 = the overlay stays until tapped or the condition clears
     { key = "OvlClose",   lbl = "Overlay auto-close (s)",    kind = "num", def = 0, min = 0, max = 60, step = 1, big = 5,
       fmt = function(v) return (v == 0) and "until tapped" or (v .. " s") end },
-}
+    -- The NOTICE overlay: not an alert (no voice, no vibration, no armed condition),
+    -- so it has no page of its own under Alerts. It sits here because this is where
+    -- the shared overlay behaviour already lives. Default ON -- its whole purpose is
+    -- being seen by somebody who did not go looking, and it only ever appears
+    -- disarmed, after a link connect, when a real misconfiguration was measured.
+    { key = "NoteOvl",    lbl = "Config warning overlay",    kind = "bool", def = 1 },
+    }
+    -- the second "Test callout / Play" row (see MK.volume): hear the working language
+    t[#t + 1] = { kind = "action", lbl = "Test callout", btn = "Play",
+        act = function(wgt, working)
+            ultidash_functions.test_callout(wgt, working, { files = { "telem_ok" } })
+        end }
+    return t
+end
+KEYS.voice = function(fn)
+    fn("VoiceLang", 1); fn("Mute", 1); fn("VibMaster", 1); fn("OvlClose", 0)
+    fn("NoteOvl", 1)
+end
 
 -- Per-alert configuration. Each alert is its own settings sub-page (the Alerts
 -- submenu). The historical on/off key (enKey) is REUSED as "Active" so existing
@@ -3386,20 +4277,6 @@ local ALERTS_SPEC = {
       test = { files = { "skp_high" } } },
 }
 
--- "Test callout / Play" rows: preview a callout with the page's WORKING values (see
--- test_callout). Deliberately never dimmed — previewing an alert that is still off is
--- exactly the point. Volume page: hear the working widget volume; Voice page: hear the
--- working language. (Appended here, after the alert specs, as plain literals — no
--- helper local: the main chunk sits at the 200-locals limit.)
-SETTINGS_VOLUME[#SETTINGS_VOLUME + 1] = { kind = "action", lbl = "Test callout", btn = "Play",
-    act = function(wgt, working)
-        ultidash_functions.test_callout(wgt, working, { files = { "battry" }, num = { 70, UNIT_PERCENT } })
-    end }
-SETTINGS_VOICE[#SETTINGS_VOICE + 1] = { kind = "action", lbl = "Test callout", btn = "Play",
-    act = function(wgt, working)
-        ultidash_functions.test_callout(wgt, working, { files = { "telem_ok" } })
-    end }
-
 -- Alerts submenu: a "Voice / mute" entry plus one page per alert. The alert pages'
 -- ROW TABLES build LAZILY on first open (build_alert_items lives in the lazy menu
 -- module, like the Shortcuts/Colors rows) -- 12 pages x ~8 rows of item tables +
@@ -3408,7 +4285,7 @@ SETTINGS_VOICE[#SETTINGS_VOICE + 1] = { kind = "action", lbl = "Test callout", b
 -- the key/def pairs WITHOUT building rows -- keep it in sync with build_alert_items
 -- (ultidashMenu.lua) when adding an alert row. page.spec carries the alert's spec
 -- so the submenu shows On/Off + the feature markers straight from the options.
-local ALERT_PAGES = { { name = "Voice / mute", items = SETTINGS_VOICE } }
+ALERT_PAGES[1] = { name = "Voice / mute", build = MK.voice, keys = KEYS.voice }
 for i = 1, #ALERTS_SPEC do
     local a = ALERTS_SPEC[i]
     ALERT_PAGES[#ALERT_PAGES + 1] = { name = a.name, enKey = a.enKey, spec = a,
@@ -3430,19 +4307,22 @@ end
 -- switches this radio actually has, including custom names, and the 3-position
 -- semantics (read via getValue -> -1024/0/1024) stay intact.
 -- READ-ONLY — the model's mixer/arming logic is untouched.
-local SETTINGS_SWITCHES = {
+MK.switches = function() return {
     { key = "MotorSrc",   lbl = "Motor on/off switch",  kind = "switch", def = 0 },
     { key = "RescueSrc",  lbl = "Rescue switch",        kind = "switch", def = 0 },
     { key = "GovSrc",     lbl = "Governor mode switch", kind = "switch", def = 0 },
     { key = "ProfileSrc", lbl = "Profile switch (1-3)", kind = "switch", def = 0 },
-}
+} end
+KEYS.switches = function(fn)
+    fn("MotorSrc", 0); fn("RescueSrc", 0); fn("GovSrc", 0); fn("ProfileSrc", 0)
+end
 
 -- Governor-state voice: announce the Gov sensor's state (0..9) on every stable change
 -- while ARMED. GovVoice is the master toggle (default off — opt-in feature); each state
 -- has its own enable so noisy transitions can be silenced. All states default ON so the
 -- master switch alone gives full feedback; dim the per-state rows while the master is off.
 local function gov_voice_off(w) return (w.GovVoice or 0) ~= 1 end
-local SETTINGS_GOVVOICE = {
+MK.govvoice = function() return {
     { key = "GovVoice",  lbl = "Announce gov state",  kind = "bool", def = 0 },
     { kind = "info", lbl = "Speaks the governor state on change, in flight only (armed). Pick which states are called out below." },
     { key = "GvsOff",     lbl = "Throttle off",   kind = "bool", def = 1, dim = gov_voice_off },
@@ -3455,7 +4335,12 @@ local SETTINGS_GOVVOICE = {
     { key = "GvsAutorot", lbl = "Autorotation",   kind = "bool", def = 1, dim = gov_voice_off },
     { key = "GvsBailout", lbl = "Bailing Out",    kind = "bool", def = 1, dim = gov_voice_off },
     { key = "GvsBypass",  lbl = "Gov. Bypass",    kind = "bool", def = 1, dim = gov_voice_off },
-}
+} end
+KEYS.govvoice = function(fn)
+    fn("GovVoice", 0); fn("GvsOff", 1); fn("GvsIdle", 1); fn("GvsSpool", 1); fn("GvsRecov", 1)
+    fn("GvsActive", 1); fn("GvsHold", 1); fn("GvsFallbk", 1); fn("GvsAutorot", 1)
+    fn("GvsBailout", 1); fn("GvsBypass", 1)
+end
 
 -- NB: the pre-native stored codes (own list: 1=Off, 2..17 SA..SH, 18..29 CFS,
 -- 100+ logical switches, old keys MotorSw/RescueSw/GovSw/ProfileSw/TbSwitch) are
@@ -3469,16 +4354,20 @@ local SETTINGS_GOVVOICE = {
 -- kind="sensor" stores the EdgeTX sensor NAME (string). Defaults reproduce the
 -- original panel; the detail page defaults to a sensible battery/ESC set.
 -- VOLT_AUTO = the smart cell/battery voltage (warn colour).
-local SETTINGS_TELE_MAIN = {
+MK.tele_main = function() return {
     { kind = "info", lbl = "Dropdown = common sensors. Right field = any raw source (overrides the dropdown)." },
     { key = "PanelV1", lbl = "Panel 1 (top)", kind = "sensor", def = VOLT_AUTO },
     { key = "PanelV2", lbl = "Panel 2",       kind = "sensor", def = "Hspd" },
     { key = "PanelV3", lbl = "Panel 3",       kind = "sensor", def = "Curr" },
     { key = "PanelV4", lbl = "Panel 4",       kind = "sensor", def = "Tesc" },
     { key = "PanelV5", lbl = "Panel 5 (btm)", kind = "sensor", def = "Vbec" },
-}
+} end
+KEYS.tele_main = function(fn)
+    fn("PanelV1", VOLT_AUTO); fn("PanelV2", "Hspd"); fn("PanelV3", "Curr")
+    fn("PanelV4", "Tesc"); fn("PanelV5", "Vbec")
+end
 
-local SETTINGS_TELE_DETAIL = {
+MK.tele_detail = function() return {
     { kind = "info", lbl = "Dropdown = common sensors. Right field = any raw source (overrides the dropdown)." },
     { key = "DetV1",   lbl = "Detail 1",      kind = "sensor", def = "Vbat" },
     { key = "DetV2",   lbl = "Detail 2",      kind = "sensor", def = "Vcel" },
@@ -3492,10 +4381,33 @@ local SETTINGS_TELE_DETAIL = {
     { key = "DetV10",  lbl = "Detail 10",     kind = "sensor", def = SENSOR_OFF },
     { key = "DetV11",  lbl = "Detail 11",     kind = "sensor", def = SENSOR_OFF },
     { key = "DetV12",  lbl = "Detail 12",     kind = "sensor", def = SENSOR_OFF },
-}
+} end
+KEYS.tele_detail = function(fn)
+    fn("DetV1", "Vbat"); fn("DetV2", "Vcel"); fn("DetV3", "Curr"); fn("DetV4", "Capa")
+    fn("DetV5", "Bat%"); fn("DetV6", SENSOR_OFF); fn("DetV7", SENSOR_OFF)
+    fn("DetV8", SENSOR_OFF); fn("DetV9", SENSOR_OFF); fn("DetV10", SENSOR_OFF)
+    fn("DetV11", SENSOR_OFF); fn("DetV12", SENSOR_OFF)
+end
+
+-- M5: the Live Monitor's sensor slots (Toolbox ▸ Live Monitor page). Same kind="sensor"
+-- component as Tele Main / Details / D3's report rows; all four default OFF, and the
+-- HOST allocates the ring only while at least one is set -- the feature costs nothing
+-- until someone configures it.
+MK.livemon = function() return {
+    { kind = "info", lbl = "Live Monitor (Toolbox): each sensor gets a full-width strip of the last 15-60 s, min/max per 0.2 s. Sampling runs while the page is closed." },
+    { key = "LmV1", lbl = "Strip 1 (top)", kind = "sensor", def = SENSOR_OFF },
+    { key = "LmV2", lbl = "Strip 2",       kind = "sensor", def = SENSOR_OFF },
+    { key = "LmV3", lbl = "Strip 3",       kind = "sensor", def = SENSOR_OFF },
+    { key = "LmV4", lbl = "Strip 4",       kind = "sensor", def = SENSOR_OFF },
+    { key = "LmWin", lbl = "Window", kind = "choice", def = 2, vals = { "15 s", "30 s", "60 s" } },
+} end
+KEYS.livemon = function(fn)
+    fn("LmV1", SENSOR_OFF); fn("LmV2", SENSOR_OFF); fn("LmV3", SENSOR_OFF)
+    fn("LmV4", SENSOR_OFF); fn("LmWin", 2)
+end
 
 -- General / meta settings (config-file behaviour, diagnostics)
-local SETTINGS_GENERAL = {
+MK.general = function() return {
     { key = "DebugLog",    lbl = "Debug log to SD card",  kind = "bool", def = 0 },
     { key = "DebugKeep",   lbl = "Debug log: sessions kept", kind = "num", def = 20, min = 1, max = 50, step = 1, big = 5 },
     -- The on-screen half of the debug mode, separated from the logging half. Default ON, so
@@ -3516,12 +4428,89 @@ local SETTINGS_GENERAL = {
                        fmt = function(v) return (v == 0) and "log every arm" or (v .. " s") end },
     { key = "FltBatt", lbl = "Ask battery on connect",     kind = "bool", def = 0 },
     { key = "FltProf", lbl = "Battery sets FC profile",    kind = "bool", def = 0 },
-}
+    -- RESET TO DEFAULTS, which used to be a warning-coloured button under the settings
+    -- menu's grid. It moved here for the room: that button plus its reserve is what kept
+    -- the 13 group tiles from getting the whole body. Last row of the last group, behind a
+    -- confirmation -- the same routine, only its route changed. No settings key, so it adds
+    -- nothing to KEYS.general and nothing to SETTINGS_DEFAULTS.
+    { kind = "action", lbl = "Reset to defaults", btn = "Reset",
+      act = function(wgt)
+        local function do_reset()
+            -- STAGGERED exactly like the autosave (see save_pending_settings): this runs
+            -- inside a dialog callback, whose call already carries the page -- so only
+            -- FLAG it here; the host's stage 1 does the write in its own cycle (a
+            -- stamps-only file since the delta rule) and hands over to stage 2
+            -- (settings_apply_pending), which applies, bumps settings_gen and flags the
+            -- rebuild.
+            wgt.settings_reset_pending = true
+            -- Drop the working copy WITHOUT saving it, and leave for the group list. Not
+            -- cosmetic: a reset changes every key, so a working copy seeded before it
+            -- would hold pre-reset values that the next autosave would write straight back
+            -- over the defaults. Leaving is also where the old button left the user.
+            wgt.settings_working = nil
+            wgt.settings_senslist = nil
+            wgt.settings_target = nil
+            wgt.menu_view = "settings_menu"
+            init_view_state(wgt).dirty = true
+        end
+        -- confirmation dialog when available; plain reset otherwise
+        local ok = pcall(function()
+            lvgl.confirm({ title = "Reset settings",
+                           message = "Reset ALL settings of this model to defaults?",
+                           confirm = do_reset })
+        end)
+        if not ok then do_reset() end
+      end },
+} end
+KEYS.general = function(fn)
+    fn("DebugLog", 0); fn("DebugKeep", 20); fn("DbgOvl", 1); fn("FltLog", 0); fn("FltStats", 0)
+    fn("FltMinS", 30); fn("FltBatt", 0); fn("FltProf", 0)
+end
+
+-- D3: the spoken telemetry report. The TRIGGER is a shortcut switch (target
+-- "Voice: Telemetry report" in the Shortcuts group) -- deliberately no switch row
+-- here, so switches keep living in one place. Slots are spoken in THIS order;
+-- with the names option off the pilot infers the sensor from that order. Defaults
+-- follow the design's ~15-20 s: battery, headspeed, current, temperature, BEC,
+-- link, two free.
+MK.telemsay = function() return {
+    { kind = "section", lbl = "Report slots (spoken in order)" },
+    { key = "TsayV1", lbl = "Slot 1", kind = "sensor", def = VOLT_AUTO },
+    { key = "TsayV2", lbl = "Slot 2", kind = "sensor", def = "Hspd" },
+    { key = "TsayV3", lbl = "Slot 3", kind = "sensor", def = "Curr" },
+    { key = "TsayV4", lbl = "Slot 4", kind = "sensor", def = "Tesc" },
+    { key = "TsayV5", lbl = "Slot 5", kind = "sensor", def = "Vbec" },
+    { key = "TsayV6", lbl = "Slot 6", kind = "sensor", def = "RQly" },
+    { key = "TsayV7", lbl = "Slot 7", kind = "sensor", def = SENSOR_OFF },
+    { key = "TsayV8", lbl = "Slot 8", kind = "sensor", def = SENSOR_OFF },
+    { kind = "section", lbl = "Behaviour" },
+    -- floor 10 s is functional: eight slots run ~15-20 s, below that a report
+    -- would overtake itself (the repeat counts from the report's START)
+    { key = "TsayInt",   lbl = "Repeat (switch held)", kind = "num", def = 30, min = 10, max = 120, step = 5, big = 15,
+                         fmt = function(v) return v .. " s" end },
+    -- the third variant -- a warning waiting for the report -- was decided OUT
+    { key = "TsayPrio",  lbl = "When an alert speaks", kind = "choice", def = 1, vals = { "Report stops", "Report pauses" } },
+    -- opt-in name wavs (s_<sensor>.wav in SOUNDS/<lang>/ultidash/); a missing file
+    -- falls back to value-and-unit, and menu > Status counts the coverage
+    { key = "TsayNames", lbl = "Speak sensor names",   kind = "bool", def = 0 },
+} end
+KEYS.telemsay = function(fn)
+    fn("TsayV1", VOLT_AUTO); fn("TsayV2", "Hspd"); fn("TsayV3", "Curr"); fn("TsayV4", "Tesc")
+    fn("TsayV5", "Vbec"); fn("TsayV6", "RQly"); fn("TsayV7", SENSOR_OFF)
+    fn("TsayV8", SENSOR_OFF); fn("TsayInt", 30); fn("TsayPrio", 1); fn("TsayNames", 0)
+end
 
 -- Toolbox: RF adjustment map/editor tool pages (sources default to ch11/ch12/AdjV/BEAT/PID#)
-local SETTINGS_TOOLBOX = {
+MK.toolbox = function() return {
     -- activation switch / auto-open moved to the "Shortcuts" group (SETTINGS_SHORTCUTS);
     -- a shortcut can now open Adjust Map / Adjust Edit like any other page.
+    -- T: where the adjust table comes from. Manual = the built-in table (labels.lua on
+    -- top, unchanged behaviour). The two FC states read the craft's own adjfunc lines
+    -- over MSP once per connect (ultidashRf adj_step) -- the exact bank windows included,
+    -- so a Config channel in a dead gap reads "no bank" instead of a wrong one. The read
+    -- runs ONLY when this option asks for it; menu > Status names the effective source.
+    { key = "TbSource", lbl = "Adj table from", kind = "choice", def = 1,
+      vals = { "Manual", "Flight controller", "FC + labels.lua" } },
     { key = "TbConfigCh", lbl = "Adj: Config channel",  kind = "num", def = 11, min = 1, max = 32, step = 1, big = 4, fmt = function(v) return "CH" .. v end },
     { key = "TbValueCh",  lbl = "Adj: Value channel",   kind = "num", def = 12, min = 1, max = 32, step = 1, big = 4, fmt = function(v) return "CH" .. v end },
     { key = "TbGvar",  lbl = "Adj editor: GVAR",        kind = "num", def = 1, min = 1, max = 15, step = 1, big = 1,
@@ -3531,174 +4520,50 @@ local SETTINGS_TOOLBOX = {
     { key = "TbBert",  lbl = "Adj editor: ranges hint", kind = "bool", def = 0 },
     { key = "TbSun",   lbl = "Toolbox sunlight mode",   kind = "bool", def = 0 },
     { key = "TbVoice", lbl = "Announce bank (voice)",   kind = "bool", def = 1 },
-}
-
--- Switch shortcuts: bind switch positions / toggle presses to any detail page or
--- Toolbox tool (targets come from SHORTCUT_TARGETS). Two mechanisms:
---   * 6 POSITION slots: while the picked switch position is held the page is open
---     ("hold = open, leave = close"). A stability delay (SwDelay) means passing
---     through an intermediate position on the way to another doesn't fire it.
---   * 2 TOGGLE slots: each press of the picked switch steps opt1 -> opt2 -> ... -> close.
--- Switch + position are picked in ONE native EdgeTX switch picker (kind="swpos",
--- lvgl.switch: "SA-up" etc., incl. logical switches) — the value is a swsrc index read
--- via getSwitchValue. Keys (per slot): Sc<i>Sp / Sc<i>Tgt (positions), Tg<j>Sp /
--- Tg<j>O1..O4 (toggles). (The pre-picker keys Sc<i>Sw/Sc<i>Pos/Tg<j>Sw from the first
--- 0.6.0 WIP builds are ignored — re-pick once.) Rows are generated so the slot count is
--- a one-line change. All slots READ the switch only — the model's mixer/arming logic
--- stays untouched.
--- The Shortcuts group is SUBMENU PAGES (not a flat list): the position slots and the
--- toggle slots each get their own page. The flat 39-row page built ~14 dropdowns + 8
--- switch pickers in ONE refresh() call and overran EdgeTX's ~20k-instruction widget budget
--- ("CPU limit" mid-build); split, each page's build stays well within budget.
--- The item tables build LAZILY on first open (page.build — same idea as the colour
--- pages): building both pages at module load ran inside create()'s budget for rows the
--- user may never open. page.keys hands for_each_setting_item the key/def pairs WITHOUT
--- building the rows — keep keys() and the builders in sync when adding a slot.
-function shortcut.pos_items()
-    -- page 1: switch delay + the 6 hold-to-open position slots
-    local pos = {}
-    pos[#pos + 1] = { key = "SwDelay", lbl = "Switch delay (ms)", kind = "num", def = 300,
-                      min = 0, max = 1000, step = 10, big = 100,
-                      fmt = function(v) return v == 0 and "instant" or (v .. " ms") end }
-    pos[#pos + 1] = { kind = "info", lbl = "Position slots: hold the picked switch position to show the page, leave it to close. The delay above filters passing through a position." }
-    for i = 1, 6 do
-        local swk = "Sc" .. i .. "Sp"
-        local function off(w) return (w[swk] or 0) == 0 end
-        pos[#pos + 1] = { kind = "section", lbl = "Position slot " .. i }
-        pos[#pos + 1] = { key = swk, lbl = "Switch position", kind = "swpos", def = 0 }
-        pos[#pos + 1] = { key = "Sc" .. i .. "Tgt", lbl = "Opens", kind = "choice",
-                          def = 1, vals = shortcut.tlabels, dim = off }
-    end
-    return pos
+} end
+KEYS.toolbox = function(fn)
+    fn("TbSource", 1); fn("TbConfigCh", 11); fn("TbValueCh", 12); fn("TbGvar", 1)
+    fn("TbPulse", 150); fn("TbScale", 1)
+    fn("TbBert", 0); fn("TbSun", 0); fn("TbVoice", 1)
 end
-function shortcut.tgl_items()
-    -- page 2: the 2 press-to-step toggle slots
-    local tgl = {}
-    tgl[#tgl + 1] = { kind = "info", lbl = "Toggle switches: each press (switch into the picked position) steps to the next option, after the last it closes." }
-    for j = 1, 2 do
-        local swk = "Tg" .. j .. "Sp"
-        local function off(w) return (w[swk] or 0) == 0 end
-        tgl[#tgl + 1] = { kind = "section", lbl = "Toggle switch " .. j }
-        tgl[#tgl + 1] = { key = swk, lbl = "Switch position", kind = "swpos", def = 0 }
-        for k = 1, 4 do
-            tgl[#tgl + 1] = { key = "Tg" .. j .. "O" .. k, lbl = "Option " .. k,
-                              kind = "choice", def = 1, vals = shortcut.tlabels, dim = off }
-        end
-    end
-    return tgl
-end
--- attached to the existing shortcut table, not a new module local (200-locals limit)
-shortcut.pages = {
-    { name = "Position slots",  build = shortcut.pos_items, keys = function(fn)
-        fn("SwDelay", 300)
-        for i = 1, 6 do
-            fn("Sc" .. i .. "Sp", 0); fn("Sc" .. i .. "Tgt", 1)
-        end
-    end },
-    { name = "Toggle switches", build = shortcut.tgl_items, keys = function(fn)
-        for j = 1, 2 do
-            fn("Tg" .. j .. "Sp", 0)
-            for k = 1, 4 do fn("Tg" .. j .. "O" .. k, 1) end
-        end
-    end },
-}
 
--- items are built LAZILY on first open (open_page in build_colors_menu_view) — building all
--- three pages here at module load happened inside create()'s instruction budget (~57 rows of
--- item tables) and pushed it toward the CPU limit. The defaults/working-copy walk derives the
--- colour keys straight from COLOR_ROLES (see for_each_setting_item), so nothing needs .items
--- until the user actually opens a colour page.
--- Since stage 3b the colour pages follow the ACTIVE SKIN's scheme list, and the "Skin"
--- settings group shows the active skin's own option rows. Both are IN-PLACE refreshed
--- tables (refresh_skin_menus below): the menu module and SETTINGS_GROUPS hold their
--- references from module load, only the contents swap on a skin change.
-local COLOR_PAGES = {}
-local SETTINGS_SKIN = {}
-local menus_skin = nil   -- the SKINS entry the two tables currently reflect
-local function refresh_skin_menus(reg)
-    if menus_skin == reg then return end
-    menus_skin = reg
-    local schemes = reg.schemes or SCHEMES
-    -- Colors pages: only the OVERRIDABLE schemes (with a tag). Tag-less schemes are
-    -- fixed by the skin file — nothing for the user to edit, so no page.
-    for i = #COLOR_PAGES, 1, -1 do COLOR_PAGES[i] = nil end
-    for i = 1, #schemes do
-        if schemes[i].tag ~= nil then
-            COLOR_PAGES[#COLOR_PAGES + 1] = { name = schemes[i].name, scheme = schemes[i] }
-        end
-    end
-    for i = #SETTINGS_SKIN, 1, -1 do SETTINGS_SKIN[i] = nil end
-    -- row 1 is always the skin's OWN scheme choice (synthesised per skin: its key,
-    -- its default, its scheme names — colour settings belong to the skin). ALL
-    -- schemes are choosable here, fixed ones included.
-    if reg.scheme_key ~= nil then
-        local names = {}
-        for i = 1, #schemes do names[i] = schemes[i].name end
-        SETTINGS_SKIN[1] = { key = reg.scheme_key, lbl = "Color scheme", kind = "choice",
-                             def = reg.def_scheme or 1, vals = names }
-    end
-    local items = reg.items
-    if items ~= nil then
-        local base = #SETTINGS_SKIN
-        for i = 1, #items do SETTINGS_SKIN[base + i] = items[i] end
-    end
-    -- does this skin want the session extrema of its sensor slots? (opt-in: they cost two
-    -- extra source reads per slot per 5 Hz pass — see update_user_sensors). Stored as a
-    -- FIELD, not a local: the main chunk sits at the 200-local limit.
-    SKINS._want_extrema = (reg.wants_extrema == true)
-    -- collect this skin's sensor-slot keys so the 5 Hz pass fills their live values
-    local sk = SKINS._sensor_keys
-    for i = #sk, 1, -1 do sk[i] = nil end
-    if items ~= nil then
-        for i = 1, #items do
-            if items[i].kind == "sensor" and items[i].key then
-                sk[#sk + 1] = items[i].key
-            end
-        end
-    end
-    -- the threshold service's pull list goes with them: the names in it were registered by
-    -- the OUTGOING skin's build, and a skin that no longer asks for Tmcu must stop paying
-    -- for the read. env.threshold_for re-registers on the next build.
-    local ex = SKINS._extra_names
-    if ex ~= nil then
-        for i = #ex, 1, -1 do ex[i] = nil end
-    end
-end
--- NOTE deliberately NOT called at module load anymore: the manifests only exist after
--- register_skin_defaults ran (first settings-apply cycle); update() refreshes the
--- menus right after resolving the scheme, which is always past that point.
-
--- Ordered so that each consecutive run of 3 groups forms one themed row of the settings
--- grid; .sections names those rows (counts must add up to the group count — keep both in
--- sync when adding a group: extend a section to 6 entries / two rows, or add a section).
--- "Telemetry" and "Voice" are two-page submenus purely to keep the grid at 3x4: their
--- inline page lists are plain {name, items}, walked by the generic build_sub_menu_view
--- and for_each_setting_item like the Alerts pages. (NB main chunk is at the 200-locals
--- limit — the page lists/section table are inline/attached, NOT new module locals.)
-local SETTINGS_GROUPS = {
-    { name = "Display",    items = SETTINGS_DISPLAY },
-    { name = "Skin",       items = SETTINGS_SKIN },   -- the ACTIVE skin's own rows (in-place, stage 3c)
-    { name = "Colors",     submenu = COLOR_PAGES, menu = "colors_menu" },
-    { name = "Telemetry",  menu = "sub_menu", submenu = {
-        { name = "Tele Main",    items = SETTINGS_TELE_MAIN },
-        { name = "Tele Details", items = SETTINGS_TELE_DETAIL },
+-- `build` + `keys` instead of `items` on every flat group and on the two plain
+-- submenus' pages (see MK/KEYS above for the why and the tradeoff). "Skin" keeps
+-- `items`: SETTINGS_SKIN is the IN-PLACE table refresh_skin_menus rewrites on a skin
+-- change, and its keys come from the skin manifests via register_skin_defaults, not
+-- from here.
+-- `icon` is the bare glyph name of the settings menu's tile image; the menu module turns it
+-- into /WIDGETS/UltiDash/img/ud_<icon>.png. Names and assignment come from the menu-icon
+-- spec's group table; a group without one degrades to a text-only tile.
+local __groups = {
+    { name = "Display",    icon = "monitor", build = MK.display, keys = KEYS.display },
+    { name = "Skin",       icon = "layers",  items = SETTINGS_SKIN },   -- the ACTIVE skin's own rows (in-place, stage 3c)
+    { name = "Colors",     icon = "palette", submenu = COLOR_PAGES, menu = "colors_menu" },
+    { name = "Telemetry",  icon = "wave",    menu = "sub_menu", submenu = {
+        { name = "Tele Main",    icon = "list",     build = MK.tele_main,   keys = KEYS.tele_main },
+        { name = "Tele Details", icon = "listfind", build = MK.tele_detail, keys = KEYS.tele_detail },
+        { name = "Live monitor", icon = "pulse",    build = MK.livemon,     keys = KEYS.livemon },   -- the Toolbox tile wears the same glyph: one feature, one picture
     } },
 
-    { name = "Battery",    items = SETTINGS_BATTERY },
-    { name = "Thresholds", items = SETTINGS_THRESHOLDS },
-    { name = "ESC load",   items = SETTINGS_ESC },
+    { name = "Battery",    icon = "battery", build = MK.battery,    keys = KEYS.battery },
+    { name = "Thresholds", icon = "gauge",   build = MK.thresholds, keys = KEYS.thresholds },
+    { name = "ESC load",   icon = "esc",     build = MK.esc,        keys = KEYS.esc },
 
-    { name = "Volume",     items = SETTINGS_VOLUME },
-    { name = "Alerts",     submenu = ALERT_PAGES, menu = "alerts_menu" },
-    { name = "Voice",      menu = "sub_menu", submenu = {
-        { name = "Switch voice", items = SETTINGS_SWITCHES },
-        { name = "Gov voice",    items = SETTINGS_GOVVOICE },
+    { name = "Volume",     icon = "speaker", build = MK.volume, keys = KEYS.volume },
+    { name = "Alerts",     icon = "bell",    submenu = ALERT_PAGES, menu = "alerts_menu" },
+    { name = "Voice",      icon = "voice",   menu = "sub_menu", submenu = {
+        { name = "Switch voice", icon = "switchvoice", build = MK.switches, keys = KEYS.switches },
+        { name = "Gov voice",    icon = "governor",    build = MK.govvoice, keys = KEYS.govvoice },
+        -- D3: filed under Voice, not Telemetry -- a voice feature filed under
+        -- telemetry is found by nobody looking for voice (the user's call)
+        { name = "Telemetry report", icon = "report", build = MK.telemsay, keys = KEYS.telemsay },
     } },
 
-    { name = "Shortcuts",  menu = "sub_menu", submenu = shortcut.pages },
-    { name = "Toolbox",    items = SETTINGS_TOOLBOX },
-    { name = "General",    items = SETTINGS_GENERAL },
+    { name = "Shortcuts",  icon = "switch",  menu = "sub_menu", submenu = shortcut.pages },
+    { name = "Toolbox",    icon = "wrench",  build = MK.toolbox, keys = KEYS.toolbox },
+    { name = "General",    icon = "sliders", build = MK.general, keys = KEYS.general },
 }
+for i = 1, #__groups do SETTINGS_GROUPS[i] = __groups[i] end
 -- section runs MUST sum to #SETTINGS_GROUPS (currently 13) — the menu hub walks groups
 -- section-by-section, so any group past the last run's end is dropped from the grid (this
 -- is what hid "General"/Debug log after the "Skin" group was added as a 13th group).
@@ -3708,70 +4573,15 @@ SETTINGS_GROUPS.sections = {
     { hdr = "Sound & callouts", n = 3 },   -- Volume, Alerts, Voice
     { hdr = "System",           n = 3 },   -- Shortcuts, Toolbox, General
 }
-
--- Visit every settings item across all groups AND alert sub-pages. Used for the
--- defaults table and the working-copy snapshot so both cover the submenu items.
-local color_setting_scratch = { def = -1 }   -- reused scratch row for synthesised keys (fn must only READ it; key AND def are (re)set per row)
-local function for_each_setting_item(fn)
-    for g = 1, #SETTINGS_GROUPS do
-        local grp = SETTINGS_GROUPS[g]
-        if grp.items then
-            for i = 1, #grp.items do fn(grp.items[i]) end
-        elseif grp.submenu then
-            for p = 1, #grp.submenu do
-                local page = grp.submenu[p]
-                if page.scheme then
-                    -- colour page: its rows are built lazily on open, so synthesise the keyed
-                    -- rows straight from COLOR_ROLES (def -1 = unset) instead of walking .items —
-                    -- keeps the item tables off the module-load / create() budget.
-                    for r = 1, #COLOR_ROLES do
-                        local role = COLOR_ROLES[r]
-                        if role_in_scheme(role, page.scheme) then
-                            color_setting_scratch.key = color_key(page.scheme, role)
-                            color_setting_scratch.def = -1
-                            fn(color_setting_scratch)
-                        end
-                    end
-                elseif page.items == nil and page.keys then
-                    -- lazy page (Shortcuts): rows build on first open — page.keys hands the
-                    -- key/def pairs over without building them (same reused scratch row)
-                    page.keys(function(key, def)
-                        color_setting_scratch.key = key
-                        color_setting_scratch.def = def
-                        fn(color_setting_scratch)
-                    end)
-                else
-                    local items = page.items
-                    for i = 1, #items do fn(items[i]) end
-                end
-            end
-        end
-    end
-end
-
--- defaults derived from the group tables (single source of truth now that the
--- EdgeTX option list no longer carries these values) — handed to the settings
--- layer so apply() can fill anything missing from the file
-local SETTINGS_DEFAULTS = {}
 for_each_setting_item(function(it)
     if it.key then SETTINGS_DEFAULTS[it.key] = it.def end   -- skip keyless info rows
 end)
--- EVERY skin's own rows and scheme overrides must be known to the defaults, not only
--- the active skin's: save()'s orphan-drop removes any key missing from the defaults,
--- which would silently wipe an INACTIVE skin's stored options/colour overrides. Since
--- skins are SELF-CONTAINED (manifest in the skin file), collecting the keys means
--- loading every skin once — far too heavy for module level (create()'s budget), so it
--- runs ONCE in a settings-apply cycle: register_skin_defaults is called right before
--- ultidash_settings.apply/save at each call site — always before the first apply that
--- overlays skin keys and long before any save's orphan-drop. SETTINGS_DEFAULTS is the
--- very table set_defaults holds, so the late mutation is visible immediately.
--- FORWARD-DECLARED: the body needs skin_load (defined with the skin system below).
-local skin_defaults_done = false
-local register_skin_defaults
 -- hidden key (no settings row): tracks whether the in-widget menu was opened at
 -- least once — drives the first-placement hint banner on the dashboard
 SETTINGS_DEFAULTS.SetupSeen = 0
-ultidash_settings.set_defaults(SETTINGS_DEFAULTS)
+SETTINGS_GROUPS._build = nil
+end
+
 
 --- Persist pending settings edits (if any) and resolve them into the options.
 --- AUTOSAVE policy: edits are saved no matter HOW the page is left (back arrow,
@@ -3809,16 +4619,14 @@ local function save_pending_settings(wgt)
         return
     end
     if settings_changed(wgt) then
-        -- HAND THE WRITE OVER instead of doing it here: save() walks the whole key
-        -- catalog (merge, orphan-drop, sort, line-by-line write -- measured ~11k
-        -- instructions) and apply() walks it again (~6k), so the pair alone eats most
-        -- of the ~20k budget. Any call that already carries other work then trips
-        -- "CPU limit" at the apply() line -- the arm-close caller does exactly that,
-        -- it runs INSIDE the 5 Hz heavy pass (measured 22.4k, reported from a v0.6.1
-        -- radio). Stage 1 = the SD write, stage 2 = the apply, each alone in its own
-        -- cycle (see refresh()/background()); same staggering as the deferred create().
-        -- Costs two invisible frames. The edits live on wgt until then, so only a
-        -- widget teardown inside that ~100 ms window could drop them.
+        -- HAND THE WRITE OVER instead of doing it here: unstaggered, the save plus the
+        -- apply in one call is what tripped "CPU limit" at the apply() line -- the
+        -- arm-close caller runs INSIDE the 5 Hz heavy pass (measured 22.4k, reported
+        -- from a v0.6.1 radio). Stage 1 = the SD write (chunked since E1, one bounded
+        -- batch per call -- see settings_write_stage1), stage 2 = the apply, each alone
+        -- in its own cycle (refresh()/background()). Costs a few invisible frames. The
+        -- edits live on wgt until the write lands, so only a widget teardown inside
+        -- that short window could drop them.
         wgt.settings_save_pending = wgt.settings_working
     end
     wgt.settings_working = nil
@@ -3855,6 +4663,12 @@ local function close_tool_page(wgt)
         if tb_adjed.cleanup then tb_adjed.cleanup(wgt) end
         tb_adjed = nil                  -- release the lazy-loaded module (GC)
     end
+    -- M5: the Live Monitor has no cleanup -- its data lives in the HOST (wgt.lm keeps
+    -- sampling with the page closed, which is the feature) -- only the module ref drops
+    if wgt.menu_view == "tb_livemon" and livemon.mod then
+        livemon.mod = nil               -- release the lazy-loaded module (GC)
+        wgt.lmv = nil                   -- and the page's per-instance draw state
+    end
     -- RF2 Config MUST run its own close on ANY forced exit (fullscreen exit):
     -- it restores the rf2.* UI slots and the un-gated mspQueue pump -- without
     -- that, the RfTool widget's MSP processing would stay parked behind the
@@ -3864,6 +4678,15 @@ local function close_tool_page(wgt)
         wgt.rf2cfg_close_req = nil      -- consumed here; a stale flag would shut a fresh page
         tb_rf2cfg = nil                 -- release the lazy-loaded module (GC)
     end
+    -- RFSuite MUST run its own close on ANY forced exit for the same reason
+    -- and one more: besides restoring the rf2 pump it detaches RFSuite's MSP client
+    -- and calls clearAllModules -- the only chance this Lua state ever gets to give
+    -- that module graph back.
+    if wgt.menu_view == "tb_rfscfg" and rfscfg.mod then
+        if rfscfg.mod.cleanup then rfscfg.mod.cleanup(wgt) end
+        wgt.rfs_close_req = nil         -- consumed here; a stale flag would shut a fresh page
+        rfscfg.mod = nil                -- release the lazy-loaded module (GC)
+    end
     -- Log Viewer: release the open /LOGS file handle + the ~2000-line module
     if wgt.menu_view == "tb_logview" and tb_logview then
         if tb_logview.close then tb_logview.close(wgt) end
@@ -3871,10 +4694,19 @@ local function close_tool_page(wgt)
         tb_logview = nil                -- release the lazy-loaded module (GC)
     end
     -- Flight Log viewer: release the open CSV handle on a forced exit
+    -- (its cleanup also drops the battery editor's state, wgt.fb)
     if wgt.menu_view == "tb_fltlog" and fltlog.mod then
         if fltlog.mod.cleanup then fltlog.mod.cleanup(wgt) end
         wgt.fl_close_req = nil          -- consumed here; a stale flag would shut a fresh page
+        wgt.fb_close_req, wgt.fb_saved, wgt.fb_dirty = nil, nil, nil
         fltlog.mod = nil                -- release the lazy-loaded module (GC)
+    end
+    -- battpick "+ New" create form (fltbatt): a forced exit discards the open
+    -- form -- nothing is written (only its own deferred save cycle ever writes)
+    if wgt.menu_view == "tb_batted" and fltlog.batted then
+        if fltlog.batted.cleanup then fltlog.batted.cleanup(wgt) end
+        wgt.fb_close_req, wgt.fb_saved, wgt.fb_dirty = nil, nil, nil
+        fltlog.batted = nil             -- release the lazy-loaded module (GC)
     end
 end
 
@@ -3918,9 +4750,19 @@ function fltlog.arm_edges(wgt)
     local arm_on = ultidash_functions.arm_sensor_on(wgt)
     if arm_on and not wgt.was_armed_sensor then
         wgt.stats_dismissed = false
+        wgt.stats_tap_open = nil   -- C3: a new flight retires a standing tap-open too
         if ultidash_functions.dbg then ultidash_functions.dbg.logf("STATS", "dismiss cleared (arm rising edge)") end
         -- flight log: a genuine arm opens a flight record (counter snapshot)
         fltlog.arm(wgt)
+        -- "Open page on arming": ARM the request here, execute it two ticks later. The
+        -- edge itself is the worst possible moment -- this is exactly the switch on which
+        -- sync_view_for_telemetry sets detail_view = nil (a stats page being replaced by
+        -- the flight view), so a page opened now is wiped before it is ever drawn. Same
+        -- shape as fltlog.open_battpick's deferred open. Nothing happens here beyond the
+        -- flag: whether it may open at all is decided where the view state is known.
+        if wgt.options ~= nil and (wgt.options.ArmOpen or 1) > 1 and wgt.options.ArmClose ~= 1 then
+            wgt.arm_open_at = (getTime() or 0) + 40   -- ~0.4 s
+        end
     elseif wgt.was_armed_sensor and not arm_on and wgt.flt_open then
         wgt.flt_flush_req = true
     end
@@ -3939,13 +4781,19 @@ end
 -- those go in as getters the module pulls fresh per build.
 local menu_mod = nil
 local menu_env = nil
-local function menu_load()
+local function menu_load(wgt)
     if menu_mod ~= nil then return menu_mod end
     if menu_env == nil then
+        -- The env captures `rf_service` BY VALUE, once, and the menu module keeps that
+        -- reference for the session (its battery-profile picker calls through it). Since
+        -- the service is lazy-loaded, capturing before it is attached would hand the menu
+        -- a permanent nil. Attach first: idempotent, and by any real menu open long done.
+        ensure_rf_service(wgt)
         menu_env = {
             init_view_state       = init_view_state,
             close_settings        = close_settings,
-            for_each_setting_item = for_each_setting_item,
+            -- for_each_setting_item is NOT handed over any more — the menu's settings
+            -- seed became page-scoped (2026-08-17) and was its only consumer there
             build_sensor_list     = build_sensor_list,
             sensor_pick_label     = sensor_pick_label,
             is_raw_sensor         = is_raw_sensor,
@@ -3968,7 +4816,8 @@ local function menu_load()
                 return false
             end,
             tb_avail              = function()
-                return tb_adjmap_avail, tb_adjed_avail, tb_logview_avail, tb_rf2cfg_avail
+                return tb_adjmap_avail, tb_adjed_avail, tb_logview_avail, tb_rf2cfg_avail,
+                       livemon.avail, rfscfg.avail
             end,
             SETTINGS_GROUPS       = SETTINGS_GROUPS,
             ALERT_PAGES           = ALERT_PAGES,
@@ -4144,6 +4993,32 @@ function fltlog.open_battpick(wgt)
     init_view_state(wgt).dirty = true
 end
 
+-- Deferred open of the battery CREATE form from battpick's "+ New" (B11).
+-- Own cycle like open_battpick itself (batted_req; the registry read for the
+-- id prefill must not share a press callback's budget). models is preset to
+-- the connected craft; after Save the pick list reloads through the existing
+-- battpick_load_req path and the new pack appears at the end (stable order).
+function fltlog.open_batted(wgt)
+    if wgt.menu_view ~= "battpick" then return end
+    local fb = fltlog.load_batted()
+    local fd = fltlog.load_data()
+    if fb == nil or fd == nil then return end
+    local ok, reg = pcall(fd.load_registry)
+    if not ok or type(reg) ~= "table" then reg = {} end
+    local craft = wgt.values ~= nil and wgt.values.craft_name or nil
+    local ok2 = pcall(fb.open, wgt, "create", {
+        D = fd, reg = reg, craft = craft,
+        known_models = (craft ~= nil and craft ~= "") and { craft } or {},
+        preset_models = (craft ~= nil and craft ~= "") and { craft } or nil,
+        return_to = "battpick",
+        on_change = function(w) w.fb_saved = true end,
+        on_close = function(w) w.fb_close_req = true end,
+    })
+    if not ok2 then return end
+    wgt.menu_view = "tb_batted"
+    init_view_state(wgt).dirty = true
+end
+
 -- ============================================================================
 -- SWITCH SHORTCUTS ENGINE
 -- ============================================================================
@@ -4154,6 +5029,24 @@ end
 -- Toolbox tool. Edge/hold triggered — never fights manual navigation (open/close only
 -- act on the exact page THIS binding controls).
 
+-- One debug-log line per shortcut ACTION or refusal, WITH the reason. The
+-- 2026-08-16 field report -- "the switch did nothing, only a reboot helped" --
+-- could have been a missed press, the menu gate, the fullscreen gate or a dead
+-- loader, and the log could not tell them apart: none of the four left a trace.
+-- Consecutive DUPLICATE lines are swallowed (a held position slot re-tries its
+-- refused open every 5 Hz pass; one line says everything the repetition would).
+-- Two DIFFERENT refusals alternating would defeat the dedup -- that takes two
+-- switches held at once and is capped by the session file limit anyway.
+shortcut.log = function(wgt, fmt, ...)
+    local d = ultidash_functions.dbg
+    if d == nil then return end
+    local ok, s = pcall(string.format, fmt, ...)
+    s = ok and s or fmt
+    if s == wgt.sc_lastlog then return end
+    wgt.sc_lastlog = s
+    d.logf("SC", "%s", s)
+end
+
 -- Is THIS target the page currently showing? The predicate `shortcut.close` decides by
 -- and the toggle slot resyncs its stage against (see shortcut.run). Identity, not
 -- provenance: a page of the same id opened by another route counts as up.
@@ -4161,6 +5054,7 @@ function shortcut.is_up(wgt, tgt)
     if tgt == nil then return false end
     if tgt.kind == "detail" then return wgt.detail_view == tgt.id end
     if tgt.kind == "tool"   then return wgt.menu_view == tgt.id end
+    if tgt.kind == "menu"   then return wgt.menu_view == "menu" end
     return false
 end
 
@@ -4177,8 +5071,10 @@ end
 function shortcut.tool_ready(tgt)
     if tgt.id == "tb_adjmap" then return tb_load_adjmap() ~= nil end
     if tgt.id == "tb_adjed"  then return tb_load_adjed()  ~= nil end
+    if tgt.id == "tb_livemon" then return livemon.load() ~= nil end
     if tgt.load == "logview" then return tb_load_logview() ~= nil end
     if tgt.load == "rf2cfg"  then return tb_load_rf2cfg()  ~= nil end
+    if tgt.load == "rfscfg"  then return rfscfg.load()     ~= nil end
     if tgt.load == "fltlog"  then return fltlog.load_viewer() ~= nil end
     return true
 end
@@ -4186,8 +5082,38 @@ end
 -- Open a shortcut target. Mirrors the tap-open gating: a detail overlay opens only over
 -- the flight view with nothing else up; a tool page honours the disarmed-only rule and
 -- opens over the dashboard or the Toolbox hub. Returns true if it opened.
-function shortcut.open(wgt, tgt)
+function shortcut.open(wgt, tgt, held)
     if not tgt or tgt.kind == "none" then return false end
+    if tgt.kind == "action" then
+        -- D3: audio needs no screen -- no fullscreen gate, no view gate, no armed
+        -- gate (decided: it may speak in flight; precedence stays with the alerts).
+        -- `held` comes from a position slot and arms the repeat loop.
+        ultidash_functions.telemsay_start(wgt, held == true)
+        shortcut.log(wgt, "start %s%s", tgt.id, held and " (hold)" or "")
+        return true
+    end
+    if tgt.kind == "menu" then
+        -- M2: the menu hub, on the glyph's own conditions -- fullscreen only (the glyph
+        -- exists only there), nothing else up, and the SHARED armed rule.
+        if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then
+            shortcut_fs_hint(wgt)
+            shortcut.log(wgt, "open menu refused: not fullscreen")
+            return false
+        end
+        if not (wgt.menu_view == nil and wgt.detail_view == nil and wgt.ovl_active == nil) then
+            shortcut.log(wgt, "open menu refused: %s up",
+                         wgt.menu_view or wgt.detail_view or "overlay")
+            return false
+        end
+        if not shortcut.menu_allowed(wgt) then
+            shortcut.log(wgt, "open menu refused: armed")
+            return false
+        end
+        wgt.menu_view = "menu"
+        init_view_state(wgt).dirty = true
+        shortcut.log(wgt, "open menu")
+        return true
+    end
     if tgt.kind == "detail" then
         -- The same fullscreen gate the tool branch carries below, and for the same reason:
         -- the detail builders declare themselves fullscreen-only, and in a widget-grid zone
@@ -4195,12 +5121,17 @@ function shortcut.open(wgt, tgt)
         -- widget zone gets no touch. The menu-glyph and tap routes cannot reach this state
         -- at all -- both are fullscreen-only -- so a shortcut was the one way in.
         if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then
-            shortcut_fs_hint(wgt); return false
+            shortcut_fs_hint(wgt)
+            shortcut.log(wgt, "open %s refused: not fullscreen", tgt.id)
+            return false
         end
         -- nothing to open when the module did not load (see detail_load). Read off the
         -- instance, not off the module local: that local is declared further down the file
         -- and would be a global -- i.e. always nil -- from here.
-        if not wgt.detail_ok then return false end
+        if not wgt.detail_ok then
+            shortcut.log(wgt, "open %s refused: detail module not loaded", tgt.id)
+            return false
+        end
         if wgt.menu_view == nil and wgt.detail_view == nil
             and init_view_state(wgt).current == "flight" then
             wgt.detail_view = tgt.id
@@ -4208,13 +5139,17 @@ function shortcut.open(wgt, tgt)
             -- to inherit the scroll position of the last one and open part-scrolled
             if tgt.id == "estatus" then wgt.estatus_scroll = 0 end
             init_view_state(wgt).dirty = true
+            shortcut.log(wgt, "open %s", tgt.id)
             return true
         end
+        shortcut.log(wgt, "open %s refused: %s up", tgt.id,
+                     wgt.menu_view or wgt.detail_view or "non-flight view")
         return false
     end
     -- tool page
     if tgt.disarmed and wgt.armed_now then
         wgt.lv_armed_hint = (getTime() or 0) + 200   -- ~2 s "disarmed only" hint
+        shortcut.log(wgt, "open %s refused: armed", tgt.id)
         return false
     end
     -- Tool pages are FULLSCREEN UIs (lvgl.page / immediate fullscreen builds); opening
@@ -4224,13 +5159,23 @@ function shortcut.open(wgt, tgt)
     -- mirror that guarantee here. Gated BEFORE tool_ready so we don't even lazy-load the
     -- module while not fullscreen. A held position re-fires once the user is fullscreen.
     if lvgl.isFullScreen == nil or not lvgl.isFullScreen() then
-        shortcut_fs_hint(wgt); return false
+        shortcut_fs_hint(wgt)
+        shortcut.log(wgt, "open %s refused: not fullscreen", tgt.id)
+        return false
     end
     -- view gate BEFORE tool_ready: tool_ready lazy-LOADS the module, so with a bound
     -- switch held while another page is open it would load logview/rf2cfg every 5 Hz
     -- pass just to have the open refused below — the module stayed resident (GC drag)
-    if not (wgt.menu_view == nil or wgt.menu_view == "toolbox") then return false end
-    if not shortcut.tool_ready(tgt) then return false end
+    if not (wgt.menu_view == nil or wgt.menu_view == "toolbox") then
+        shortcut.log(wgt, "open %s refused: %s up", tgt.id, wgt.menu_view)
+        return false
+    end
+    if not shortcut.tool_ready(tgt) then
+        -- the loader already logged WHY (fltlog.load_err) -- this line adds WHAT
+        -- the user did to hit it
+        shortcut.log(wgt, "open %s refused: tool not loadable", tgt.id)
+        return false
+    end
     -- The MSP gate, for the one target that writes to the flight controller
     -- Replicated from the tap dispatch, NOT relaxed:
     -- the tap requires disarmed AND wgt.rf.msp_allowed and re-reads before opening, because
@@ -4239,15 +5184,20 @@ function shortcut.open(wgt, tgt)
     -- that is then declined. Rule 1 of this project is no MSP while armed; the disarmed
     -- check above and this one are the two halves of it.
     if tgt.msp then
-        if not (wgt.rf and wgt.rf.msp_allowed) then return false end
+        if not (wgt.rf and wgt.rf.msp_allowed) then
+            shortcut.log(wgt, "open %s refused: no MSP", tgt.id)
+            return false
+        end
         rf_service.refresh_data(wgt)
     end
+    shortcut.log(wgt, "open %s", tgt.id)
     wgt.detail_view = nil                             -- tool pages own the whole screen
     -- a stale close request from an earlier shortcut-close of the SAME module would
     -- otherwise shut the fresh page in its first refresh (the module never saw the
     -- close, so the flag was never consumed)
     if tgt.id == "tb_logview" then wgt.lv_close_req = nil end
     if tgt.id == "tb_rf2cfg"  then wgt.rf2cfg_close_req = nil end
+    if tgt.id == "tb_rfscfg"  then wgt.rfs_close_req = nil end
     if tgt.id == "tb_fltlog"  then wgt.fl_close_req = nil end
     -- RTN from a shortcut-opened tool goes STRAIGHT back to the dashboard — the
     -- user never navigated the menu, so there is no menu trail to unwind (opened
@@ -4264,16 +5214,33 @@ end
 -- for GC (boot-resident modules measurably drag the whole UI, see the lazy-load design).
 function shortcut.close(wgt, tgt)
     if not tgt then return end
+    if tgt.kind == "action" then
+        -- leaving the held position ends the REPEAT; a running report finishes
+        ultidash_functions.telemsay_release(wgt)
+        shortcut.log(wgt, "release %s", tgt.id)
+        return
+    end
+    if tgt.kind == "menu" then
+        -- only the HUB is closed -- a user who navigated deeper from it keeps the page
+        if wgt.menu_view == "menu" then
+            wgt.menu_view = nil
+            init_view_state(wgt).dirty = true
+            shortcut.log(wgt, "close menu")
+        end
+        return
+    end
     if tgt.kind == "detail" then
         if wgt.detail_view == tgt.id then
             wgt.detail_view = nil
             init_view_state(wgt).dirty = true
+            shortcut.log(wgt, "close %s", tgt.id)
         end
     elseif tgt.kind == "tool" then
         if wgt.menu_view == tgt.id then
             close_tool_page(wgt)
             wgt.menu_view = nil
             init_view_state(wgt).dirty = true
+            shortcut.log(wgt, "close %s", tgt.id)
         end
     end
 end
@@ -4306,7 +5273,8 @@ function shortcut.run(wgt)
             if cur ~= s.pos then s.pos = cur; s.since = now end   -- state changed: restart delay
             if cur then
                 if not s.opened and (now - (s.since or now)) >= delay_cs then
-                    if shortcut.open(wgt, tgt) then s.opened = true; s.tgt = tgt end
+                    -- held=true: a position slot's action target (D3) repeats while held
+                    if shortcut.open(wgt, tgt, true) then s.opened = true; s.tgt = tgt end
                 end
             elseif s.opened then
                 shortcut.close(wgt, s.tgt); s.opened = false
@@ -4336,6 +5304,7 @@ function shortcut.run(wgt)
             if (s.stage or 0) >= 1
                 and not shortcut.is_up(wgt, s.list and s.list[s.stage]) then
                 s.stage = 0
+                shortcut.log(wgt, "tg%d resync: page closed elsewhere", j)
             end
             local on = ultidash_functions.swpos_active(sw)
             if s.prev == nil then
@@ -4357,6 +5326,9 @@ function shortcut.run(wgt)
                 local nx = (s.stage or 0) + 1
                 if nx > #list then nx = 0 end                 -- past the last option: closed
                 s.stage = nx
+                -- the press itself, BEFORE the open (whose own line then says what
+                -- came of it) -- a press that opens nothing is otherwise invisible
+                shortcut.log(wgt, "tg%d press: stage %d/%d", j, nx, #list)
                 if nx >= 1 and not shortcut.open(wgt, list[nx]) then
                     s.stage = 0                               -- open refused (e.g. armed tool): stay closed
                 end
@@ -4721,6 +5693,22 @@ local function skin_env_build()
             end
             w[key] = r
         end,
+        -- The page-close control for a FULL-SCREEN page: draws the "X" in the top-right
+        -- corner of `panel` (a `w`-wide page) and registers its tap rect. Returns the
+        -- width it occupies, so the caller can keep its header text out of it.
+        -- SINCE 0.8.0 THIS IS THE ONLY WAY A DETAIL PAGE CLOSES BY TOUCH -- the tap
+        -- anywhere that used to close it is gone (it was invisible, and it made tap
+        -- zones on those pages impossible). A skin that overrides a detail page and
+        -- does NOT call this builds a page the pilot can only leave with RTN.
+        -- See docs/SKINS.md.
+        close_button  = function(panel, wgt, w)
+            local cx, csz = ultidash_functions.close_control(panel, w - 8, 6,
+                COLOR_THEME_SECONDARY1, COLOR_THEME_PRIMARY1)
+            -- generous on purpose: the glyph is small and the corner is the one place
+            -- nothing else can be hit, so the rect covers the whole corner
+            wgt.close_rect = { x = cx - 8, y = 0, w = csz + 16, h = csz + 14 }
+            return csz + 16
+        end,
         -- A render-ready threshold bundle for a sensor name, or nil when the name is not in
         -- the host table (the caller then renders as it does today). Thresholds and the
         -- scale are snapshot HERE, at build time; the value getters are per-frame. That is
@@ -4774,9 +5762,11 @@ local function skin_env_build()
         sensor_slot = function(wgt, key)
             local name = wgt.options and wgt.options[key]
             if is_off_sensor(name) then return nil end
-            -- units follow the same Display option as the host panels, so a skin that
-            -- renders `.unit` (Cockpit, Grid) drops them with everything else
-            local units_on = (wgt.options.ShowUnits == 1)
+            -- units follow the ACTIVE SKIN's own units key since 0.8.0 (the host key when
+            -- it declares none), so a skin that renders `.unit` (Cockpit, Grid) decides
+            -- for its own layout instead of inheriting a Display option meant for a
+            -- different one. `.unit_raw` below is unaffected, by design.
+            local units_on = (wgt.options[SKINS._units_key or "ShowUnits"] == 1)
             if name == VOLT_AUTO then
                 return { name = name, label = wgt.values.display_voltage_label_short,
                          -- short form of the same live label: "Cell"/"Batt", "Buffer" while
@@ -4964,6 +5954,12 @@ local function skin_load(id)
     reg.scheme_key = (type(m.scheme_key) == "string" and m.scheme_key)
         or ("Scheme_" .. reg.id)
     reg.def_scheme = (type(m.def_scheme) == "number" and m.def_scheme) or 1
+    -- The skin's own "units beside values" key, same shape as scheme_key -- but with NO
+    -- generated fallback, deliberately: a skin that declares none keeps reading the
+    -- host's ShowUnits, which is what every skin written before 0.8.0 does. Inventing a
+    -- "Units_<id>" key for them would silently reset a setting they already honour.
+    reg.units_key = (type(m.units_key) == "string" and m.units_key) or nil
+    reg.def_units = (type(m.def_units) == "number" and m.def_units) or 0
     -- opt-in for the session extrema of this skin's sensor slots (refresh_skin_menus
     -- hands it to the 5 Hz pass as SKINS._want_extrema). Must be copied here with the
     -- rest of the manifest -- while it was missing, the whole opt-in was inert and a
@@ -4998,6 +5994,10 @@ end
 local skin_disc = nil
 register_skin_defaults = function()
     if skin_defaults_done then return end
+    -- SYNCHRONOUS callers (update's register+apply pair) need the item catalogue NOW,
+    -- so build it if the staged gates have not drained it yet — those gates run
+    -- _build in its OWN cycle first, which makes this a no-op on the staged path.
+    if SETTINGS_GROUPS._build then SETTINGS_GROUPS._build() end
     if skin_disc == nil then
         skin_disc = { q = {}, seen = {}, tags = {} }
         local ids = {}
@@ -5054,6 +6054,12 @@ register_skin_defaults = function()
         end
         if reg.scheme_key then
             SETTINGS_DEFAULTS[reg.scheme_key] = reg.def_scheme or 1
+        end
+        -- EVERY skin's units key, not just the active one's -- save()'s orphan-drop
+        -- removes any key the defaults do not know, which would wipe an inactive skin's
+        -- stored choice (the same reason the scheme keys are registered here)
+        if reg.units_key then
+            SETTINGS_DEFAULTS[reg.units_key] = reg.def_units or 0
         end
         local items = reg.items
         if items ~= nil then
@@ -5213,8 +6219,12 @@ local function skin_build(wgt, zone, which)
     local skin = active_skin(wgt)
     if skin == nil then return nil end
     wgt.skin_build_failed = nil
-    local ok, main_panel, y_content = pcall(skin[which], wgt, zone)
-    if ok then return main_panel, y_content end
+    -- FOUR slots, not three: a builder's optional THIRD return is the two-cycle-build
+    -- continuation (see build_flight_ui), and a `local ok, a, b = pcall(...)` drops it
+    -- silently -- the builder still succeeds, the stage-2 half of the layout just never
+    -- runs and nothing says so. The fallback below unpacks the same way for the same reason.
+    local ok, main_panel, y_content, cont = pcall(skin[which], wgt, zone)
+    if ok then return main_panel, y_content, cont end
     local why = tostring(main_panel)
     local id = tostring(wgt.options.Skin)
     -- one line per builder per distinct reason (a builder raising every frame still says
@@ -5229,14 +6239,14 @@ local function skin_build(wgt, zone, which)
     if id == "default" or SKINS.default == nil then return nil end
     local fb = skin_load("default")
     if fb == nil then return nil end
-    local fok, fmp, fyc = pcall(fb[which], wgt, zone)
+    local fok, fmp, fyc, fcont = pcall(fb[which], wgt, zone)
     if not fok then return nil end
-    return fmp, fyc
+    return fmp, fyc, fcont
 end
 
 --- Build the flight dashboard: the active skin lays it out, the host stacks its overlays.
 local function build_flight_ui(wgt, zone)
-    local main_panel, y_content = skin_build(wgt, zone, "build_flight")
+    local main_panel, y_content, cont = skin_build(wgt, zone, "build_flight")
     if main_panel == nil then
         if wgt.skin_build_failed or active_skin(wgt) == nil then
             return skin_emergency(wgt, zone)
@@ -5244,11 +6254,20 @@ local function build_flight_ui(wgt, zone)
         return                                   -- the skin declined, as it may
     end
     add_dashboard_overlays(main_panel, wgt, zone.w, zone.h, y_content, true)
+    -- TWO-CYCLE BUILD (optional, skin API): a builder may return a THIRD value, a
+    -- continuation the host runs in the NEXT refresh cycle with a budget of its own —
+    -- the same staggering as everything else, applied to the build itself. The heaviest
+    -- layouts sat within ~4k of the harness fail line in ONE call; split, neither half
+    -- does. The continuation must be self-contained (it builds its own top-level
+    -- lvgl.box — nothing hands it a parent) and is dropped unrun by any newer build
+    -- (see the lvgl.clear site). One frame shows part 1 alone; at 20 Hz that is the
+    -- same invisibility every staged cycle here relies on.
+    if type(cont) == "function" then wgt.skin_build_cont = cont end
 end
 
 --- Build the statistics dashboard: same split, no setup hint on the stats page.
 local function build_stats_ui(wgt, zone)
-    local main_panel, y_content = skin_build(wgt, zone, "build_stats")
+    local main_panel, y_content, cont = skin_build(wgt, zone, "build_stats")
     if main_panel == nil then
         if wgt.skin_build_failed or active_skin(wgt) == nil then
             return skin_emergency(wgt, zone)
@@ -5256,6 +6275,16 @@ local function build_stats_ui(wgt, zone)
         return
     end
     add_dashboard_overlays(main_panel, wgt, zone.w, zone.h, y_content, false)
+    -- THE HOST GUARANTEES A WAY OUT. The close control normally comes from the host top
+    -- bar, so every skin that draws it gets one without knowing about it — but `minimal`
+    -- and `dash1` build their own stats header and never call it, and since 0.8.0 there
+    -- is no tap-anywhere left to fall back on. Without this the page would have no touch
+    -- route out at all. Same principle as the safety overlays above: a skin may PLACE the
+    -- control (docs/SKINS.md), it can never remove it.
+    if wgt.close_rect == nil and lvgl.isFullScreen ~= nil and lvgl.isFullScreen() then
+        skin_env_build().close_button(main_panel, wgt, zone.w)
+    end
+    if type(cont) == "function" then wgt.skin_build_cont = cont end
 end
 
 --- Rebuild the widget UI for the active view and current options. `defer_build` (used only
@@ -5265,6 +6294,26 @@ local function update(wgt, options, defer_build)
     if (wgt == nil) then return end
     prepare_widget(wgt)
     wgt.options = options
+    -- The declared craft target, RE-READ on every update() and never cached from create():
+    -- EdgeTX calls update() when the user changes an option in the widget dialog, so a
+    -- value taken once at placement time would be the previous one until reboot. Resolved
+    -- BEFORE the flag-only return below because the create path never reaches the rest of
+    -- this function, and the first gated refresh cycle -- which is where ensure_rf_service
+    -- attaches the RF service -- runs before the first full update().
+    -- ultidashOptions owns both the declaration and the MEANING of the stored value (the 0
+    -- an already-placed 0.7.x instance reports included); it is cached on the WIDGET rather
+    -- than in a top-level local because this chunk is at Lua's 200-active-locals wall.
+    -- The STORED value is what is re-read every time; the normalisation runs only when it
+    -- actually moved (measured: the unconditional call cost ~24 instructions in every
+    -- update(), and update() runs on every UI rebuild). Same memo discipline as the Status
+    -- page rows -- an option change still lands on the very next update(), which is the
+    -- call EdgeTX makes when the dialog closes.
+    local traw = options and options.Target
+    if traw ~= wgt.target_raw or wgt.target == nil then
+        if wgt.opt_mod == nil then wgt.opt_mod = loadScript(script_dir .. "ultidashOptions.lua")() end
+        wgt.target_raw = traw
+        wgt.target = wgt.opt_mod.normalize_target(traw)
+    end
     -- create() path: do NOTHING beyond flagging. create()'s 20k-instruction budget already
     -- carries the five module chunks (this file + Functions/Values/Rf/Settings, lazy-loaded
     -- by main.lua INSIDE create), which is most of the budget by itself — the cold cfg
@@ -5286,12 +6335,21 @@ local function update(wgt, options, defer_build)
         -- stage 2a, in its OWN cycle: harvest the skin manifests + register their keys
         -- (loads every skin once). Sharing this with the cfg read+apply below overran
         -- the budget (measured 18.2k) — so apply stays pending for the NEXT cycle.
-        if not skin_defaults_done then register_skin_defaults(); return wgt end
+        if not skin_defaults_done then
+            -- stage 2a0 first, in its OWN cycle: the settings item catalogue (~5.7k,
+            -- moved out of create()'s module-level budget); the harvest gets the next
+            if SETTINGS_GROUPS._build then SETTINGS_GROUPS._build() else register_skin_defaults() end
+            return wgt
+        end
         wgt.settings_apply_pending = nil
         ultidash_settings.apply(wgt)
         -- may also be the autosave's stage 2 (fullscreen ENTER can land between the
         -- save cycle and the next refresh) -> the palette memo must be invalidated here too
         settings_gen = settings_gen + 1
+        -- ...and stamp the apply memo AFTER the bump, or the very next update() would see a
+        -- generation it has never applied and repeat the walk it just did (see the memo below)
+        wgt.applied_gen, wgt.applied_target, wgt.applied_opts =
+            settings_gen, ultidash_settings.target_path(), wgt.options
         if ultidash_functions.dbg_loadable()
             and (wgt.options.DebugLog == 1)
                 ~= (ultidash_functions.dbg ~= nil and ultidash_functions.dbg.is_enabled()) then
@@ -5305,8 +6363,39 @@ local function update(wgt, options, defer_build)
     end
     -- overlay the per-model settings file onto the EdgeTX options (file wins for
     -- saved keys; no file = pure EdgeTX behavior).
+    if SETTINGS_GROUPS._build then
+        -- too EARLY for the synchronous pair: catalogue + skin harvest + apply is
+        -- three staged budgets' worth in one call — and building the UI below without
+        -- the apply would run on EMPTY options. Flag the apply and return, exactly
+        -- like the create path's flag-only update: the refresh()/background() gates
+        -- drain the chain one cycle each and the stage-2 apply flags the rebuild.
+        wgt.settings_apply_pending = true
+        return wgt
+    end
     register_skin_defaults()   -- no-op after the first call
-    ultidash_settings.apply(wgt)
+    -- MEMOISED, and this call used to be unconditional: apply() walks the whole ~296-key
+    -- catalogue (ultidashSettings.lua, `for k, def in pairs(defaults)`), and EVERY dirty
+    -- rebuild comes through here — a stats<->flight flip on arm/disarm, a detail page
+    -- opening, every menu navigation step, the settings-page seed — each paying ~1.8k
+    -- (measured: the staged `stage 2: apply` call is 2 077) with NOTHING changed in the cfg.
+    -- apply()'s output depends only on (cfg file, defaults) plus the options table it writes
+    -- into, so those three are exactly the memo keys:
+    --   settings_gen  — bumped by every path that changes settings (autosave stage 2, reset
+    --                   stage 2, settings_apply_pending); module-shared, so a save in ANY
+    --                   instance invalidates every instance's memo.
+    --   target_path() — a model switch moves the cfg file under us; M.load re-reads on it
+    --                   and so must this.
+    --   options       — EdgeTX may hand update() a FRESH options table (the widget dialog);
+    --                   a new table carries none of the file's keys and must be re-applied.
+    --                   Identity, not content: cheap and exact.
+    -- Same generation mechanic as pal_memo three blocks below. Fields on `wgt` rather than
+    -- top-level locals — this chunk is at Lua's 200-active-locals wall.
+    local apply_target = ultidash_settings.target_path()
+    if wgt.applied_gen ~= settings_gen or wgt.applied_target ~= apply_target
+        or wgt.applied_opts ~= options then
+        wgt.applied_gen, wgt.applied_target, wgt.applied_opts = settings_gen, apply_target, options
+        ultidash_settings.apply(wgt)
+    end
     -- diagnostics: drive the optional file logger from the per-model DebugLog option.
     -- No-op without ultidashDebug.lua.
     -- Enabling it STARTS a log session (several SD writes); that I/O must not share this
@@ -5319,8 +6408,10 @@ local function update(wgt, options, defer_build)
             ~= (ultidash_functions.dbg ~= nil and ultidash_functions.dbg.is_enabled()) then
         wgt.dbg_enable_pending = { wgt.options.DebugLog == 1, wgt.options.DebugKeep }
     end
-    -- One-time migration: when no per-model file exists yet, snapshot the current
-    -- effective option values into it.
+    -- One-time migration: when no per-model file exists yet, write it once so it
+    -- exists and is stamped. (Since the delta rule that is a stamps-only file on a
+    -- fresh model — every effective value IS its default — but a pre-cfg upgrade
+    -- whose options carry non-defaults still snapshots those.)
     -- DEFERRED to a refresh() cycle of its own: EdgeTX gives each widget call a
     -- 20k-instruction budget (lua_widget.cpp MAX_INSTRUCTIONS), and snapshot +
     -- cfg file write on top of the full UI build in this same call blew it
@@ -5423,7 +6514,48 @@ local function update(wgt, options, defer_build)
     -- break silently: every colour would still be a valid colour.
     if ultidash_detail ~= nil then ultidash_detail.set_theme(skin_theme) end
 
+    -- While the RFSuite adapter has the tool up, THAT TOOL owns the screen and this
+    -- rebuild must not happen at all.
+    --
+    -- The chain, and none of it is inference: this function clears the tree, paints its
+    -- background rectangle and dispatches to the open page's build; `rfscfg.M.build` draws
+    -- nothing while the tool is open (RFSuite paints inside its own run()); and RFSuite
+    -- rebuilds only when ITS state changes (`state.pendingBuildUI`, ui/home.lua). So one host
+    -- rebuild leaves the background rectangle standing and nothing ever repaints over it --
+    -- a white screen with the page still open. Reported from the radio 2026-08-18
+    -- ("kurz den home screen und dann weiss").
+    --
+    -- Why this and not rf2cfg's trick: RF2's framework exposes a re-show seam (clearWaitMessage)
+    -- that adapter pokes from its build. `ui/home.lua` returns { init, run, useLvgl } and
+    -- exports neither buildUI nor its pending flag, so there is nothing equivalent to reach --
+    -- the only lever left is not to clear in the first place.
+    --
+    -- The dirty flag is CONSUMED here on purpose. Leaving it set would re-enter this path on
+    -- every cycle, and the caller's `return update(...)` makes that a wasted call each time.
+    if wgt.menu_view == "tb_rfscfg" and rfscfg.mod ~= nil
+        and rfscfg.mod.owns_screen ~= nil and rfscfg.mod.owns_screen() then
+        init_view_state(wgt).dirty = false
+        wgt.layout_dirty = false
+        return wgt
+    end
+
     lvgl.clear()
+    -- M3: one filled rectangle in the widget's own background colour, immediately after
+    -- the clear and before the dispatch. The staged page opens (build_settings_view seeds
+    -- its working copy and returns; a sensor page spends a second cycle on the pick list)
+    -- leave the tree EMPTY for 2-3 frames, and what showed through was whatever EdgeTX
+    -- paints behind the widget -- the price of the CPU-limit staggering, reported from
+    -- the radio 2026-08-16. The rectangle costs a handful of instructions in cycles that
+    -- are deliberately near-empty; every after-the-clear staged site is covered at once.
+    -- (build_sensorcheck_view already solved this for itself with a titled placeholder
+    -- page -- this is the cheap general form underneath everything else.)
+    lvgl.build({ { type = "rectangle", filled = true, x = 0, y = 0,
+                   w = wgt.zone and wgt.zone.w or LCD_W, h = wgt.zone and wgt.zone.h or LCD_H,
+                   color = skin_theme.panel_bg } })
+    -- a pending two-cycle-build continuation dies with the tree it was meant to finish:
+    -- its part-1 objects are gone as of the clear above, and the new build either sets
+    -- a fresh one or needs none
+    wgt.skin_build_cont = nil
     -- everything lvgl is gone now — drop the cached element references so nothing
     -- (e.g. update_status_bar_visibility) touches a cleared object ("Invalid object"
     -- error). The flight/stats builders repopulate them; the other views have none.
@@ -5432,11 +6564,16 @@ local function update(wgt, options, defer_build)
     wgt.status_bar_box = nil
     -- tap-target rects: only the builders that exist in the new layout re-set them
     wgt.estatus_rect = nil
+    wgt.statspage_rect = nil
     wgt.elrs_bar_rect = nil
     wgt.settings_icon_rect = nil
     wgt.battery_rect = nil
     wgt.values_rect = nil
     wgt.battprofile_rect = nil
+    -- the page-close control: set by the detail builders and by the stats top bar, and
+    -- by NOTHING on the flight view -- so a stale rect from the page just closed must not
+    -- survive into a view that has no close at all
+    wgt.close_rect = nil
     -- the Status log's paging buttons, for the same reason: a skin that stops drawing the log
     -- must not inherit buttons from the build before it. The host builder sets or nils them
     -- itself, so clearing them first changes nothing on the host path.
@@ -5460,7 +6597,7 @@ local function update(wgt, options, defer_build)
         -- menu family (hub, Toolbox/Settings submenus, settings pages, sensor
         -- check, battery pickers): all built by the LAZY menu module. Missing
         -- module (partial deploy) = clean degrade back to the dashboard.
-        local m = menu_load()
+        local m = menu_load(wgt)
         if m ~= nil then
             -- pcall'd for the same reason the skin builders are: the settings pages render
             -- SKIN-SUPPLIED rows (M.items), so a third-party skin's malformed row could
@@ -5491,6 +6628,8 @@ local function update(wgt, options, defer_build)
         tb_adjmap.build(wgt, wgt.zone)
     elseif wgt.menu_view == "tb_adjed" and tb_adjed then
         tb_adjed.build(wgt, wgt.zone)
+    elseif wgt.menu_view == "tb_livemon" and livemon.mod then
+        livemon.mod.build(wgt, wgt.zone)
     elseif wgt.menu_view == "tb_logview" and tb_logview then
         tb_logview.build(wgt, wgt.zone)
     elseif wgt.menu_view == "tb_fltlog" and fltlog.mod then
@@ -5498,10 +6637,17 @@ local function update(wgt, options, defer_build)
         -- module copy per open); fltdata is tiny and stays resident by design anyway
         wgt.flt_data_mod = fltlog.load_data()
         fltlog.mod.build(wgt, wgt.zone)
+    elseif wgt.menu_view == "tb_batted" and fltlog.batted then
+        -- battpick's "+ New" create form (fltbatt renders detail-page style)
+        fltlog.batted.build(wgt, wgt.zone)
     elseif wgt.menu_view == "tb_rf2cfg" and tb_rf2cfg then
         -- RF2 Config paints ITSELF (original tool: lvgl.clear+build inside its
         -- runner); build() only shows the glue notice page / pokes a re-show.
         tb_rf2cfg.build(wgt, wgt.zone)
+    elseif wgt.menu_view == "tb_rfscfg" and rfscfg.mod then
+        -- RFSuite paints ITSELF (lvgl.clear+build inside its run());
+        -- build() only shows the glue notice page while the tool is not open.
+        rfscfg.mod.build(wgt, wgt.zone)
     elseif wgt.detail_view ~= nil and ultidash_detail ~= nil
         and init_view_state(wgt).current == "flight" then
         -- The four detail pages live in ultidashDetail.lua since 0.7.0 (elrs = the top-bar
@@ -5554,6 +6700,16 @@ local function update(wgt, options, defer_build)
             or not ultidash_detail.build(wgt, wgt.zone, wgt.detail_view)) then
             build_flight_ui(wgt, wgt.zone)
         end
+        -- The same guarantee as on the stats page: a skin hook that drew its own detail
+        -- page and did not call env.close_button would leave a page with NO touch route
+        -- out since 0.8.0 (`dash1` overrides detail pages today). The control is placed
+        -- in the corner as its own top-level object, because a hook returns no panel to
+        -- build into. A hook that called it already set the rect and nothing happens here.
+        if wgt.close_rect == nil then
+            local cx, csz = ultidash_functions.close_control(nil, wgt.zone.w - 8, 6,
+                COLOR_THEME_SECONDARY1, COLOR_THEME_PRIMARY1)
+            wgt.close_rect = { x = cx - 8, y = 0, w = csz + 16, h = csz + 14 }
+        end
         -- The notice, built ONLY when it applies and only on the page it is about -- it must
         -- never reach the dashboard, which is why add_dashboard_overlays is not involved.
         -- Its own top-level object rather than add_warn_banner: that helper builds INTO a
@@ -5601,35 +6757,23 @@ end
 local function background(wgt)
     if not wgt then return end
     prepare_widget(wgt)
+    -- M5: keep the live monitor's ring fed while the widget is hidden -- coarser (the
+    -- background rate is EdgeTX's), and stated as a limit in the docs rather than hidden
+    ultidash_functions.lm_sample(wgt)
     -- Stage 1 of the deferred settings write when the widget is HIDDEN (refresh never
-    -- runs): mirrors refresh()'s stage 1 so edits made before the dashboard went
-    -- off-screen still reach the card, each half in its own call's budget.
-    if wgt.settings_save_pending or wgt.settings_reset_pending then
-        if not skin_defaults_done then register_skin_defaults(); return wgt end
-        local pending = wgt.settings_save_pending
-        wgt.settings_save_pending = nil
-        local ok
-        if wgt.settings_reset_pending then
-            wgt.settings_reset_pending = nil
-            ok = ultidash_settings.reset()
-            if ok then
-                -- the file is right now; the LIVE options are not. reset() deliberately
-                -- does not write the "unset" colour roles, and apply() never downgrades a
-                -- key the file does not carry -- so every colour override stayed on screen
-                -- until the next boot. Same stage as the write, so it costs no extra cycle.
-                ultidash_settings.reset_options(wgt)
-            else
-                ultidash_functions.log("settings reset FAILED (cfg file not writable)")
-            end
-        else
-            ok = ultidash_settings.save(pending)
-            if not ok then ultidash_functions.log("settings save FAILED (cfg file not writable)") end
+    -- runs): the module's write_stage1 (autosave begin, one bounded batch of a chunked
+    -- write in flight, or a reset), so edits made before the dashboard went off-screen
+    -- still reach the card. It flags stage 2 itself when the write is done.
+    if wgt.settings_save_pending or wgt.settings_reset_pending or wgt.settings_write_job then
+        -- the orphan-drop in the merge needs the full key set; harvesting it is a
+        -- cycle of its own (see stage 2a) — normally long done, so a flag check
+        if not skin_defaults_done then
+            -- stage 2a0 first, in its OWN cycle: the settings item catalogue (~5.7k,
+            -- moved out of create()'s module-level budget); the harvest gets the next
+            if SETTINGS_GROUPS._build then SETTINGS_GROUPS._build() else register_skin_defaults() end
+            return wgt
         end
-        if not ok then
-            wgt.cfg_save_failed_text = nil                        -- default banner wording
-            wgt.cfg_save_failed_until = (getTime() or 0) + 1000   -- ~10 s sticky warn banner
-        end
-        wgt.settings_apply_pending = true
+        ultidash_settings.write_stage1(wgt, ultidash_functions.log)
         return
     end
     -- Stage 2 of the deferred create() when the widget is HIDDEN (refresh never runs),
@@ -5641,10 +6785,17 @@ local function background(wgt)
         -- stage 2a, in its OWN cycle: harvest the skin manifests + register their keys
         -- (loads every skin once). Sharing this with the cfg read+apply below overran
         -- the budget (measured 18.2k) — so apply stays pending for the NEXT cycle.
-        if not skin_defaults_done then register_skin_defaults(); return wgt end
+        if not skin_defaults_done then
+            -- stage 2a0 first, in its OWN cycle: the settings item catalogue (~5.7k,
+            -- moved out of create()'s module-level budget); the harvest gets the next
+            if SETTINGS_GROUPS._build then SETTINGS_GROUPS._build() else register_skin_defaults() end
+            return wgt
+        end
         wgt.settings_apply_pending = nil
         ultidash_settings.apply(wgt)
         settings_gen = settings_gen + 1   -- invalidate palette memo
+        wgt.applied_gen, wgt.applied_target, wgt.applied_opts =   -- ...and stamp the apply memo
+            settings_gen, ultidash_settings.target_path(), wgt.options
         if ultidash_functions.dbg_loadable()
             and (wgt.options.DebugLog == 1)
                 ~= (ultidash_functions.dbg ~= nil and ultidash_functions.dbg.is_enabled()) then
@@ -5714,6 +6865,12 @@ local function background(wgt)
     end
     ultidash_functions.background_refresh(wgt)
     ultidash_functions.publish_shared(wgt)
+    -- cache the armed state off-screen too. refresh() has always done this for the
+    -- reactive closures; background() did not, and since lm_sample reads the cached flag
+    -- instead of calling is_armed itself (2026-08-17) an off-screen arm would otherwise
+    -- never reach the Live Monitor's edge marker. Same 5 Hz cadence, same meaning in both
+    -- paths -- and arm_edges below wants the state anyway.
+    wgt.armed_now = ultidash_functions.is_armed(wgt)
     -- arm/disarm edges off-screen too: opens/flags the flight record —
     -- without this a flight flown on another EdgeTX screen logged 0 s
     fltlog.arm_edges(wgt)
@@ -5745,6 +6902,10 @@ end
 local function refresh(wgt, event, touch_state)
     if not wgt then return end
     prepare_widget(wgt)
+    -- M5: fold this pass into the live monitor's 5 Hz min/max ring -- EVERY cycle,
+    -- before any dispatch or early return, because a peak between two 5 Hz passes is
+    -- exactly what the ring exists to keep. Costs a 4-compare no-op while unconfigured.
+    ultidash_functions.lm_sample(wgt)
     -- dev metrics (shown in the status detail footer): UI loop rate per second —
     -- the most honest "load" indicator (scheduler starvation = rate drops) — plus
     -- the Lua heap, sampled once per window
@@ -5771,39 +6932,20 @@ local function refresh(wgt, event, touch_state)
         if d then d.set_enabled(p[1], p[2]) end
         return
     end
-    -- Stage 1 of the deferred settings WRITE — either the autosave (flagged by
-    -- save_pending_settings on back/RTN/arm/fullscreen-exit) or "Reset to defaults"
-    -- (flagged by the menu). Both write the whole key catalog to the card and run ALONE
-    -- in this cycle's budget; each then flags the shared stage 2 below so the apply gets
-    -- its own cycle too. Measured: save ~11k, reset ~17k -- neither fits beside anything.
-    if wgt.settings_save_pending or wgt.settings_reset_pending then
-        -- the orphan-drop in save() needs the full key set; harvesting it is a cycle
-        -- of its own (see stage 2a) — normally long done, so this is a flag check
-        if not skin_defaults_done then register_skin_defaults(); return wgt end
-        local pending = wgt.settings_save_pending
-        wgt.settings_save_pending = nil
-        local ok
-        if wgt.settings_reset_pending then
-            wgt.settings_reset_pending = nil
-            ok = ultidash_settings.reset()
-            if ok then
-                -- the file is right now; the LIVE options are not. reset() deliberately
-                -- does not write the "unset" colour roles, and apply() never downgrades a
-                -- key the file does not carry -- so every colour override stayed on screen
-                -- until the next boot. Same stage as the write, so it costs no extra cycle.
-                ultidash_settings.reset_options(wgt)
-            else
-                ultidash_functions.log("settings reset FAILED (cfg file not writable)")
-            end
-        else
-            ok = ultidash_settings.save(pending)
-            if not ok then ultidash_functions.log("settings save FAILED (cfg file not writable)") end
+    -- Stage 1 of the deferred settings WRITE — the module's write_stage1 (the autosave
+    -- begin, one bounded batch of a chunked write in flight, or "Reset to defaults"),
+    -- alone in this cycle's budget. It flags the shared stage 2 below when it is done;
+    -- the chunking and its abort story live at save_begin/save_step in ultidashSettings.
+    if wgt.settings_save_pending or wgt.settings_reset_pending or wgt.settings_write_job then
+        -- the orphan-drop in the merge needs the full key set; harvesting it is a
+        -- cycle of its own (see stage 2a) — normally long done, so a flag check
+        if not skin_defaults_done then
+            -- stage 2a0 first, in its OWN cycle: the settings item catalogue (~5.7k,
+            -- moved out of create()'s module-level budget); the harvest gets the next
+            if SETTINGS_GROUPS._build then SETTINGS_GROUPS._build() else register_skin_defaults() end
+            return wgt
         end
-        if not ok then
-            wgt.cfg_save_failed_text = nil                        -- default banner wording
-            wgt.cfg_save_failed_until = (getTime() or 0) + 1000   -- ~10 s sticky warn banner
-        end
-        wgt.settings_apply_pending = true
+        ultidash_settings.write_stage1(wgt, ultidash_functions.log)
         return
     end
     -- Stage 2 of the deferred create() (see update) AND of the autosave above: the cfg
@@ -5816,12 +6958,19 @@ local function refresh(wgt, event, touch_state)
         -- stage 2a, in its OWN cycle: harvest the skin manifests + register their keys
         -- (loads every skin once). Sharing this with the cfg read+apply below overran
         -- the budget (measured 18.2k) — so apply stays pending for the NEXT cycle.
-        if not skin_defaults_done then register_skin_defaults(); return wgt end
+        if not skin_defaults_done then
+            -- stage 2a0 first, in its OWN cycle: the settings item catalogue (~5.7k,
+            -- moved out of create()'s module-level budget); the harvest gets the next
+            if SETTINGS_GROUPS._build then SETTINGS_GROUPS._build() else register_skin_defaults() end
+            return wgt
+        end
         wgt.settings_apply_pending = nil
         ultidash_settings.apply(wgt)
         -- invalidate the palette memo. Unconditional: on the create path nothing is
         -- memoised yet, so the extra bump costs one recompute.
         settings_gen = settings_gen + 1
+        wgt.applied_gen, wgt.applied_target, wgt.applied_opts =   -- ...and stamp the apply memo
+            settings_gen, ultidash_settings.target_path(), wgt.options
         init_view_state(wgt).dirty = true   -- the autosave path built with the OLD options
         if ultidash_functions.dbg_loadable()
             and (wgt.options.DebugLog == 1)
@@ -5863,6 +7012,22 @@ local function refresh(wgt, event, touch_state)
     -- here, alone in its own cycle (measured: read + adoption write + apply in ONE
     -- call sat at ~19.9k of the 20k limit). No-op ~5 instr when nothing is pending.
     if ultidash_settings.flush_adoption ~= nil and ultidash_settings.flush_adoption() then
+        return
+    end
+    -- Stage 2 of a TWO-CYCLE skin build (see build_flight_ui): the heavy half of the
+    -- heaviest layouts runs here, alone in this cycle's budget. Deliberately AFTER the
+    -- settings stages above — those may flag a rebuild, whose lvgl.clear drops this
+    -- continuation before it could build onto a cleared tree — and pcall'd like every
+    -- skin call: a failing stage 2 logs and leaves part 1 standing (values, cards and
+    -- taps all live there), which degrades visibly instead of looping a rebuild that
+    -- would fail the same way at 20 Hz.
+    if wgt.skin_build_cont ~= nil then
+        local f = wgt.skin_build_cont
+        wgt.skin_build_cont = nil
+        local okc, errc = pcall(f)
+        if not okc then
+            ultidash_functions.log("skin build stage 2 FAILED: " .. tostring(errc))
+        end
         return
     end
     -- Rebuild ONCE after leaving fullscreen. Root cause (EdgeTX 2.12 source): lvgl.box
@@ -5930,10 +7095,12 @@ local function refresh(wgt, event, touch_state)
             wgt.menu_view = "settings_menu"
             init_view_state(wgt).dirty = true
         elseif wgt.menu_view == "settings_menu" or wgt.menu_view == "status"
+            or wgt.menu_view == "elrsstatus"
             or wgt.menu_view == "sensorcheck" or wgt.menu_view == "toolbox" then
             wgt.menu_view = "menu"                -- submenu -> hub
             init_view_state(wgt).dirty = true
-        elseif wgt.menu_view == "tb_adjmap" or wgt.menu_view == "tb_adjed" then
+        elseif wgt.menu_view == "tb_adjmap" or wgt.menu_view == "tb_adjed"
+            or wgt.menu_view == "tb_livemon" then
             close_tool_page(wgt)                   -- reset a mid-pulse GVAR before closing
             -- back to where the tool was OPENED from: toolbox submenu (menu path) or
             -- straight to the dashboard (shortcut path — no menu trail to unwind)
@@ -5949,12 +7116,23 @@ local function refresh(wgt, event, touch_state)
             end
             init_view_state(wgt).dirty = true
         elseif wgt.menu_view == "tb_fltlog" then
-            -- RTN steps a per-flight detail page back to the list first (on_exit_key
-            -- reports it handled that); at the list top level it leaves the tool.
+            -- RTN steps a battery page / per-flight detail / active model filter
+            -- back first (on_exit_key reports it handled that); at the list top
+            -- level it leaves the tool.
             if not (fltlog.mod and fltlog.mod.on_exit_key(wgt)) then
                 if fltlog.mod then fltlog.mod.close(wgt) end
                 fltlog.mod = nil                   -- release the lazy-loaded module (GC)
                 wgt.menu_view = (wgt.tool_back == "toolbox") and "toolbox" or nil
+            end
+            init_view_state(wgt).dirty = true
+        elseif wgt.menu_view == "tb_batted" then
+            -- battpick's create form: RTN unwinds inside the editor first (models
+            -- sub-page / dialog); at its top RTN = Cancel -> battpick unchanged
+            if not (fltlog.batted and fltlog.batted.on_exit_key(wgt)) then
+                if fltlog.batted then fltlog.batted.close(wgt) end
+                fltlog.batted = nil                -- release the lazy-loaded module (GC)
+                wgt.fb_close_req, wgt.fb_saved, wgt.fb_dirty = nil, nil, nil
+                wgt.menu_view = "battpick"
             end
             init_view_state(wgt).dirty = true
         elseif wgt.menu_view == "tb_rf2cfg" then
@@ -5963,6 +7141,10 @@ local function refresh(wgt, event, touch_state)
             -- dispatch below; the final exit comes back as wgt.rf2cfg_close_req.
             -- No host action here (the branch only keeps the generic else from
             -- closing the view underneath the module).
+        elseif wgt.menu_view == "tb_rfscfg" then
+            -- RFSuite owns RTN completely, same as RF2 Config -- its own key
+            -- loop unwinds page -> main menu -> exit, and the exit comes back as
+            -- wgt.rfs_close_req from the refresh dispatch below.
         else
             wgt.menu_view = nil                   -- hub -> dashboard
             init_view_state(wgt).dirty = true
@@ -5981,10 +7163,29 @@ local function refresh(wgt, event, touch_state)
     -- own tap zones below are gated to menu_view==nil, so no conflict). In-flight capable.
     if wgt.menu_view == "tb_adjmap" and tb_adjmap then
         wgt.tb_announce = ultidash_functions.tb_announce_pos
+        -- T: the FC-served table can land or change WHILE the page is open (the connect
+        -- walk finishes, the option flips, the session ends) -- applyFcTable reports the
+        -- change and the page rebuilds. One string compare per cycle when nothing moved.
+        if tb_common and tb_common.applyFcTable then
+            tb_common.applyOverrides()
+            if tb_common.applyFcTable(wgt) then init_view_state(wgt).dirty = true end
+        end
         tb_adjmap.refresh(wgt, event, touch_state)
     elseif wgt.menu_view == "tb_adjed" and tb_adjed then
         wgt.tb_announce = ultidash_functions.tb_announce_pos
+        if tb_common and tb_common.applyFcTable then
+            tb_common.applyOverrides()
+            if tb_common.applyFcTable(wgt) then init_view_state(wgt).dirty = true end
+        end
         tb_adjed.refresh(wgt, event, touch_state)
+    elseif wgt.menu_view == "tb_livemon" and livemon.mod then
+        -- M5: light per-cycle work (chip tap, one strip's rewrite per bucket tick);
+        -- the sampling itself already ran at the top of this refresh, page or no page
+        livemon.mod.refresh(wgt, event, touch_state)
+        if wgt.lmv_dirty then                  -- window switch / late point allocation
+            wgt.lmv_dirty = nil
+            init_view_state(wgt).dirty = true
+        end
     elseif wgt.menu_view == "tb_logview" and tb_logview then
         -- EXCLUSIVE cycles for the Log Viewer: its chunked file parse deliberately
         -- burns most of an instruction budget itself, so NOTHING heavy may share the
@@ -6044,6 +7245,41 @@ local function refresh(wgt, event, touch_state)
             init_view_state(wgt).dirty = true
         end
         return
+    elseif wgt.menu_view == "tb_batted" and fltlog.batted then
+        -- EXCLUSIVE cycles like the Flight Log pages: the Save registry write
+        -- runs in the module's own deferred cycle and owns the call budget.
+        -- No shortcut.run here on purpose -- a switch-opened tool must not
+        -- stomp the open form; arming still closes it via armed_now below.
+        local lnow = getTime() or 0
+        if (lnow - (wgt.lv_arm_gate or 0)) >= 20 then
+            wgt.lv_arm_gate = lnow
+            wgt.armed_now = ultidash_functions.is_armed(wgt)
+        end
+        if init_view_state(wgt).dirty == true then
+            return update(wgt, wgt.options)    -- rebuild alone in this cycle
+        end
+        fltlog.batted.refresh(wgt, event, touch_state)
+        if wgt.fb_saved or wgt.fb_close_req then
+            local saved = wgt.fb_saved
+            wgt.fb_saved, wgt.fb_close_req, wgt.fb_dirty = nil, nil, nil
+            if fltlog.batted and fltlog.batted.close then fltlog.batted.close(wgt) end
+            fltlog.batted = nil                -- release the lazy-loaded module (GC)
+            if saved then
+                -- Save: reload the pick list through the existing deferred open;
+                -- the new pack sits at the end (stable file order, B11)
+                wgt.menu_view = nil
+                wgt.battpick_load_req = true
+            elseif not wgt.armed_now then
+                wgt.menu_view = "battpick"     -- Cancel -> battery query unchanged
+            else
+                wgt.menu_view = nil            -- armed: the whole window is closed
+            end
+            init_view_state(wgt).dirty = true
+        elseif wgt.fb_dirty then               -- page/dialog change inside the module
+            wgt.fb_dirty = nil
+            init_view_state(wgt).dirty = true
+        end
+        return
     elseif wgt.menu_view == "tb_rf2cfg" and tb_rf2cfg then
         tb_rf2cfg.refresh(wgt, event, touch_state)
         if wgt.rf2cfg_close_req then           -- module closed itself (slots restored):
@@ -6059,6 +7295,40 @@ local function refresh(wgt, event, touch_state)
             wgt.rf2cfg_dirty = nil
             init_view_state(wgt).dirty = true
         end
+    elseif wgt.menu_view == "tb_rfscfg" and rfscfg.mod then
+        -- An EXCLUSIVE cycle, and here that is not a nicety -- it is the only way the widget
+        -- survives. RFSuite is written for the standalone Lua state, where a long call is
+        -- YIELDED and resumed (interface.cpp:122); a widget call is KILLED at 20000
+        -- instructions (widgets.cpp:53). So a pumped RFSuite page routinely spends the whole
+        -- budget, and anything the host does AFTERWARDS in the same call runs on an exhausted
+        -- one and raises where no pcall of ours can reach it -- observed as
+        -- "Error in widget UltiDash widget function: CPU limit" in the simulator trace
+        -- (2026-08-18), i.e. EdgeTX's own error, not a contained one.
+        --
+        -- Cheap arm upkeep at 5 Hz FIRST, so the disarmed-only rule keeps working, then the
+        -- module, then return. Same shape as tb_fltlog / tb_batted above, for the same reason
+        -- stated differently: whoever owns the screen owns the call budget.
+        --
+        -- No shortcut.run: a bound switch must not stomp an open config page, and arming
+        -- still closes it through the module's own arm-close below.
+        local rnow = getTime() or 0
+        if (rnow - (wgt.lv_arm_gate or 0)) >= 20 then
+            wgt.lv_arm_gate = rnow
+            wgt.armed_now = ultidash_functions.is_armed(wgt)
+        end
+        rfscfg.mod.refresh(wgt, event, touch_state)
+        if wgt.rfs_close_req then              -- module closed itself (pump restored,
+            local target = wgt.rfs_close_req   -- MSP detached, modules cleared)
+            wgt.rfs_close_req = nil
+            rfscfg.mod = nil                   -- release the lazy-loaded module (GC)
+            wgt.menu_view = (target ~= "dashboard" and wgt.tool_back == "toolbox")
+                            and "toolbox" or nil
+            init_view_state(wgt).dirty = true
+        elseif wgt.rfs_dirty then              -- notice text changed / tool error
+            wgt.rfs_dirty = nil
+            init_view_state(wgt).dirty = true
+        end
+        return                                 -- exclusive cycle -- see the comment above
     end
     -- Toolbox menu: rebuild on the arm transition while it is open, so the
     -- disarmed-only tools flip between dimmed and normal (build-time tcol)
@@ -6088,8 +7358,7 @@ local function refresh(wgt, event, touch_state)
         -- drift apart and a relaxed guard can never open a DIFFERENT branch.
         local glyph_tap = wgt.ovl_active == nil and wgt.detail_view == nil
             and rect_hit(touch_state, menu_tap_rect(wgt), 10)
-            and not (ultidash_functions.is_armed(wgt)
-                and wgt.values.rf_connection_state ~= "disconnected")
+            and shortcut.menu_allowed(wgt)   -- M2 shares this exact condition
         -- The four detail zones open a page only when there IS one to open. With
         -- ultidashDetail.lua missing (the soft failure detail_load logs) the taps still set
         -- detail_view: the next tap was then eaten closing a page nobody could see, the menu
@@ -6108,17 +7377,33 @@ local function refresh(wgt, event, touch_state)
         if (tap_count == nil or tap_count <= 1 or glyph_tap)
             and now >= (wgt.elrs_tap_block or 0) and wgt.menu_view == nil then
             if wgt.ovl_active ~= nil and wgt.detail_view == nil then
-                -- critical-alert overlay: ANY tap dismisses the current episode.
-                -- Only while it is actually visible (flight/stats view — an open detail
-                -- page replaces that tree, so its taps must not be swallowed here).
-                -- Long cooldown so the bounce can't click through onto the tap zone
-                -- underneath; no rebuild needed (reactive visible).
-                wgt.elrs_tap_block = now + 100
-                wgt.ovl_dismissed = wgt.ovl_active
-                wgt.ovl_active = nil
+                -- Alert/notice overlay: THE X IN THE CORNER AND NOTHING ELSE closes it
+                -- (0.8.0, the user's decision — the same change the detail pages got, for
+                -- the same reason: "any tap closes" is invisible and turns every mis-tap
+                -- into a close, which on a message meant to be READ throws it away before
+                -- it has been). Only while it is actually visible (flight/stats view — an
+                -- open detail page replaces that tree, so its taps must not be swallowed
+                -- here). No rebuild needed either way (reactive visible).
+                -- A tap that MISSES the X is still swallowed by this branch and does
+                -- nothing: the tap zones underneath must not be reachable through a box
+                -- that covers them. It gets the SHORT cooldown, because the pilot is
+                -- aiming at the X and a 1 s block would eat the second attempt; the
+                -- closing tap keeps the long one, so its bounce cannot click through onto
+                -- what the box was covering.
+                if rect_hit(touch_state, wgt.ovl_close_rect, 10) then
+                    wgt.elrs_tap_block = now + 100
+                    wgt.ovl_dismissed = wgt.ovl_active
+                    wgt.ovl_active = nil
+                else
+                    wgt.elrs_tap_block = now + 25
+                end
             elseif wgt.detail_view ~= nil then
                 -- Status log scroll: taps on the ▲/▼ buttons scroll the log (short cooldown)
-                -- and do NOT close; any other tap closes the detail (long cooldown).
+                -- and do NOT close. CLOSING IS THE X IN THE CORNER AND NOTHING ELSE since
+                -- 0.8.0 (long cooldown): "any tap closes" was invisible, turned every
+                -- mis-tap into a close, and was the reason a detail page could never carry
+                -- tap zones of its own. RTN and a bound switch are unaffected, and a tap
+                -- that hits nothing now does nothing.
                 if wgt.detail_view == "estatus" and rect_hit(touch_state, wgt.estatus_scroll_up, 6) then
                     wgt.elrs_tap_block = now + 25
                     wgt.estatus_scroll = math.max(0, (wgt.estatus_scroll or 0) - 1)
@@ -6127,7 +7412,7 @@ local function refresh(wgt, event, touch_state)
                     wgt.elrs_tap_block = now + 25
                     wgt.estatus_scroll = (wgt.estatus_scroll or 0) + 1
                     init_view_state(wgt).dirty = true
-                else
+                elseif rect_hit(touch_state, wgt.close_rect, 10) then
                     wgt.elrs_tap_block = now + 100
                     wgt.detail_view = nil
                     init_view_state(wgt).dirty = true
@@ -6152,12 +7437,17 @@ local function refresh(wgt, event, touch_state)
                 end
                 init_view_state(wgt).dirty = true
             elseif init_view_state(wgt).current == "stats" then
-                -- manual dismiss of the statistics page: any tap (outside the menu
-                -- glyph) returns to the flight view; it reappears with the next
-                -- arm/disarm or reconnect cycle (flags cleared there)
-                wgt.elrs_tap_block = now + 100
-                wgt.stats_dismissed = true
-                init_view_state(wgt).dirty = true
+                -- manual dismiss of the statistics page: the X in the top bar, and only
+                -- it. It used to be ANY tap outside the menu glyph -- with nothing on the
+                -- page saying so, which is the whole point of this change; the page also
+                -- vanished on any fumbled touch while reading it. It still reappears with
+                -- the next arm/disarm or reconnect cycle (flags cleared there).
+                if rect_hit(touch_state, wgt.close_rect, 10) then
+                    wgt.elrs_tap_block = now + 100
+                    wgt.stats_dismissed = true
+                    wgt.stats_tap_open = nil   -- C3: a tap-opened page closes the same way
+                    init_view_state(wgt).dirty = true
+                end
             elseif rect_hit(touch_state, wgt.battprofile_rect, 6)
                 and not ultidash_functions.is_armed(wgt)
                 and wgt.rf and wgt.rf.msp_allowed then
@@ -6181,6 +7471,16 @@ local function refresh(wgt, event, touch_state)
                 wgt.elrs_tap_block = now + 100
                 wgt.detail_view = "estatus"
                 wgt.estatus_scroll = 0
+                init_view_state(wgt).dirty = true
+            elseif rect_hit(touch_state, wgt.statspage_rect, 6)
+                and not ultidash_functions.is_armed(wgt) then
+                -- C3: a tap on the status panel (outside its status line, checked above)
+                -- opens the STATISTICS page — under StatsViewMode "Never" too, that mode
+                -- governs only the automatic route. Disarmed only: while armed the view
+                -- stays flight by construction, and a deferred open that popped the page
+                -- at disarm, minutes after the tap, would read as a haunting.
+                wgt.elrs_tap_block = now + 100
+                wgt.stats_tap_open = true
                 init_view_state(wgt).dirty = true
             elseif tap_details and rect_hit(touch_state, wgt.battery_rect, 6) then
                 wgt.elrs_tap_block = now + 100
@@ -6206,6 +7506,11 @@ local function refresh(wgt, event, touch_state)
         fltlog.open_battpick(wgt)
         return
     end
+    if wgt.batted_req then                     -- battpick "+ New": own cycle (B11)
+        wgt.batted_req = nil
+        fltlog.open_batted(wgt)
+        return
+    end
     if wgt.flt_prof_req ~= nil and (getTime() or 0) >= (wgt.flt_prof_at or 0) then
         wgt.flt_prof_at = (getTime() or 0) + 20   -- retry cadence (~5 Hz)
         fltlog.write_profile(wgt)
@@ -6225,7 +7530,7 @@ local function refresh(wgt, event, touch_state)
             wgt.senscheck_next = snow + 100   -- 1 s (centiseconds)
             local first = (wgt.senscheck == nil)
             -- scan lives in the lazy menu module (loaded anyway while the page is open)
-            local m = menu_load()
+            local m = menu_load(wgt)
             if m then m.update_sensorcheck(wgt) end
             if first and wgt.senscheck ~= nil then
                 init_view_state(wgt).dirty = true   -- swap the note for the real rows
@@ -6285,7 +7590,11 @@ local function refresh(wgt, event, touch_state)
         -- write wgt caches), but the reads delay the tool's own page traffic. State
         -- changes still arrive via the onStateChanged callback; a parked
         -- read_pending fires on the first pass after the tool closes.
-        if wgt.menu_view ~= "tb_rf2cfg" then
+        -- tb_rfscfg skips it for a HARDER reason than tb_rf2cfg. There the
+        -- shared queue only got delayed; here RFSuite drives its own MSP stack and
+        -- the adapter has stopped the rf2 pump outright, so a read queued now would
+        -- sit unprocessed until the page closes.
+        if wgt.menu_view ~= "tb_rf2cfg" and wgt.menu_view ~= "tb_rfscfg" then
             rf_service.background(wgt, handle_telemetry_state_change)
         end
         -- FULL pass even while the detail/menu pages are up: all dashboard
@@ -6303,11 +7612,13 @@ local function refresh(wgt, event, touch_state)
         -- LVGL work in the same budget); its rf2.mspQueue ownership is covered by the
         -- rf_service gate above (disarmed-only, so no alerts/callouts are lost).
         -- Arm detection below still runs.
-        if wgt.menu_view ~= "tb_logview" and wgt.menu_view ~= "tb_rf2cfg" then
+        if wgt.menu_view ~= "tb_logview" and wgt.menu_view ~= "tb_rf2cfg"
+            and wgt.menu_view ~= "tb_rfscfg" then
             ultidash_functions.refresh(wgt)
             update_user_sensors(wgt)
             ultidash_functions.publish_shared(wgt)
             ultidash_functions.refresh_volume_override(wgt)   -- adaptive master volume via GVAR (off unless configured)
+            ultidash_functions.update_elrs_notice(wgt)        -- ELRS<->FC link config verdict -> notice
             ultidash_functions.update_alert_overlay(wgt)      -- critical-alert overlay episode state
         end
         wgt.dbg_pass_cs = (getTime() or 0) - pass_t0
@@ -6338,6 +7649,26 @@ local function refresh(wgt, event, touch_state)
                 wgt.battpick_load_req = true   -- registry load runs in its own cycle
             end
         end
+        -- "Open page on arming", executed: ONE attempt, and every refusal is final. A
+        -- page that appears seconds after the arm -- over whatever the pilot opened in
+        -- the meantime -- is worse than one that never appeared, so there is no retry
+        -- loop here. The gates are the tap route's own, not relaxed: full screen only (a
+        -- widget zone gets no touch, so the page could not be closed), the module loaded,
+        -- nothing else on screen, the flight view settled, and still armed -- a pilot who
+        -- disarmed inside the delay gets nothing.
+        if wgt.arm_open_at ~= nil and tnow >= wgt.arm_open_at then
+            wgt.arm_open_at = nil
+            local sc_tgt = shortcut.detail_choice(wgt.options.ArmOpen)
+            if sc_tgt ~= nil and wgt.armed_now and wgt.detail_ok and fs
+                and wgt.menu_view == nil and wgt.detail_view == nil
+                and init_view_state(wgt).current == "flight" then
+                wgt.detail_view = sc_tgt.id
+                -- as the tap and shortcut routes do: a page opened part-scrolled from the
+                -- last visit reads as a bug
+                if sc_tgt.id == "estatus" then wgt.estatus_scroll = 0 end
+                init_view_state(wgt).dirty = true
+            end
+        end
         if wgt.armed_now and wgt.values.rf_connection_state ~= "disconnected" then
             -- menu/settings/status close on arm (no configuring in flight; pending edits
             -- autosaved) — EXCEPT the Toolbox tool pages, which are meant for in-flight
@@ -6356,8 +7687,17 @@ local function refresh(wgt, event, touch_state)
             -- fl_close_req) — it is not in the tb list because this branch is
             -- UNREACHABLE for it anyway: its exclusive refresh branch returns
             -- every cycle before the 5 Hz pass gets here.
+            -- tb_livemon belongs in this list since M5: the tool has NO disarmed gate on
+            -- purpose (shortcut.targets -- reading it in flight is its point) and it runs
+            -- BESIDE the 5 Hz pass rather than exclusively (its design law), so without the
+            -- exemption this state-based close shut it on every armed pass and the page
+            -- could not be open in flight at all -- the exact opposite of its decision.
+            -- tb_rfscfg for the rf2cfg reason and one more: its own arm-close is the
+            -- only path that detaches RFSuite's MSP client and clears its module
+            -- graph, so dropping menu_view from here would strand both.
             local tb = (wgt.menu_view == "tb_adjmap" or wgt.menu_view == "tb_adjed"
-                or wgt.menu_view == "tb_logview" or wgt.menu_view == "tb_rf2cfg")
+                or wgt.menu_view == "tb_logview" or wgt.menu_view == "tb_rf2cfg"
+                or wgt.menu_view == "tb_livemon" or wgt.menu_view == "tb_rfscfg")
             if wgt.menu_view ~= nil and not tb then
                 save_pending_settings(wgt)
                 wgt.menu_view = nil
@@ -6379,7 +7719,8 @@ local function refresh(wgt, event, touch_state)
         wgt.rf_data_dirty = false
         -- not for tb_rf2cfg: the RF2 view shows no wgt.values, and a host
         -- rebuild would force the original framework to re-read its page
-        if wgt.menu_view ~= nil and wgt.menu_view ~= "tb_rf2cfg" then
+        if wgt.menu_view ~= nil and wgt.menu_view ~= "tb_rf2cfg"
+            and wgt.menu_view ~= "tb_rfscfg" then
             init_view_state(wgt).dirty = true
         end
     end

@@ -17,8 +17,11 @@ Merge these folders into the **root of your radio's SD card**:
 ```
 WIDGETS/UltiDash/      →  <SD>/WIDGETS/UltiDash/
 SOUNDS/en/ultidash/    →  <SD>/SOUNDS/en/ultidash/
-SOUNDS/de/ultidash/    →  <SD>/SOUNDS/de/ultidash/
 ```
+
+The **German voice pack is a separate download** (`UltiDash-v<version>-voice-de.zip` →
+`<SD>/SOUNDS/de/ultidash/`). You need it only if you later set *Voice language* to
+**Deutsch**; the default is English and the files above cover it.
 
 ## 2. Rotorflight: send the sensors UltiDash needs
 
@@ -98,17 +101,30 @@ On the model's **EdgeTX Telemetry** page, with the **FC powered and connected**,
 **Discover new sensors**. The `Vbat`, `Curr`, … names from step 2 and the ELRS link
 sensors should appear.
 
+> ⚠️ **Nothing new appeared? Then discovery was not running.** EdgeTX creates a sensor only
+> while *Discover new sensors* is **on** *and* the model's list still has room — the cap is
+> **60 sensors** on these radios, and when it is reached the radio switches discovery **off by
+> itself without saying so** (the *telemetry full* warning exists on the monochrome radios
+> only). A Rotorflight craft plus the ELRS link sensors plus the receiver's own defaults sits
+> close to that cap, so **adding a few rows on the flight controller and discovering again
+> often finds nothing at all** — no entry, no error. The remedy is to **delete every sensor on
+> the Telemetry page, switch *Discover new sensors* back on and let the whole list rebuild in
+> one go**. See **[REFERENCE.md §6.2](REFERENCE.md)** for what such a rebuild costs.
+
 > **Recommended (not required):** delete the **empty duplicate sensors** that the ELRS
 > receiver creates without values — typically `RxBt`, `Curr`, `Capa`, `Bat%` (they show
 > `—` on the Telemetry page). Then turn **Discover new sensors off** so they aren't
 > recreated. UltiDash resolves its sensors by Rotorflight **sensor ID** and no longer gets
 > shadowed by these, so this is a tidy-up rather than a fix — but it keeps the sensor list
-> clean and matters for any raw sensor you later pick **by name**.
+> clean and matters for any raw sensor you later pick **by name**. **Keep in mind what that
+> switch then does:** with discovery off, a sensor the craft only starts sending later never
+> appears at all — turn it back on for that, then off again.
 
 ## 5. Add the UltiDash widget
 
 Place the **UltiDash** widget in a (full-screen) widget zone on a model screen — one
-instance per model. The widget has no EdgeTX options to set.
+instance per model. Its settings dialog carries one option, **Craft target** — leave it at
+*Rotorflight*.
 
 ## 6. Configure and verify
 

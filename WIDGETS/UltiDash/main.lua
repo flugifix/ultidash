@@ -63,9 +63,9 @@ local app_name = "UltiDash"
 -- The TARGET release of the branch being worked on, set once when that branch opens -- not
 -- per WIP commit, and not left at the last release either: since menu -> Status shows this,
 -- leaving it behind would make every development build claim to be the previous version.
--- Shown as "0.7.1" plus the card's short commit on a dev build; see version_text() in
+-- Shown as "0.8.0" plus the card's short commit on a dev build; see version_text() in
 -- ultidash.lua.
-local app_ver = "0.7.1"
+local app_ver = "0.8.0"
 local widg_dir = "/WIDGETS/UltiDash/"
 
 local ultidash = nil

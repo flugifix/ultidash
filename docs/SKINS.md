@@ -30,8 +30,8 @@ like any other and is the best-documented example to read alongside this guide.
   All of that — the engine — stays in the host and keeps running whatever the skin draws.
 - A skin lays out the **flight** and **stats** views. The detail pages, the settings menu,
   the Toolbox, the status bar and the **safety overlays** (setup hint, warning banners, the
-  critical-alert overlay) are the host's and are stacked on top of any skin — a skin can
-  never suppress them. The top-left **menu glyph** always works, even from a skin that
+  critical-alert overlay and the config warning overlay that shares its box) are the host's
+  and are stacked on top of any skin — a skin can never suppress them. The top-left **menu glyph** always works, even from a skin that
   draws no top bar.
 - A skin does **not** change fonts arbitrarily or hardcode sizes: the two radios differ
   (TX16S 800×480, TX15 480×320), so fonts are **measured** via the API.
@@ -74,6 +74,9 @@ M.schemes = {             -- scheme descriptors (§6); omit -> the standard thre
 M.scheme_key = "MySkinScheme"   -- cfg key remembering THIS skin's scheme pick (unique);
                                 -- omit -> auto ("Scheme_<id>")
 M.def_scheme = 1                -- the scheme a fresh model starts in
+M.units_key = "MySkinUnits"     -- cfg key for THIS skin's "units beside values" (§7d);
+                                -- omit -> the skin follows the host's own ShowUnits
+M.def_units = 0                 -- 0 = off, the readable default on a 480 px radio
 M.items = {                     -- own settings rows (§7); omit -> none
     { key = "MyBig", lbl = "Big value", kind = "bool", def = 1 },
 }
@@ -98,6 +101,20 @@ return M
 - `build_flight` / `build_stats` build the view for `zone` (`zone.w`, `zone.h`) and **return
   `main_panel, content_top_y`** — the root panel plus the y where your content starts, so
   the host can place its overlays. Return `nil` to fall back to the built-in look.
+- **A builder may return a THIRD value: a continuation for a two-cycle build** (host
+  0.8.0+; older hosts simply ignore it). The host calls it in the **next** refresh cycle,
+  where it gets a full instruction budget of its own — EdgeTX's ~20k limit is per call, so
+  a heavy layout that splits its build in half comes nowhere near it in either. Rules the
+  continuation lives by: it must be **self-contained** — build into a top-level box of your
+  own (`lvgl.box({ x = 0, y = 0, w = zone.w, h = zone.h }):build(elems)`), nothing hands it
+  a parent; resolve every **decision** (geometry, source picks, tap zones) in stage 1 and
+  move only **work**, so the two halves cannot disagree; and don't put anything in stage 2
+  that stage 1's picture cannot stand without for one frame — the host shows stage 1 alone
+  for a single cycle, which at 20 Hz is the same invisibility every staged rebuild already
+  relies on. A newer build (skin switch, settings apply, fullscreen exit) drops a pending
+  continuation unrun; a continuation that raises is caught, logged, and leaves stage 1
+  standing. The three heaviest bundled layouts (Cockpit, Dash1, Grid) use this — their
+  sources are worked examples.
 - A broken load, a wrong `api`, a missing build function, or an error in `init` → the host
   falls back to the default skin (never a crash, never a blank screen) — **and says so**:
   the rejection is logged with its reason (console always, `logs/debug_NN.log` when
@@ -154,6 +171,10 @@ return M
 - `env.card_gap` — the standard inter-panel gap (px).
 - `env.theme` — a live palette snapshot (§5). Read fields at build time.
 - `env.set_tap(wgt, zone, rect)` — register a detail-page tap zone (§8).
+- `env.close_button(panel, wgt, page_w)` — draw the page-close **X** in the top-right
+  corner of a full-screen page and register its tap rect; returns the width it takes, so
+  your header can stay clear of it (§8a). **Only relevant to a skin that overrides a
+  detail page** (`M.build_detail_*`).
 - `env.card(container, x, y, w, h, children)` / `env.stacked_field(children, x, y, w,
   pad, label, value, font, h)` — the low-level card + stacked label/value primitives the
   host panels use, for free-form skins that want the same look.
@@ -251,6 +272,7 @@ A scheme in a skin's `schemes` list:
 | `dark` | `true` = dark scheme (forces the panel fill, picks the neon traffic-light set, renders the native menu pages neutral for readability). |
 | `pal` | the **8 base palette slots** (see the table below). Required. |
 | `follows_theme` | (rare) follow the live EdgeTX theme instead of a fixed palette — only the default skin's *EdgeTX theme* uses this. |
+| `icon` | **optional.** Glyph for the scheme's own *Settings ▸ Colors* page — the tile that leads there, the page header and the sibling strip. The name is the file stem without the `ud_` prefix and the artwork must be on the card as `/WIDGETS/UltiDash/img/ud_<icon>.png`. **Omit it and the scheme takes `layers`**, the glyph of the *Skin* group, which is why no skin has to ship artwork before it may offer a scheme. Only tagged schemes get a page, so the key is meaningless without a `tag`. |
 
 Everything else (traffic-light, chrome, battery fills, the Toolbox palette) is **derived**
 from `pal` + `dark`, so a minimal scheme is just a name, a tag and eight colours. The eight
@@ -444,12 +466,33 @@ for the migration's sake: the table you mutated *is* the settings cache, so the 
 value is what every build gets from `wgt.options` from that moment on, and it reaches the file
 the next time something is saved on that model. On a radio that already has a config, that may
 not be until the user next changes a setting — and it does not matter, because the conversion
-is redone, identically, on every load until then.
+is redone, identically, on every load until then. If the converted value happens to equal the
+row's `def`, it is not written at all but dropped from the file like any other default (§12):
+the same outcome by the same argument, since the next load re-runs the migration on whatever
+is left and the key resolves to that default regardless.
 
 **Keep the tolerant read as well, if you have one.** A migration only runs for skins the host
 managed to load, on a host new enough to have the hook. Decoding an old value at *read* time
 (`type(v) == "number" and LEGACY[v] or v`) stays the contract for what you draw; `M.migrate`
 fixes the stored **form**, which is what the settings menu matches against your `ids`.
+
+### 7d. Units beside values (`M.units_key`, 0.8.0)
+
+Whether a unit suffix is worth what it costs in font size is a **layout** decision, not a
+global one: the value that reads well beside a big MK3 panel is unreadable in a 480 px card.
+So the switch works exactly like the colour scheme — declare `M.units_key` (a unique cfg key)
+and `M.def_units` (`0` off / `1` on), and the host synthesises a *Units beside values* row in
+the **Skin** group, right under *Color scheme*. Everything the host renders from your sensor
+slots (`env.sensor_slot(...).unit`) then follows **your** key.
+
+**Omitting it is a supported choice, not an oversight:** a skin that declares no key keeps
+following the host's own *Display ▸ Units on detail pages*, which is what every skin written
+before 0.8.0 does — nothing has to change and no stored setting moves. The built-in UltiDash
+skin claims the historical host key (`ShowUnits`) as its own, so under it the two rows are
+one switch, as they were before the split.
+
+`.unit_raw` is unaffected either way: it is the unit **regardless** of the option, for a skin
+that puts the unit in a caption row where it costs no value font size.
 
 ## 8. Tap zones
 
@@ -465,6 +508,26 @@ are; unregistered zones simply don't offer that tap.
 | `"elrs"` | the ELRS link detail |
 | `"battprofile"` | the FC battery-profile picker (**disarmed only** — the host gates it) |
 | `"menu"` | the **settings menu** — for a skin that draws its own header/menu button. Unregistered, the host keeps a fixed top-left region tappable as the fallback. |
+
+### 8a. The page-close control (0.8.0)
+
+Until 0.7.1 a tap **anywhere** closed a detail page and the stats page. It no longer does:
+both now close through a visible **X** in the corner, and a tap that hits nothing does
+nothing. Two consequences for a skin:
+
+- **The stats page.** The control is drawn by the host **top bar**, so a skin that calls
+  `env.top_bar` in `build_stats` gets it for free and needs to do nothing at all. A skin
+  that draws its own header there gets the host's **fallback**, placed in the page's
+  top-right corner after your build — visible and working, but placed without knowing your
+  layout. Draw your header around it, or leave the host bar in.
+- **An overridden detail page** (`M.build_detail_elrs` and friends): call
+  `env.close_button(panel, wgt, zone.w)` in your builder and keep your header text out of
+  the width it returns. If you don't, the host places its own in the corner — again
+  working, again not knowing what is underneath.
+
+The host can never be left without one: whatever a skin does, the page keeps a touch route
+out. That is the same rule the safety overlays follow — a skin may place a host affordance,
+never remove it.
 
 **One rect per zone, and the last writer wins.** `set_tap` stores a single rectangle per
 zone name, and the host clears all zones before every rebuild — so "last" means the last
@@ -640,13 +703,24 @@ separate file per skin**. Four kinds of key come from a skin:
 | the skin's options | its `M.items` keys | `GridBig=1`, `GridHspdMax=2500` |
 | per-scheme colour overrides | `Clr<tag><role>` | `ClrGS1=0xFFAA00` |
 
+**Declaring a key is not the same as writing one.** The file only ever carries the keys whose
+value differs from the row's `def` — a skin the user left entirely on your defaults
+contributes nothing to it at all, and an option the user set and then set back disappears
+again on the next save. Read it as a record of the user's deviations from your design, not as
+an inventory of what you declared; the value your build sees comes from `wgt.options`, which
+is filled from the defaults first and is complete either way.
+
 Two consequences worth knowing:
 
 - **All skins share the one file, and inactive skins are preserved.** At startup the host
-  loads every discovered skin once and registers its keys, so saving never drops the keys
-  of a skin you're not currently using — switch skins back and forth and each skin keeps
-  its own scheme pick, options and colour tweaks. (This is also why keys must be unique —
-  §7.)
+  loads every discovered skin once and registers its keys, so a save made while another
+  skin is active keeps every value that differs from its default, whichever skin declared
+  it — switch skins back and forth and each skin still has its own scheme pick, options and
+  colour tweaks. What it does *not* do is keep the **line**: a key sitting at its default is
+  dropped like any other (see the note under the table), and comes back as that same default
+  the next time the skin is loaded. Nothing a user chose is lost either way, but do not read
+  a skin's absence from the file as its settings having been thrown away. (This is also why
+  keys must be unique — §7.)
 - **Config is per model, not per skin.** The same skin flown on two models has an
   independent copy of its settings on each. Colour overrides only exist for schemes with
   a `tag`; a **fixed** scheme (no tag, §6) writes nothing — its colours are the skin

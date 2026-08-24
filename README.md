@@ -2,7 +2,7 @@
 
 **A full-screen LVGL dashboard widget for EdgeTX / Rotorflight helicopters.**
 
-`Status: v0.7.1 — in development, experimental`
+`Status: v0.8.0 — in development, experimental`
 
 > 🚀 **New to UltiDash?** See it first in the **[Illustrated Walkthrough](docs/WALKTHROUGH.md)**,
 > then get it running with the **[Quick Start guide](docs/QUICKSTART.md)** — the shortest path
@@ -17,8 +17,10 @@ fullscreen menu), and tapping a panel opens a detailed view of it.
 
 ![UltiDash in action](images/ultidash_showcase.gif)
 
-*Flight view, the tap-to-open detail pages (telemetry, battery, ELRS, status), the
-battery-profile picker, the stats page and the settings menu.*
+*Flight view, the tap-to-open detail pages (battery, telemetry, ELRS, status & events), the
+menu and settings, the Toolbox with its Log Viewer and Flight Log — and the same dashboard
+in the dark colour scheme. Every frame is a real screen: a 700-class helicopter on 12S, one
+moment of one real flight.*
 
 ### The dashboard at a glance
 
@@ -55,9 +57,10 @@ At a glance — full detail in the **[Features](#features)** list below.
 - **ESC load monitor** *(opt.)* — utilization bar + overload alarm.
 
 **Config & tools**
-- **In-widget settings menu** — saved per EdgeTX model; no EdgeTX option list.
+- **In-widget settings menu** — saved per EdgeTX model; the EdgeTX option list holds only
+  the declared craft target.
 - **Configurable value slots** — any sensor + selectable current source.
-- **Toolbox** *(opt.)* — **RF2 Config** (full FC setup on the radio — bind to a shortcut) · Log Viewer (`/LOGS` graphs) · RF Adjustment · Flight Log · FC battery profile.
+- **Toolbox** *(opt.)* — **RF2 Config** (full FC setup on the radio — bind to a shortcut) · **RFSuite (exp.)** (the newer Rotorflight suite, if you have it installed — highly experimental) · Log Viewer (`/LOGS` graphs) · RF Adjustment · Flight Log · FC battery profile.
 - **Flight log & battery management** *(opt.)* — per-flight CSV + per-pack cycle counting.
 - **Sensor check** — flags any missing/renamed telemetry sensor.
 - **No external libraries.**
@@ -108,7 +111,8 @@ here, I will of course respect that.
   active Rotorflight battery profile (shown with their capacities) right from the
   dashboard, via the RFTool MSP API and without rebooting the FC. *(This is the only place
   UltiDash writes to the FC — disarmed only; everything else is read/announce-only.)*
-- **In-widget settings menu** — no EdgeTX option list to fight: open the full-screen menu
+- **In-widget settings menu** — nothing to fight in the EdgeTX option list (it holds one
+  entry, the craft target): open the full-screen menu
   and edit everything with real toggle switches, dropdowns and +/− steppers, grouped into
   named pages. Settings are **saved per EdgeTX model** on the SD card — shared by every
   Rotorflight craft flown on that model (see below).
@@ -123,7 +127,10 @@ here, I will of course respect that.
   selectable). Every alert has its own page:
   on/off, **repeat** (count/interval), **escalation volume**, vibration — the critical
   ones also an optional **fullscreen overlay** (red warning box over the dashboard,
-  tap or auto-close to dismiss) — with a master
+  closed with the X in its corner, or by auto-close). The same box doubles as a **config warning**: when the
+  ELRS module's link rate and telemetry ratio do not match what the flight controller was
+  told, it says so on the dashboard, in both sides' numbers, with the values to set —
+  disarmed only. With a master
   mute, a separate **vibration master**, English/German voice packs and two volume worlds
   (fixed callout volume and an optional **master-volume control via GVAR**, boosted while a
   critical alert repeats — needs a small one-time model setup, see the reference §5.4).
@@ -148,6 +155,12 @@ here, I will of course respect that.
   - **RF2 Config** — the original Rotorflight configuration tool (rotorflight-lua-scripts)
     opened straight from the dashboard, run unmodified from `/SCRIPTS/RF2/` (needs the RF
     Tool widget; disarmed only).
+  - **RFSuite (exp.)** *(0.8.0, optional, highly experimental)* — the newer Rotorflight suite
+    (rotorflight-lua-edgetx-suite) opened the same way, run unmodified from
+    `/SCRIPTS/TOOLS/rfsuite-core/`. A **separate, optional install that does not replace
+    RF Tool**; without it the tile explains what is missing. Pages can stutter and one may
+    go blank — a widget gets a hard instruction budget per call that a Tools script does
+    not — and RTN always gets you out (disarmed only; see docs/TOOLBOX.md §8).
   - **Flight Log** — browse the flight log on the radio: recent flights, per-model
     totals and battery usage (see the flight-log feature below).
   - **Battery profile** — the same FC battery-profile picker the dashboard's *B-Profile*
@@ -157,9 +170,10 @@ here, I will of course respect that.
   (date, time, FC model name, tracked flight time) to an import-friendly
   `fltlog/flights.csv`, with a configurable **minimum flight time** so spool-up tests
   never count; optionally UltiDash asks **which battery you plugged in** after
-  each connect (packs defined per model in a PC-edited `fltlog/batteries.cfg`, with a
-  free-form id that external tools can match — start from the commented template
-  `fltlog/batteries.example.cfg`), counts cycles + last use per pack, and
+  each connect (packs defined per model in `fltlog/batteries.cfg`, editable **on the
+  radio** — Flight Log ▸ Batteries, or "+ New battery" right on the query page — or on
+  the PC, with a free-form id that external tools can match — start from the commented
+  template `fltlog/batteries.example.cfg`), counts cycles + last use per pack, and
   can activate the pack's FC battery profile on selection (see
   [docs/REFERENCE.md](docs/REFERENCE.md) §12).
 - **Sensor check** *(diagnostic)* — a read-only menu page that lists the sensors UltiDash
@@ -175,16 +189,22 @@ here, I will of course respect that.
 - **Rotorflight 2.3** (required) with the **RFTool** widget installed (provides
   connection/arm state and MSP data). MSP is only read on connect/disarm — never during
   armed flight.
+  *(0.8.0, experimental:* UltiDash can take the same data from **RFSuite for EdgeTX**
+  instead, when that suite publishes its MSP service and RFTool is not installed. It is
+  untested against a flight controller; with both suites loaded UltiDash keeps to RFTool,
+  since the radio has one CRSF transmit slot to share. **menu ▸ Status ▸ MSP provider**
+  names the one in force.*)
 - An **ELRS** RF link: the link bars and the link/RSSI warnings read ELRS telemetry
   sensors (`RFMD`, `RQly`, `TQly`, `1RSS`, `2RSS`, `RSNR`, `TPWR`, `ANT`).
 - Telemetry sensors (fixed names): `Vbat`, `Vcel`, `Cel#`, `Curr`, `Capa`, `Bat%`,
   `Vbec`, `Tesc`, `Tmcu`, `Hspd`, `Gov`, `ARM`, `ARMD`, `PID#`, `RTE#`, `BAT#`, `Thr`,
   `Esc#` + `EscF` (ESC status), the ELRS sensors above, and `*Skp` (skipped-packet counter
   — the label really starts with `*`).
-- Sounds in `/SOUNDS/en/ultidash/` and `/SOUNDS/de/ultidash/` (all included, in their own
-  subfolders so they don't clash with the EdgeTX voice pack; pick the language in
-  *Alerts ▸ Voice / mute*). Spoken numbers/units (`percent`, `volts`, digits) still come
-  from your EdgeTX voice pack.
+- Sounds in `/SOUNDS/en/ultidash/` and `/SOUNDS/de/ultidash/` (own subfolders so they don't
+  clash with the EdgeTX voice pack; pick the language in *Alerts ▸ Voice / mute*).
+  **English is in the main download; German is a separate addon zip** — *Voice language*
+  defaults to English, so you only need the addon if you switch it. Spoken numbers/units
+  (`percent`, `volts`, digits) still come from your EdgeTX voice pack.
 - Optional model image in `/images/`: a single file named after the **Rotorflight model
   name** is enough — e.g. `MyHeli.png` or `MyHeli.jpg`. (Advanced/optional: a
   `<model>-<cells>S` variant is preferred when present; otherwise the plain name, then the
@@ -192,18 +212,32 @@ here, I will of course respect that.
 
 ## Installation
 
-Copy the folders from this repo to the **root of your radio's SD card**, merging with
-what's already there:
+Copy the folders to the **root of your radio's SD card**, merging with what's already there:
 
 ```
-WIDGETS/UltiDash/      →  <SD>/WIDGETS/UltiDash/
-SOUNDS/en/ultidash/    →  <SD>/SOUNDS/en/ultidash/
+WIDGETS/UltiDash/            →  <SD>/WIDGETS/UltiDash/
+SOUNDS/en/ultidash/          →  <SD>/SOUNDS/en/ultidash/
+SCRIPTS/TOOLS/udlogview.lua  →  <SD>/SCRIPTS/TOOLS/udlogview.lua
+```
+
+That is the whole dashboard — the main release zip, or this repo, whichever you took. The
+third line is the small launcher that puts the **Log Viewer** in EdgeTX's own *SYS ▸ Apps*
+menu; it has to sit there because that menu reads only its own directory. Leave it out and
+everything else still works — you simply reach the Log Viewer through the widget's Toolbox
+instead.
+**Only if you want the German callouts** (*Alerts ▸ Voice / mute ▸ Voice language =
+Deutsch*), add the separate **`UltiDash-v<version>-voice-de.zip`** on top:
+
+```
 SOUNDS/de/ultidash/    →  <SD>/SOUNDS/de/ultidash/
 ```
 
+Choosing Deutsch without those files does not fail visibly — EdgeTX ignores a WAV that is
+not there, so UltiDash simply stops speaking.
+
 Then add the **UltiDash** widget to a (full-screen) widget zone on a model screen —
-**one instance per model**. The widget has no EdgeTX options; everything is configured
-inside the widget (see below).
+**one instance per model**. The widget's settings dialog asks for one thing, the **craft
+target** (*Rotorflight*); everything else is configured inside the widget (see below).
 
 > ⚠️ **Upgrading from a version with `ViewMode`:** the second-screen *ELRS details* /
 > *Status info* views were removed. A second instance that used one of them becomes a
@@ -218,18 +252,27 @@ inside the widget (see below).
 > still tidy (and matters for a raw sensor you pick **by name**). Details in
 > **[docs/REFERENCE.md §6.1](docs/REFERENCE.md)**.
 
+> ⚠️ **A sensor that never appears at all is a different problem.** EdgeTX caps a model at
+> **60 sensors** and then turns *Discover new sensors* off by itself, without a message on a
+> colour radio — so adding rows on the flight controller and discovering again can find nothing.
+> Clear the Telemetry page and let the whole list rebuild:
+> **[docs/REFERENCE.md §6.2](docs/REFERENCE.md)**.
+
 ## Configuration
 
-There are **no EdgeTX widget options** — all configuration lives in an **in-widget
+The EdgeTX widget-settings dialog carries a single option, **Craft target** (*Rotorflight*
+today — see `docs/REFERENCE.md` §2.1). Everything else lives in an **in-widget
 settings menu**:
 
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **menu symbol** (the ☰ glyph, top-left, next to the clock) — *disarmed only*.
-3. The menu offers **Settings** (a submenu of the configuration groups), **Status**,
-   **Sensor check** and **Toolbox**. The menu and the Settings submenu are laid out as
-   button grids; each group opens its own page.
+3. The menu offers **Settings** (a submenu of the configuration groups) and **Toolbox**,
+   then, under a *Diagnostics* heading, the three read-out pages **Status**, **ELRS
+   Status** and **Sensor check**. Menu and submenu are grids of **icon tiles**; each group
+   opens its own page, and every page carries its tile's glyph in the header.
 
-The **Settings** submenu — a 3-column grid in four themed sections:
+The **Settings** submenu — all 13 groups on one screen, a 3-column grid in four themed
+sections:
 
 | Section | Group | Covers |
 |---------|-------|--------|
@@ -248,7 +291,10 @@ The **Settings** submenu — a 3-column grid in four themed sections:
 | | **General** | the **debug log** (off by default) + how many log sessions to keep, and the **flight log / battery query / FC-profile-on-pick** switches |
 
 Each group page also has a **Reset … to defaults** button that resets only that page; the
-*Reset to defaults* button below the settings grid resets the whole model.
+whole-model *Reset to defaults* is the last row of the **General** group. Pages that belong
+to a set — the group pages, the alert pages, the *Colors* / *Telemetry* / *Voice* /
+*Shortcuts* pages — page with the **‹ ›** header arrows or through the icon strip at the top
+of the page, which is the route the rotary encoder can take.
 
 > 🧪 **The skin system is in development.** The dashboard layout is pluggable: the engine,
 > the skin API, the discovery (`skins/*.lua`) and the *Skin* settings group are part of this

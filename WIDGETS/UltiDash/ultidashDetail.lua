@@ -50,7 +50,7 @@ local DARK_LUMA_THRESHOLD
 -- catalogue and palette upvalues, and a second copy of either would be a second
 -- source of truth for what a sensor reads.
 -- ---------------------------------------------------------------------------
-local select_font, measure_font, color_luma, memo_text
+local select_font, measure_font, color_luma, memo_text, close_button
 local sensor_short_label, sensor_unit, sensor_value_text, sensor_value_text_raw
 local sensor_minmax_text, sensor_test_text, is_off_sensor, esc_load_color
 local ultidash_functions
@@ -62,6 +62,7 @@ function M.init(env)
     measure_font          = env.measure_font
     color_luma            = env.color_luma
     memo_text             = env.memo_text
+    close_button          = env.close_button
     sensor_short_label    = env.sensor_short_label
     sensor_unit           = env.sensor_unit
     sensor_value_text     = env.sensor_value_text
@@ -143,13 +144,14 @@ local function build_elrs_view(wgt, zone)
     local val_w            = lcd.sizeText("-108dBm", row_font) + 8
     local foot_tw, foot_th = lcd.sizeText("Ag", row_font)
 
-    -- "tap to close" hint: MEASURED (rule 8). A fixed 100x18 box at a fixed x clipped the
-    -- text on the 800x480 MK3, where SMLSIZE is both taller and wider. The same measured
-    -- footprint also drives how much room the rate label may take.
-    local tc_w, tc_h = lcd.sizeText("tap to close", SMLSIZE)
-    local tc_res = tc_w + 20
-
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG, filled = force_bg_fill or (o.BGFilled == 1) })
+
+    -- The close control comes FIRST because what is left beside it is the rate label's
+    -- width. It replaces the grey "tap to close" word all four pages carried: a label is
+    -- not a control, and the thing that actually closed the page was the whole invisible
+    -- surface. Still no lvgl button — a focusable object would capture PAGE/RTN/TELE in
+    -- fullscreen, which is why these pages never had one.
+    local tc_res = close_button(panel, wgt, w)
 
     -- header: title + rate/mode, separated by a line
     panel:label({ x = 10, y = 4, text = "ELRS", font = title_font, color = COLOR_THEME_PRIMARY1 })
@@ -157,11 +159,6 @@ local function build_elrs_view(wgt, zone)
         w = w - title_w - 24 - tc_res, h = row_th + 2,
         text = function() return wgt.values.elrs_rate_desc or "-" end,
         font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
-    -- fullscreen-only page: closing is handled in refresh() (any tap) or by
-    -- leaving fullscreen (RTN) — no lvgl button needed (and none allowed: a
-    -- focusable button would capture PAGE/RTN/TELE in fullscreen)
-    panel:label({ x = w - tc_w - 10, y = 8, w = tc_w + 2, h = tc_h + 2,
-        text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
     local top = 4 + title_h + 4
     panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
 
@@ -253,7 +250,9 @@ local function build_elrs_view(wgt, zone)
                     end
                     if v <= crit() then return C_RED elseif v <= warn() then return C_YELL else return C_GREEN end
                 end,
-                pos = function() return bar_x, ry end,
+                -- no constant `pos` closure: x/y are build-time, only the width is reactive.
+                -- See the link bars in ultidash.lua -- measured on the simulator 2026-08-17,
+                -- a rectangle with static x/y and a reactive `size` keeps its build position.
                 size = function()
                     local v = get() or 0
                     if v < 0 then v = 0 elseif v > 100 then v = 100 end
@@ -276,33 +275,126 @@ local function build_elrs_view(wgt, zone)
         panel:label({ x = bar_x + bar_w + 6, y = ty, w = val_w, h = row_th + 2, text = r.val, font = row_font, color = COLOR_THEME_PRIMARY1, align = RIGHT })
     end
 
-    -- footer: link details (left, live) + diversity (right)
+    -- footer: session RQ-min (left, live) + the ANTENNA PAIR and the TX module's
+    -- antenna mode (right)
+    local _, sml_h = lcd.sizeText("Ag", SMLSIZE)
     panel:hline({ y = h - foot_h - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
-    panel:label({ x = 10, y = h - foot_h + 4, w = w - 130, h = foot_th + 2,
-        -- memoized on its two inputs (antenna + session RQ min): re-concat only on change
-        text = (function()
-            local last_ant, last_min, last_s, primed
-            return function()
-                local v = wgt.values
-                local ant, mn = v.elrs_ant, v.rqly_min
-                if primed and ant == last_ant and mn == last_min then return last_s end
-                local s = ""
-                if ant ~= nil then s = "Ant " .. (ant + 1) end
-                if mn ~= nil then s = s .. (s ~= "" and "    " or "") .. "RQ min " .. math.floor(mn) .. "%" end
-                last_ant, last_min, last_s, primed = ant, mn, s, true
-                return s
-            end
-        end)(),
+
+    -- TWO ANTENNAS, not a DIV pill. The chip 0.8.0 introduced said "a second antenna is
+    -- reporting" and nothing else, while the page already knew WHICH one carries the link
+    -- (the ANT sensor, spelled out as "Ant 1" in the footer's left half). One drawing now
+    -- says both, and the left half gives its words back to the mode text.
+    --   a filled ROD   = this antenna is there
+    --   green + WAVES  = it is the one currently carrying the link
+    --   a hollow rod   = there is no second antenna (the chip's own on/off language)
+    -- The first cut drew a 2 px mast with a dot on top and the user's verdict was that it is
+    -- not pretty -- it was a stick figure at the size the footer gives it. This one is a
+    -- ROUNDED ROD, the same vocabulary the bars above it are drawn in, with the radiating
+    -- waves as lvgl ARC sectors (the primitive the battery gauge's corners already use).
+    -- Sizes come from the footer BAND rather than from the small font, so the pair uses the
+    -- height the band actually has: SMLSIZE is 17 px on both 480-wide radios and 23 on the
+    -- MK3, and the band is bigger than either.
+    -- The proportions are the ICON's, worked backwards from the height available: the head
+    -- sits inside the inner wave, the outer wave decides the width, and the mast is a short
+    -- tail below them rather than a stalk running to the bottom of the band -- which is what
+    -- the first icon-shaped cut drew, and it looked like a lollipop on a stick.
+    local gh   = math.max(sml_h + 4, foot_h - 8)         -- the band, less its padding
+    local wav2 = math.max(9, math.floor(gh / 2.45))      -- outer wave radius
+    local wav1 = math.max(6, math.floor(wav2 * 0.6))     -- inner wave radius
+    local tail = math.max(3, math.floor(wav2 * 0.45))    -- the mast below the waves
+    local dotd = math.max(5, math.floor(wav1 * 0.85))    -- the head
+    local mstw = math.max(3, math.floor(dotd / 2))       -- the mast
+    local wavt = math.max(2, math.floor(gh / 16))        -- wave thickness
+    local ah   = 2 * wav2 + tail                         -- one antenna's full height
+    local aw   = 2 * wav2 + 2                            -- one antenna's full width
+    local agap = math.max(5, math.floor(gh / 5))
+    local ant_w = 2 * aw + agap
+    -- The mode box takes the WIDEST value the ELRS firmware offers for "Antenna Mode"
+    -- ("Gemini;Ant 1;Ant 2;Switch"), not whatever this module happens to answer -- so the
+    -- layout sweep sees the real worst case even though the text is reactive.
+    local mode_w = math.max(lcd.sizeText("Gemini", SMLSIZE), lcd.sizeText("Switch", SMLSIZE)) + 6
+    local ant_x  = w - ant_w - 10
+    local mode_x = ant_x - mode_w - 8
+    local gy     = h - foot_h + math.max(2, math.floor((foot_h - ah) / 2))
+
+    panel:label({ x = 10, y = h - foot_h + 4, w = mode_x - 16, h = foot_th + 2,
+        -- memoized on its one remaining input: re-concat only when the session minimum
+        -- moves (the active antenna moved into the drawing on its right)
+        text = memo_text(function() return wgt.values.rqly_min end,
+            function(m) return (m ~= nil) and ("RQ min " .. math.floor(m) .. "%") or "" end),
         font = row_font, color = COLOR_THEME_PRIMARY1, align = LEFT })
-    -- MEASURED, not 20 (rule 8): SMLSIZE is 17 px on both 480-wide radios and 23 on the
-    -- MK3, so the old hardcoded box fitted everywhere except the radio it was eyeballed
-    -- on. Centred in the footer band rather than pinned, so it stays level with the link
-    -- details beside it whatever the two fonts measure.
-    local _, div_h = lcd.sizeText("Ag", SMLSIZE)
-    panel:label({ x = w - 124, y = h - foot_h + math.max(2, math.floor((foot_h - div_h) / 2)),
-        w = 114, h = div_h,
-        text = function() return wgt.values.elrs_diversity and "Diversity: yes" or "Diversity: no" end,
-        font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+
+    -- The TX MODULE's antenna mode, from the CRSF config scan (ultidashElrs) -- the other
+    -- side of the link from the antennas beside it, which are the receiver's. NOTHING is
+    -- drawn while it is unknown: a plain 2.4 GHz module never registers the field at all,
+    -- so a "-" there would be permanent and would read as a failed read.
+    panel:label({ x = mode_x, y = gy + math.max(0, math.floor((ah - sml_h) / 2)),
+        w = mode_w, h = sml_h + 2,
+        text = function() return wgt.values.elrs_cfg_ant or "" end,
+        font = SMLSIZE, color = COLOR_THEME_SECONDARY1, align = RIGHT })
+
+    -- reactive, like everything else on this page: diversity is only known once a second
+    -- antenna has actually reported, which can happen after the page was built
+    local function present(i)
+        if i == 1 then return true end
+        return wgt.values.elrs_diversity == true
+    end
+    local function active(i)
+        local a = wgt.values.elrs_ant
+        return a ~= nil and (math.floor(a) + 1) == i
+    end
+    local ants = {}
+    for i = 1, 2 do
+        local cx  = ant_x + (i - 1) * (aw + agap) + math.floor(aw / 2)   -- the mast's centre
+        -- The HEAD's centre is one OUTER radius below the band's top edge, because the waves
+        -- are drawn around it -- measured on the simulator 2026-08-19, where a shallower
+        -- offset put the outer wave across the footer's separator line and into the TPWR row.
+        local cy  = gy + wav2
+        local col = function()
+            if active(i) then return SEM_GREEN end
+            return present(i) and COLOR_THEME_SECONDARY1 or COLOR_DIM
+        end
+        local lit = function() return active(i) end
+        local dx, dy = cx - math.floor(dotd / 2), cy - math.floor(dotd / 2)
+        local mast_y = cy + math.floor(dotd / 2)
+        -- head + mast, in `img/ud_antenna.png`'s shape: the same drawing the icon set uses
+        -- for an antenna, redrawn rather than placed, because the colour has to switch and a
+        -- PNG's does not. Filled where the antenna exists, a 1 px outline where it does not
+        -- -- the on/off language the DIV chip spoke.
+        local function body(vis, c)
+            ants[#ants + 1] = { type = "rectangle", x = dx, y = dy, w = dotd, h = dotd,
+                filled = true, rounded = math.floor(dotd / 2), color = c, visible = vis }
+            ants[#ants + 1] = { type = "rectangle", x = cx - math.floor(mstw / 2), y = mast_y,
+                w = mstw, h = gy + ah - mast_y, filled = true,
+                rounded = math.floor(mstw / 2), color = c, visible = vis }
+        end
+        if i == 1 then
+            body(nil, col)
+        else
+            body(function() return present(2) end, col)
+            ants[#ants + 1] = { type = "rectangle", x = dx, y = dy, w = dotd, h = dotd,
+                thickness = 1, rounded = math.floor(dotd / 2), color = COLOR_DIM,
+                visible = function() return not present(2) end }
+            ants[#ants + 1] = { type = "rectangle", x = cx - math.floor(mstw / 2), y = mast_y,
+                w = mstw, h = gy + ah - mast_y, thickness = 1,
+                rounded = math.floor(mstw / 2), color = COLOR_DIM,
+                visible = function() return not present(2) end }
+        end
+        -- the waves: two arc pairs around the head, LEFT and RIGHT, on the ACTIVE antenna
+        -- only -- the icon's own shape. 0 deg is 3 o'clock and angles run clockwise, so the
+        -- right pair is 315..405 (it wraps through 0, which lv_arc_set_angles does on its
+        -- own) and the left pair 135..225. The background ring is switched off
+        -- (bgOpacity = 0), as it is on the battery gauge's corner sectors.
+        for _, r in ipairs({ wav1, wav2 }) do
+            for _, a in ipairs({ { 315, 405 }, { 135, 225 } }) do
+                ants[#ants + 1] = { type = "arc", x = cx, y = cy, radius = r, thickness = wavt,
+                    startAngle = a[1], endAngle = a[2], rounded = false,
+                    bgStartAngle = 0, bgEndAngle = 0, bgOpacity = 0,
+                    color = SEM_GREEN, visible = lit }
+            end
+        end
+    end
+    panel:build(ants)
 end
 
 -- Add a filled triangle (up/down) to a build-table list from stacked 1px bars — the
@@ -334,19 +426,17 @@ local function build_estatus_view(wgt, zone)
     local title_w, title_h = lcd.sizeText("Status", title_font)
     local _, row_th = lcd.sizeText("Ag", row_font)
     local _, sml_h  = lcd.sizeText("Ag", SMLSIZE)
-    local tc_w, tc_h = lcd.sizeText("tap to close", SMLSIZE)   -- measured, see build_elrs_view
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
         filled = force_bg_fill or (wgt.options.BGFilled == 1) })
 
-    -- header: title + craft name + close hint
+    -- header: title + craft name + close control (see build_elrs_view)
+    local tc_res = close_button(panel, wgt, w)
     panel:label({ x = 10, y = 4, text = "Status", font = title_font, color = COLOR_THEME_PRIMARY1 })
     panel:label({ x = 10 + title_w + 14, y = 4 + math.floor((title_h - row_th) / 2),
-        w = w - title_w - 40 - tc_w, h = row_th + 2,
+        w = w - title_w - 24 - tc_res, h = row_th + 2,
         text = function() return wgt.values.craft_name_formatted() end,
         font = row_font, color = COLOR_THEME_SECONDARY1, align = LEFT })
-    panel:label({ x = w - tc_w - 10, y = 8, w = tc_w + 2, h = tc_h + 2,
-        text = "tap to close", font = SMLSIZE, color = C_DIM, align = RIGHT })
     local top = 8 + title_h + 4
 
     -- ---------- Header: arm card (left) + Governor/Throttle/ESC card (right) ----------
@@ -463,12 +553,20 @@ local function build_estatus_view(wgt, zone)
         -- open, and a build-time string said "1-8 / 12" over a list that had reached 20.
         -- The scroll offset is build-time by design (the arrows rebuild the page), so only
         -- the total moves here.
+        -- MEMOISED on the only thing that moves. `scroll` and `slots` are build-time
+        -- constants (the arrows rebuild the page), so the count alone keys the string --
+        -- and it changes at most on an ESC event, not per frame. This was the one
+        -- un-memoised formatter left in a file where every neighbour is memoised: a
+        -- string.format per LVGL frame for as long as the page stands open.
         panel:label({ x = sux - 96, y = log_lbl_y, w = 90, h = sml_h + 2, font = SMLSIZE, align = RIGHT, color = C_DIM,
-            text = function()
-                local lg = ultidash_functions.get_esc_log(wgt)
-                local n = lg and #lg or nlog
-                return string.format("%d-%d / %d", scroll + 1, math.min(scroll + slots, n), n)
-            end })
+            text = memo_text(
+                function()
+                    local lg = ultidash_functions.get_esc_log(wgt)
+                    return lg and #lg or nlog
+                end,
+                function(n)
+                    return string.format("%d-%d / %d", scroll + 1, math.min(scroll + slots, n), n)
+                end) })
     else
         -- Below one page, so no chrome -- and this decision IS build-time: a log that grows
         -- past the page while it is open gets its arrows on the next rebuild (a tap, a view
@@ -548,14 +646,12 @@ local function build_battery_view(wgt, zone)
     local row_font   = h >= 170 and MIDSIZE or 0
     local title_w, title_h = lcd.sizeText("Battery", title_font)
     local _, row_th = lcd.sizeText("Ag", row_font)
-    local tc_w, tc_h = lcd.sizeText("tap to close", SMLSIZE)   -- measured, see build_elrs_view
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
         filled = force_bg_fill or (wgt.options.BGFilled == 1) })
 
     panel:label({ x = 10, y = 4, text = "Battery", font = title_font, color = COLOR_THEME_PRIMARY1 })
-    panel:label({ x = w - tc_w - 10, y = 8, w = tc_w + 2, h = tc_h + 2,
-        text = "tap to close", font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+    close_button(panel, wgt, w)   -- see build_elrs_view
     local top = 4 + title_h + 4
     panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
 
@@ -596,7 +692,7 @@ local function build_battery_view(wgt, zone)
               if v <= th_low() then return C_YELL end
               return C_GREEN
           end,
-          pos = function() return rx + 1, by + 1 end,
+          -- constant `pos` dropped, same measured reasoning as the bars above
           size = function()
               local v = wgt.values.vcel
               if v == nil then return 0, bar_h - 2 end
@@ -766,7 +862,7 @@ local function build_battery_view(wgt, zone)
     -- coloured fill appears; the left/right end strips carry rounded corners matching
     -- the frame and the top/bottom strips overlap them by the radius (no notches).
     -- Always shown here while ESC load monitoring is on (the dashboard placement is a
-    -- setting, see SETTINGS_ESC).
+    -- setting, see the "ESC load" settings group).
 
     -- overlays INSIDE the graphic: cells (left), big percent (center), used/capacity (right)
     local pct_font = select_font(math.floor(bh * 0.50), 220, "100%")
@@ -836,13 +932,11 @@ local function build_telem_view(wgt, zone)
     local h = zone.h
     local title_font = h >= 170 and DBLSIZE or MIDSIZE
     local _, title_h = lcd.sizeText("Telemetry", title_font)
-    local tc_w, tc_h = lcd.sizeText("tap to close", SMLSIZE)   -- measured, see build_elrs_view
 
     local panel = lvgl.rectangle({ x = 0, y = 0, w = w, h = h, color = PANEL_BG,
         filled = force_bg_fill or (wgt.options.BGFilled == 1) })
     panel:label({ x = 10, y = 4, text = "Telemetry", font = title_font, color = COLOR_THEME_PRIMARY1 })
-    panel:label({ x = w - tc_w - 10, y = 8, w = tc_w + 2, h = tc_h + 2, text = "tap to close",
-        font = SMLSIZE, color = COLOR_THEME_DISABLED, align = RIGHT })
+    close_button(panel, wgt, w)   -- see build_elrs_view
     local top = 4 + title_h + 4
     panel:hline({ y = top - 1, w = w - 4, h = 1, color = COLOR_THEME_SECONDARY1 })
 

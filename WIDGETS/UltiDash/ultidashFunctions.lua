@@ -21,7 +21,20 @@
 
 local ultidash_functions = {}
 
-local esc = loadScript("/WIDGETS/UltiDash/ultidashEsc.lua")()
+-- Multi-vendor ESC status/fault decoder. LAZY-LOADED (same shape as dbg_load below): at
+-- module level its 76 instructions sat in create(), which main.lua enters with five module
+-- chunks already in it. The first caller is whichever of deferred_init / set_palette runs
+-- first -- their order is NOT proven, so both go through the accessor and neither may
+-- assume the other ran. NOT pcall'd, unlike dbg_load: a missing ultidashEsc.lua was fatal
+-- while this sat at module level and stays fatal -- every read of it is a LEVEL_* constant
+-- or the decoder itself, so degrading would only move the error somewhere less legible.
+-- 0.8.0 loads it on EVERY craft: its LEVEL_* constants feed the palette, which is not
+-- downstream of the craft target, so only the load SITE moved.
+local esc = nil
+local function get_esc()
+    if esc == nil then esc = loadScript("/WIDGETS/UltiDash/ultidashEsc.lua")() end
+    return esc
+end
 
 -- Optional file logger (the "Debug log" diagnostics setting). LAZY-LOADED: the
 -- ~11 kB module loads only when the DebugLog option first turns ON (default off
@@ -83,12 +96,7 @@ local sem_yell = BAR_COLOR_LOW
 
 -- ESC status severity colors (eStatus). WARN/ERROR are TEXT -> the semantic colours, refreshed
 -- per scheme in set_palette; the literals below are just the pre-set_palette fallback.
-local ESC_LEVEL_COLORS = {
-    [esc.LEVEL_TRACE] = COLOR_THEME_DISABLED,
-    [esc.LEVEL_INFO]  = COLOR_THEME_PRIMARY1,
-    [esc.LEVEL_WARN]  = BAR_COLOR_LOW,
-    [esc.LEVEL_ERROR] = BAR_COLOR_CRITICAL,
-}
+local ESC_LEVEL_COLORS = {}   -- filled by M.deferred_init (host stage 2a0); see the end of this file
 
 -- swap the theme color shadows (called from ultidash.lua update() with the palette + semantic
 -- colours it resolved). scheme (a SCHEMES descriptor since the registry refactor) is kept for
@@ -96,12 +104,15 @@ local ESC_LEVEL_COLORS = {
 function ultidash_functions.set_palette(scheme, p, sem)
     COLOR_THEME_PRIMARY1, COLOR_THEME_PRIMARY2, COLOR_THEME_SECONDARY1, COLOR_THEME_SECONDARY2 = p[1], p[2], p[3], p[4]
     COLOR_THEME_SECONDARY3, COLOR_THEME_FOCUS, COLOR_THEME_WARNING, COLOR_THEME_DISABLED = p[5], p[6], p[7], p[8]
-    ESC_LEVEL_COLORS[esc.LEVEL_TRACE] = COLOR_THEME_DISABLED
-    ESC_LEVEL_COLORS[esc.LEVEL_INFO]  = COLOR_THEME_PRIMARY1
+    -- through the accessor, NOT the bare upvalue: whether deferred_init has run by now is
+    -- not proven, and this is one of the two entry points that can be first
+    local e = get_esc()
+    ESC_LEVEL_COLORS[e.LEVEL_TRACE] = COLOR_THEME_DISABLED
+    ESC_LEVEL_COLORS[e.LEVEL_INFO]  = COLOR_THEME_PRIMARY1
     if sem then
         sem_red, sem_yell = sem.red, sem.yell
-        ESC_LEVEL_COLORS[esc.LEVEL_WARN]  = sem_yell   -- was fixed yellow (BAR_COLOR_LOW)
-        ESC_LEVEL_COLORS[esc.LEVEL_ERROR] = sem_red    -- was fixed red (BAR_COLOR_CRITICAL)
+        ESC_LEVEL_COLORS[e.LEVEL_WARN]  = sem_yell   -- was fixed yellow (BAR_COLOR_LOW)
+        ESC_LEVEL_COLORS[e.LEVEL_ERROR] = sem_red    -- was fixed red (BAR_COLOR_CRITICAL)
         -- battery-bar fills (per-scheme configurable since the Colors settings pages)
         BAR_COLOR_OK       = sem.bar_ok    or BAR_COLOR_OK
         BAR_COLOR_WARN     = sem.bar_warn  or BAR_COLOR_WARN
@@ -118,19 +129,28 @@ end
 -- legacy RUNAWAY/CRASH at bits 5/6). Keep in sync with ARM_DISABLE_FLAG_NAMES in
 -- ultidashValues.lua. Entries 26/27 (bits 25/26) are API-version dependent -> patched by
 -- get_arm_disable_descs().
-local ARM_DISABLE_DESCS = {
-    "NOGYRO", "FAILSAFE", "RXLOSS", "BADRX", "BOXFAILSAFE", "GOVERNOR", "RPM_SIGNAL",
-    "THROTTLE", "ANGLE", "BOOTGRACE", "NOPREARM", "LOAD", "CALIB", "CLI", "CMS",
-    "BST", "MSP", "PARALYZE", "GPS", "RESCUE_SW", "RPMFILTER", "REBOOT_REQD",
-    "DSHOT_BBANG", "NO_ACC_CAL", "MOTOR_PROTO", "ARMSWITCH",
-}
+local ARM_DISABLE_DESCS = {}   -- filled by M.deferred_init (host stage 2a0); see the end of this file
 
 -- Patch the version-dependent last entries on the cached table (cheap, no realloc),
 -- mirroring get_arming_disable_flag_names() in ultidashValues.lua. API >= 12.09: bit 25 =
 -- OVERRIDE, bit 26 = ARMSWITCH; earlier: bit 25 = ARMSWITCH, bit 26 unused (entry 27 nil
 -- so #ARM_DISABLE_DESCS drops back to 26 and the iterators skip it).
+-- The FC's MSP API version, from whichever suite serves MSP on this radio: RFTool's
+-- rf2.apiVersion (a number) or the RFSuite session's (a STRING, "12.09"). RFTool is read
+-- first, which is the same order ultidashRf picks a provider in, so a radio carrying both
+-- answers the same here as it does there. Duplicated in ultidashValues for the same rule --
+-- the two version branches below already mirror each other, and this is the third half.
+local function fc_api_version()
+    local v = rf2 and rf2.apiVersion
+    if type(v) == "number" then return v end
+    local s = _G.rfsuite and _G.rfsuite.session
+    if type(s) == "table" then return tonumber(s.apiVersion) end
+    return nil
+end
+
 local function get_arm_disable_descs()
-    if rf2 and rf2.apiVersion and rf2.apiVersion >= 12.09 then
+    local api = fc_api_version()
+    if api and api >= 12.09 then
         ARM_DISABLE_DESCS[26] = "OVERRIDE"
         ARM_DISABLE_DESCS[27] = "ARMSWITCH"
     else
@@ -206,7 +226,14 @@ local audio_volume = nil
 local Shared = {
     ready      = false,   -- true once an instance has published (Status page keys off it)
     ts         = nil,     -- getTime() of the last publish (dual-publisher detection)
-    owner      = nil,     -- the wgt table of the last publisher (dual-publisher detection)
+    -- The last publisher's ID, not its wgt. It used to be the table itself, and that made this
+    -- module-level field PIN a destroyed instance: on a model change the widget is torn down,
+    -- nothing publishes on the new model if it places no UltiDash, and the dead instance stayed
+    -- reachable with everything hanging off it. Measured 2026-08-18 on the simulator, with a
+    -- model change staged against a model that places no UltiDash. An id compares exactly as
+    -- well -- the field was only ever tested with `~=`, never dereferenced.
+    owner      = nil,     -- pub_id of the last publisher (dual-publisher detection)
+    next_id    = 0,       -- hands out pub_id; lives here so no new module-level local is needed
     model_name = nil,     -- FC craft name (cached by the publisher)
     connected  = false,
     bg_filled    = nil,   -- BGFilled as boolean (detail-page backgrounds)
@@ -235,17 +262,7 @@ local Shared = {
 -- Per-alert repeat summary (Status page). The option keys (code..Rep/Cnt/Int) are
 -- precomputed once here so publish_shared never concatenates them on its 5 Hz path.
 local REP_ALERTS = {}
-do
-    local defs = {
-        { "Fuel", "Fuel" }, { "Volt", "Volt" }, { "Cell", "Cell" }, { "Arm", "Arm" },
-        { "Telem", "Telem" }, { "Link", "Link" }, { "Rssi", "Rssi" }, { "Pwr", "Pwr" },
-        { "Bec", "Bec" }, { "Skp", "Skp" }, { "EscL", "EscL" }, { "Temp", "Temp" },
-    }
-    for i = 1, #defs do
-        REP_ALERTS[i] = { code = defs[i][1], name = defs[i][2],
-            rep = defs[i][1] .. "Rep", cnt = defs[i][1] .. "Cnt", int = defs[i][1] .. "Int" }
-    end
-end
+-- (the REP_ALERTS fill lives in M.deferred_init; the table itself stays local above)
 
 function ultidash_functions.get_shared()
     return Shared
@@ -274,15 +291,30 @@ function ultidash_functions.publish_shared(wgt)
     local t, a = Shared.thresholds, Shared.alerts
 
     -- Dual-publisher detection: two placed instances are BOTH publishers (both
-    -- write Shared) -> doubled callouts. If another instance published recently
-    -- (fresh ts, foreign owner), flag BOTH (each sees the other's publishes).
-    -- Display-only; behaviour is otherwise unchanged. Reads the OLD ts, so this
-    -- must run before Shared.ts is updated below.
+    -- write Shared) -> doubled callouts. Display-only; behaviour is otherwise
+    -- unchanged. Reads the OLD ts, so this must run before Shared.ts is updated below.
+    --
+    -- The test is "I WAS the owner and something displaced me", not "somebody else is the
+    -- owner". Only a LIVE second instance can displace a publisher; a destroyed one never
+    -- publishes again. The old test could not tell those apart, so the first publish after a
+    -- MODEL CHANGE -- fresh instance, foreign owner still in Shared, ts a second old -- raised
+    -- the banner on a model placing exactly one instance (measured 2026-08-18 on the
+    -- simulator, with a model change staged against a single-instance model). A fresh
+    -- instance has no
+    -- `was_owner`, so it now stays silent until it has actually been displaced once.
+    -- Cost: detection arrives one publish cycle later (~200 ms at the 5 Hz publish rate),
+    -- against a banner that is sticky for 5 s anyway.
     local now = getTime() or 0
-    if Shared.owner ~= nil and Shared.owner ~= wgt and (now - (Shared.ts or 0)) < 300 then
+    if wgt.pub_id == nil then
+        Shared.next_id = (Shared.next_id or 0) + 1
+        wgt.pub_id = Shared.next_id
+    end
+    if wgt.was_owner and Shared.owner ~= nil and Shared.owner ~= wgt.pub_id
+       and (now - (Shared.ts or 0)) < 300 then
         wgt.dual_publisher_until = now + 500   -- sticky ~5 s past the last foreign publish
     end
-    Shared.owner = wgt
+    Shared.owner = wgt.pub_id
+    wgt.was_owner = true
 
     Shared.ts         = getTime() or 0
     Shared.model_name = v.craft_name
@@ -363,8 +395,16 @@ function ultidash_functions.publish_shared(wgt)
     Shared.ready = true
 end
 
+-- Every utterance through the two players below bumps this. The spoken telemetry
+-- report (D3) compares it against the value it saw after its OWN last utterance --
+-- a difference means something else (an alert, a switch voice, a bank announce)
+-- spoke in between, and the report yields per its TsayPrio setting. The callout
+-- engine keeps precedence without knowing the report exists.
+local audio_seq = 0
+
 local function play_audio(file)
     if master_muted then return end
+    audio_seq = audio_seq + 1
     if audio_volume then
         playFile(audio_path() .. file .. ".wav", audio_volume)
     else
@@ -376,6 +416,7 @@ end
 -- master mute (previously a muted callout could still speak its bare number).
 local function play_number(value, unit, attr)
     if master_muted then return end
+    audio_seq = audio_seq + 1
     if audio_volume then
         playNumber(value, unit, attr or 0, audio_volume)
     else
@@ -444,10 +485,36 @@ end
 
 -- Toolbox bank announcement: speak the active EnCh position (1..6) via the EdgeTX voice
 -- pack (honors master mute + the widget volume). Used by the adjustment tool pages.
-function ultidash_functions.tb_announce_pos(pos)
-    if type(pos) ~= "number" then return end
-    play_audio("bank")        -- speaks "Bank" ...
-    play_number(pos, 0, 0)    -- ... then the position number -> "Bank 1" ... "Bank 6"
+--
+-- The tools call this EVERY refresh with the bank they currently read (nil = a dead gap
+-- between the FC's windows) plus the "page just opened" flag, and THIS function owns the
+-- whole debounce -- the pages keep no announce state of their own. Reason: an announcement
+-- queues TWO files and EdgeTX has no Lua API to flush the audio queue, so speaking on every
+-- changed position chained -- sweeping the Config channel across all six banks enqueued
+-- twelve clips that were still playing long after the knob had settled. Same failure and
+-- the same cure as update_switch_voices further down: hold while the bank is moving, then
+-- speak only the position that is still current when the window expires. The two constants
+-- are its own rather than shared with the switch voices: these calls come from a tool
+-- page's refresh, not from the 5 Hz pass, so the rates are not interchangeable.
+local TB_VOICE_HOLD = 30    -- cs a bank must hold before it is announced
+local TB_VOICE_GAP  = 150   -- cs minimum between two announcements (coalesces a sweep)
+local tb_voice = { last = nil, pend = nil, t = 0, at = nil }
+
+function ultidash_functions.tb_announce_pos(pos, arm)
+    -- page (re)opened: forget what was last spoken, so the current bank speaks once
+    if arm then tb_voice.last = nil end
+    if type(pos) ~= "number" then return end   -- dead gap: say nothing, keep the state
+    local now = getTime() or 0
+    if pos ~= tb_voice.pend then
+        tb_voice.pend = pos
+        tb_voice.t = now                       -- candidate change, start the hold timer
+    elseif pos ~= tb_voice.last and (now - tb_voice.t) >= TB_VOICE_HOLD
+        and (tb_voice.at == nil or now - tb_voice.at >= TB_VOICE_GAP) then
+        tb_voice.last = pos
+        tb_voice.at = now
+        play_audio("bank")        -- speaks "Bank" ...
+        play_number(pos, 0, 0)    -- ... then the position number -> "Bank 1" ... "Bank 6"
+    end
 end
 
 -- Per-alert haptic. Each alert passes its code; vibration fires only when that alert's
@@ -813,8 +880,10 @@ end
 -- Flight-time tracking: count only while ARMED *and* the rotor is spinning (both in
 -- combination). Sensors are read via read_src (fresh sensor read, cached only within the
 -- pass), independent of the refresh path / rf_connection_state / any wgt.values caching —
--- that indirection was unreliable (rfToolState is nil on this RFTool, so cached values
--- could be stale).
+-- that indirection was unreliable: the connection state is pushed by the RFTool when IT
+-- notices a change, so a cached value can lag the sensors by a pass or more. (Until
+-- 2026-08-15 this said "rfToolState is nil on this RFTool"; the widget no longer reads that
+-- field at all — see ultidashRf note_tool_api — but the reason above is unchanged.)
 local function should_track_flight_time(wgt)
     -- On a positively-dead link (RQly == 0 -> telemetry_alive false, set in
     -- maybe_reset_stats) EdgeTX serves the FROZEN last ARM/Hspd values until sensor
@@ -933,7 +1002,7 @@ local function clear_live_telemetry_values(wgt)
     wgt.tesc_pending = 0; wgt.tesc_level = 0; wgt.tesc_announced = 0
     wgt.tmcu_pending = 0; wgt.tmcu_level = 0; wgt.tmcu_announced = 0
     clear_repeat(wgt, "Temp")
-    esc.reset()
+    get_esc().reset()
 end
 
 -- Wipe the EdgeTX min/max sensors and the widget-side extrema. Done once per
@@ -1014,7 +1083,14 @@ function ultidash_functions.update_craft_name(wgt)
     -- than falling back to the EdgeTX model/profile name. Only fall back to the
     -- EdgeTX name if no FC name was ever seen. Each gsub runs ONLY when its raw input
     -- changes (it would otherwise allocate a string on every 5 Hz pass).
+    -- ...from whichever suite serves MSP: RFTool's rf2.modelName, else the RFSuite session's
+    -- (filled by that suite's own on-connect read, and nil again on disconnect exactly like
+    -- RFTool's -- which is what the cache above is for either way).
     local fc_name = rf2 and rf2.modelName
+    if fc_name == nil then
+        local s = _G.rfsuite and _G.rfsuite.session
+        if type(s) == "table" and type(s.modelName) == "string" then fc_name = s.modelName end
+    end
     if fc_name and fc_name ~= "" then
         if fc_name ~= wgt.craft_name_raw then
             wgt.craft_name_raw = fc_name
@@ -1209,25 +1285,7 @@ end
 -- confirms it for FLRC) -> the SNR row shows "-" instead of a yellow 0dB bar.
 -- Covers ELRS 3.x sequential (1-13, 2.4GHz) + 4.x 2.4GHz (21-41) + GemX (100+).
 -- 900MHz 4.x (0-16) collides with 3.x and is NOT disambiguated (rare on a heli).
-local RFMD_INFO = {
-    [1]={"25Hz",-123,"25Hz (LORA)"},   [2]={"50Hz",-115,"50Hz (LORA)"},   [3]={"100Hz",-117,"100Hz (LORA)"},
-    [4]={"100HzF",-112,"100Hz (LORA-full)"}, [5]={"150Hz",-112,"150Hz (LORA)"}, [6]={"200Hz",-112,"200Hz (LORA)"},
-    [7]={"250Hz",-108,"250Hz (LORA)"}, [8]={"333HzF",-105,"333Hz (LORA-full)"}, [9]={"500Hz",-105,"500Hz (LORA)"},
-    [10]={"D250",-104,"250Hz (FLRC-DVDA)",true}, [11]={"D500",-104,"500Hz (FLRC-DVDA)",true}, [12]={"F500",-104,"500Hz (FLRC)",true}, [13]={"F1000",-104,"1000Hz (FLRC)",true},
-    -- 3.x additive gaps confirmed against expresslrs.org/info/signal-health (2026-07):
-    -- D50/DK500/K1000Full previously fell through to "no link". Floors per that doc; note
-    -- the low-index floors are band-dependent (this block is treated 2.4GHz — see .md).
-    [14]={"D50",-112,"50Hz (DVDA LoRa)"}, [16]={"DK500",-101,"500Hz (DVDA FSK)",true}, [19]={"K1000F",-101,"1000Hz FSK-full",true},
-    [21]={"50Hz",-115,"50Hz (LORA)"},  [23]={"100HzF",-112,"100Hz (LORA-full)"}, [24]={"150Hz",-112,"150Hz (LORA)"},
-    [27]={"250Hz",-108,"250Hz (LORA)"}, [28]={"333HzF",-105,"333Hz (LORA-full)"}, [29]={"500Hz",-105,"500Hz (LORA)"},
-    [30]={"D250",-104,"250Hz (FLRC-DVDA)",true}, [31]={"D500",-104,"500Hz (FLRC-DVDA)",true}, [32]={"F500",-104,"500Hz (FLRC)",true}, [33]={"F1000",-103,"1000Hz (FLRC)",true},
-    -- 34-36 per signal-health 4.x table (2026-07): Kernel/DK modes are FSK+FEC (LR1121),
-    -- floors -103; the table lists NO K500 and ends at 36 — [37] kept as a defensive
-    -- alias so an unexpected 37 doesn't fall through to "no link".
-    [34]={"DK250",-103,"250Hz (DVDA FSK)",true}, [35]={"DK500",-103,"500Hz (DVDA FSK)",true}, [36]={"K1000",-103,"1000Hz (FSK)",true}, [37]={"K1000",-103,"1000Hz (FSK)",true},
-    [40]={"AP500",-105,"500Hz (Airport)"}, [41]={"APF1000",-103,"1000Hz FLRC (Airport)",true},
-    [100]={"GX100",-112,"100Hz 8CH (GemX)"}, [101]={"GX150",-112,"150Hz (GemX)"}, [102]={"GX333",-105,"333Hz 8CH (GemX)"}, [103]={"GX500",-105,"500Hz (GemX)"},
-}
+local RFMD_INFO = {}   -- filled by M.deferred_init (host stage 2a0); see the end of this file
 local ELRS_MAX_RSSI = -40   -- top of the usable RSSI window (like elrs_rf)
 
 -- Convert an RSSI (dBm, negative) to a 0..100 "headroom" % between the per-rate
@@ -1635,6 +1693,22 @@ local function pack_reading_is_carried_over(wgt)
     return prev ~= nil and math.abs(v - prev) < 0.005
 end
 
+-- The verdict below is spoken from `vcel`, not from `vbat` — and with no per-cell value it
+-- takes the ONE branch that warns silently: amber bar, no callout. That is the right answer
+-- for a pack which never reports and the wrong one for a pack whose CELL COUNT has merely
+-- not arrived yet. The count comes from the FC's battery config over MSP, so anything else
+-- occupying that queue at plug-in pushes it past this window — which is what the FC-served
+-- adjustment table did (ultidashRf adj_may_start now holds the walk back; this is the other
+-- half, and the one that does not care WHAT delayed the reply).
+--
+-- So a missing per-cell value defers exactly like a carried-over vbat, under the same
+-- BATT_CHECK_MAX_CS ceiling: a pack that genuinely never reports still reaches the warning,
+-- late, and nothing here can silence a callout that is owed.
+local function cell_reading_missing(wgt)
+    local c = wgt.values.vcel
+    return c == nil or c <= 0
+end
+
 -- Startup cell-check (after ePowerbar): show a grey progress bar while the
 -- battery settles, then warn (colour + audio) if the pack is not fully charged.
 function ultidash_functions.update_battery_gauge(wgt)
@@ -1681,20 +1755,32 @@ function ultidash_functions.update_battery_gauge(wgt)
         -- announce path below deliberately does without: a deferral cannot silence a real
         -- callout, only make it wait for a value that exists. Bounded by BATT_CHECK_MAX_CS,
         -- so a pack that never reports still reaches the "no value -> warn" verdict.
-        local deferring = now >= (wgt.batt_check_until or 0)
-            and now < (wgt.batt_check_expiry or 0)
-            and pack_reading_is_carried_over(wgt)
-        if deferring then
+        -- Same short-circuit as before — the two cheap time compares first, the reading
+        -- tests only inside the window, so the steady-state cost per pass is unchanged.
+        -- nil | "carried" | "nocell" — a CODE, not a message: this runs at 5 Hz and the
+        -- text is built only inside the once-per-check log branch below.
+        local waiting
+        if now >= (wgt.batt_check_until or 0) and now < (wgt.batt_check_expiry or 0) then
+            if pack_reading_is_carried_over(wgt) then waiting = "carried"
+            elseif cell_reading_missing(wgt) then waiting = "nocell" end
+        end
+        if waiting then
             wgt.batt_check_until = now + startup_delay
             wgt.values.batt_check_progress = 0
             -- once per check, not once per pass: the next hardware log should show that the
             -- deferral engaged and for how long, without burying the rest of the session
             if dbg and dbg.is_enabled() and not wgt.batt_check_deferred then
                 wgt.batt_check_deferred = true
-                dbg.logf("CELLCHK", "deferred: vbat raw %s still the previous session's %s"
-                    .. " — waiting up to %ss for the connected pack to report",
-                    tostring(wgt.vbat_raw), tostring(wgt.vbat_last_session),
-                    tostring(BATT_CHECK_MAX_CS / 100))
+                if waiting == "carried" then
+                    dbg.logf("CELLCHK", "deferred: vbat raw %s still the previous session's %s"
+                        .. " — waiting up to %ss for the connected pack to report",
+                        tostring(wgt.vbat_raw), tostring(wgt.vbat_last_session),
+                        tostring(BATT_CHECK_MAX_CS / 100))
+                else
+                    dbg.logf("CELLCHK", "deferred: no per-cell value yet (cells=%s) — the FC"
+                        .. " battery config has not landed; waiting up to %ss",
+                        tostring(wgt.values.cel_count), tostring(BATT_CHECK_MAX_CS / 100))
+                end
             end
         elseif now >= (wgt.batt_check_until or 0) then
             wgt.values.batt_checking = false
@@ -1859,12 +1945,178 @@ function ultidash_functions.swpos_active(sw)
     return ok and v == true
 end
 
-local SWITCH_VOICES = {
-    { key = "MotorSrc",   on = "motor_on",  off = "motor_off" },
-    { key = "RescueSrc",  on = "rescue_on", off = "rescue_off" },
-    { key = "GovSrc",     on = "gov_on",    off = "gov_off" },
-    { key = "ProfileSrc", profile = true },
-}
+-- ============================================================================
+-- M5: LIVE TELEMETRY MONITOR -- the host-side data path
+-- ============================================================================
+-- The ring buffer lives HERE, not in the lazy toolbox/livemon.lua module, because
+-- sampling has to run while the page is closed -- opening it after a manoeuvre must
+-- show the manoeuvre. The renderer only reads wgt.lm.
+--
+-- Shape (spec L7/L8): sampled every refresh()/background() pass, folded into 5 Hz
+-- min/max BUCKETS -- a plain 5 Hz sample can miss a one-frame spike, a min/max pair
+-- cannot see less than the pass rate does. The ring always holds 60 s; the page's
+-- window (15/30/60 s) is a view of it. Allocated only while >= 1 sensor is
+-- configured (boot-resident heap drags the whole UI through GC, Gotcha 7), flat
+-- preallocated arrays, no per-tick allocation.
+--
+-- The ring is addressed by an ABSOLUTE bucket counter (lm.head) plus a per-slot
+-- stamp array: bucket i is valid only while bstamp[i] carries the absolute number
+-- last written there. That makes a suspension gap (the widget stopped -- a Tools
+-- script ran, the radio sat in a menu) FREE to handle: head jumps by the missed
+-- count and the skipped buckets simply fail the stamp check, instead of a catch-up
+-- loop writing hundreds of empties inside one call's budget.
+local LM_BUCKETS   = 300   -- 60 s x 5 Hz
+local LM_BUCKET_CS = 20    -- bucket width in centiseconds
+local LM_KEYS = { "LmV1", "LmV2", "LmV3", "LmV4" }
+
+function ultidash_functions.lm_sample(wgt)
+    local o = wgt.options
+    if o == nil then return end
+    local lm = wgt.lm
+
+    -- (re)configure on any slot change: compare the four stored names, no string
+    -- building -- this is the whole cost of the feature while it is off
+    local cfg = wgt.lm_cfg
+    local changed = (cfg == nil)
+    if not changed then
+        for i = 1, 4 do
+            if o[LM_KEYS[i]] ~= cfg[i] then changed = true break end
+        end
+    end
+    if changed then
+        cfg = {}
+        wgt.lm_cfg = cfg
+        local names, keys, srcidx = {}, {}, {}
+        for i = 1, 4 do
+            local name = o[LM_KEYS[i]]
+            cfg[i] = name
+            -- "~off" is ultidash.lua's SENSOR_OFF sentinel (the sensor rows' default).
+            -- Missing it here configured FOUR ghost slots on every fresh install: the
+            -- ring allocated, the chunk allocator rode the early cycles and four failing
+            -- name reads rode every one -- found by the budget diff (refresh max
+            -- 13.1k -> 16.2k FAIL), not by anything misbehaving visibly.
+            if type(name) == "string" and name ~= "" and name ~= "~off" then
+                names[#names + 1] = name
+                keys[#keys + 1] = LM_KEYS[i]
+                -- a raw pick's display name does not round-trip through the label
+                -- lookup (the PanelV lesson); its verified source INDEX is in the
+                -- <slot>Raw shadow key -- verify once here, read by index below
+                local idx = o[LM_KEYS[i] .. "Raw"]
+                if type(idx) == "number" and idx ~= 0 then
+                    local okn, n = pcall(getSourceName, idx)
+                    srcidx[#names] = (okn and n == name) and idx or false
+                else
+                    srcidx[#names] = false
+                end
+            end
+        end
+        if #names == 0 then
+            wgt.lm = nil                       -- feature off: no resident state at all
+            return
+        end
+        local now = getTime() or 0
+        lm = { n = #names, names = names, keys = keys, srcidx = srcidx,
+               -- Curated names resolved to a getValue INDEX, filled below and refreshed
+               -- whenever the app-id resolver's generation moves. `false` (not nil) is
+               -- the "never resolved" sentinel: wgt.sensor_sig is itself nil until the
+               -- first scan, and nil ~= nil would never fire.
+               validx = {}, res_sig = false,
+               head = 0, deadline = now + LM_BUCKET_CS,
+               bstamp = {}, bmin = {}, bmax = {}, rmin = {}, rmax = {},
+               arm_bucket = nil, prev_armed = false,
+               -- the PAGE's point tables live here too (they survive a page
+               -- close, so reopening costs nothing), but they are ALLOCATED by
+               -- the page module, chunked across ITS cycles: the worst case is
+               -- 2400 tables = ~14k instructions, and chunking that through
+               -- lm_sample put ~1.5k on top of the dashboard's heaviest cycles
+               -- -- measured straight into a 16.3k FAIL. The open tool page's
+               -- cycles carry no dashboard work, so the allocation is free
+               -- there. Sampling itself never touches pts.
+               pts = {}, alloc_k = 1, alloc_i = 1, pts_done = false }
+        for i = 1, LM_BUCKETS do lm.bstamp[i] = -1 end
+        for k = 1, lm.n do
+            local mn, mx = {}, {}
+            for i = 1, LM_BUCKETS do mn[i] = 0 mx[i] = 0 end
+            lm.bmin[k], lm.bmax[k] = mn, mx
+            lm.pts[k] = {}
+        end
+        wgt.lm = lm
+    end
+    if lm == nil then return end
+
+    -- Resolve the curated names to a READ INDEX, once per resolver generation. This runs
+    -- every pass (~20 Hz, not 5 Hz -- a peak between two heavy passes is what the ring is
+    -- for), so read_src's per-CENTISECOND cache always missed at >= 5 cs frame spacing and
+    -- every slot paid its full read: for a name the app-id resolver knows, read_src's own
+    -- getValue plus two cache-table writes; for a name it does not, getSourceValue(name),
+    -- the C-side source-table SCAN. Resolving here keeps the scan for genuinely unmapped
+    -- names only (ELRS sensors and anything outside wgt.sensor_idx) and makes the rest a
+    -- bare getValue.
+    -- TWO INDEX SPACES, deliberately kept in two arrays: srcidx comes from the <slot>Raw
+    -- shadow and is a getSourceName/getSourceValue index; wgt.sensor_idx lives in the
+    -- getFieldInfo/getValue space (ultidash.lua, resolve_sensor_indices) and is read with
+    -- getValue. Folding them into one array would read a different sensor.
+    if lm.res_sig ~= wgt.sensor_sig then
+        lm.res_sig = wgt.sensor_sig
+        local map = wgt.sensor_idx
+        for k = 1, lm.n do
+            lm.validx[k] = (map ~= nil and map[lm.names[k]]) or false
+        end
+    end
+
+    -- fold this pass's readings into the running pair (nil reading = no sample)
+    for k = 1, lm.n do
+        local idx = lm.srcidx[k]
+        local v
+        if idx then v = getSourceValue(idx)
+        else
+            local vi = lm.validx[k]
+            if vi then v = getValue(vi)
+            else v = read_src(wgt, lm.names[k]) end
+        end
+        if type(v) == "number" then
+            local mn = lm.rmin[k]
+            if mn == nil or v < mn then lm.rmin[k] = v end
+            local mx = lm.rmax[k]
+            if mx == nil or v > mx then lm.rmax[k] = v end
+        end
+    end
+
+    -- the arm edge, for the page's marker (L9: nothing is cleared across disarm --
+    -- a 60 s ring empties itself, the marker just names where the edge sits).
+    -- Read from the HOST's cached flag, not is_craft_armed: "ARM" carries no app-id, so
+    -- that call is always the C-side name-scan path, and this function runs every pass
+    -- (~20 Hz) while any slot is configured. The cache is refreshed by both heavy passes
+    -- at 5 Hz (ultidash.lua refresh/background), which cannot lose an edge here -- the
+    -- marker records a BUCKET, and a bucket is 20 cs wide.
+    local armed = wgt.armed_now
+    if armed and not lm.prev_armed then lm.arm_bucket = lm.head end
+    lm.prev_armed = armed
+
+    -- bucket tick: close the running pair into the ring. A gap longer than one
+    -- bucket advances head PAST the missed buckets (their stamps stay stale).
+    local now = getTime() or 0
+    if now >= lm.deadline then
+        local missed = math.floor((now - lm.deadline) / LM_BUCKET_CS)
+        if missed > 0 then lm.head = lm.head + missed end
+        local slot = lm.head % LM_BUCKETS + 1
+        for k = 1, lm.n do
+            local mn = lm.rmin[k]
+            if mn ~= nil then
+                lm.bmin[k][slot], lm.bmax[k][slot] = mn, lm.rmax[k]
+            else
+                lm.bmin[k][slot], lm.bmax[k][slot] = 1, 0    -- mn > mx = empty
+            end
+            lm.rmin[k], lm.rmax[k] = nil, nil
+        end
+        lm.bstamp[slot] = lm.head
+        lm.head = lm.head + 1
+        lm.deadline = lm.deadline + (missed + 1) * LM_BUCKET_CS
+    end
+end
+
+
+local SWITCH_VOICES = {}   -- filled by M.deferred_init (host stage 2a0); see the end of this file
 
 -- Minimum gap between two announcements of the SAME switch (centiseconds). EdgeTX has
 -- no Lua API to flush the audio queue, so rapid flipping used to QUEUE one announcement
@@ -1925,18 +2177,8 @@ end
 -- The baseline is (re)synced silently whenever the feature is off or the craft is
 -- disarmed, so enabling it or arming never fires on the state that was already there.
 local GOV_VOICE_DEBOUNCE = 30   -- centiseconds a state must hold before it's announced
-local GOV_VOICE_FILES = {
-    [0] = "gs_thoff",   [1] = "gs_idle",    [2] = "gs_spool",
-    [3] = "gs_recov",   [4] = "gs_active",  [5] = "gs_hold",
-    [6] = "gs_fallbk",  [7] = "gs_autorot", [8] = "gs_bailout",
-    [9] = "gs_bypass",
-}
-local GOV_VOICE_KEYS = {
-    [0] = "GvsOff",   [1] = "GvsIdle",    [2] = "GvsSpool",
-    [3] = "GvsRecov", [4] = "GvsActive",  [5] = "GvsHold",
-    [6] = "GvsFallbk",[7] = "GvsAutorot", [8] = "GvsBailout",
-    [9] = "GvsBypass",
-}
+local GOV_VOICE_FILES = {}   -- filled by M.deferred_init (host stage 2a0); see the end of this file
+local GOV_VOICE_KEYS = {}   -- filled by M.deferred_init (host stage 2a0); see the end of this file
 
 function ultidash_functions.update_gov_voice(wgt)
     local o = wgt.options
@@ -1965,6 +2207,158 @@ function ultidash_functions.update_gov_voice(wgt)
     end
 end
 
+-- ============================================================================
+-- SPOKEN TELEMETRY REPORT (D3)
+-- ============================================================================
+-- The pilot's own readout: up to eight configured sensors (Settings > Alerts >
+-- Telemetry report), spoken in the CONFIGURED ORDER, triggered by a shortcut
+-- switch (target "Voice: Telemetry report"). A held position slot repeats at
+-- TsayInt; a momentary press is one report. It MAY speak while armed -- the
+-- user's decision -- and the callout engine keeps precedence: foreign audio
+-- (audio_seq) either aborts the report or pauses it (TsayPrio), never the other
+-- way round. Default is value-and-unit through EdgeTX's own voice (playNumber
+-- speaks the unit); per-sensor NAME wavs are an opt-in (TsayNames) whose missing
+-- file falls back to value-and-unit -- never to silence, so an incomplete
+-- recording set cannot make the report go quiet.
+--
+-- The DATA half (value, UNIT const, decimals, wav key per sensor name) is a
+-- resolver closure the host installs via telemsay_init -- SENSOR_INFO and
+-- SENSOR_VALUE_FIELD are host locals, and this module owns only the audio half.
+local TSAY_N = 8
+local TSAY_ITEM_GAP  = 200   -- cs between two item utterances (~8 items = the 15-20 s design)
+local TSAY_PAUSE_CS  = 250   -- cs the report stands back after foreign audio (pause mode)
+
+local tsay_resolver = nil
+function ultidash_functions.telemsay_init(fn) tsay_resolver = fn end
+
+-- name-wav existence, one fstat per (language, key) per session -- wavs do not
+-- appear mid-flight, and an SD change comes with a reboot
+local tsay_wav_cache = {}
+local function tsay_wav_exists(wav)
+    local key = audio_lang .. "/" .. wav
+    local hit = tsay_wav_cache[key]
+    if hit == nil then
+        local ok, st = pcall(fstat, "/SOUNDS/" .. audio_lang .. "/ultidash/s_" .. wav .. ".wav")
+        hit = (ok and st ~= nil) or false
+        tsay_wav_cache[key] = hit
+    end
+    return hit
+end
+
+-- Status-page helper (M4): how many of the CONFIGURED slots have a name wav in the
+-- active language. The row exists because the fallback speaks value-and-unit, so an
+-- incomplete recording set cannot be HEARD -- this is where it becomes checkable.
+function ultidash_functions.tsay_wav_state(wgt)
+    local o = wgt.options
+    if o == nil or o.TsayNames ~= 1 then return nil end
+    local total, found = 0, 0
+    for i = 1, TSAY_N do
+        local name = o["TsayV" .. i]
+        if not (name == nil or name == "~off" or name == "") then
+            total = total + 1
+            local wav
+            if name == "~volt" then
+                wav = "volt"
+            elseif tsay_resolver ~= nil then
+                local _, _, _, w = tsay_resolver(wgt, name)
+                wav = w
+            end
+            if wav and tsay_wav_exists(wav) then found = found + 1 end
+        end
+    end
+    return found, total, audio_lang
+end
+
+--- Trigger a report. hold=true (a held position slot) arms the repeat; the release
+--- clears it. A report already running just updates the hold flag -- the trigger is
+--- edge/hold semantics, not a queue.
+function ultidash_functions.telemsay_start(wgt, hold)
+    local st = wgt.tsay
+    if st == nil then st = {}; wgt.tsay = st end
+    st.hold = hold == true
+    if st.active then return end
+    st.active, st.idx = true, 0
+    st.started = getTime() or 0
+    st.next_t = 0
+    st.seq = audio_seq
+end
+
+function ultidash_functions.telemsay_release(wgt)
+    local st = wgt.tsay
+    if st then st.hold = false end
+end
+
+--- One bounded step per 5 Hz pass (refresh AND background, like the alerts).
+function ultidash_functions.update_telemetry_report(wgt)
+    local st = wgt.tsay
+    if st == nil then return end
+    local o = wgt.options
+    local now = getTime() or 0
+
+    if not st.active then
+        -- held switch: the NEXT report starts TsayInt after the last one STARTED
+        -- (the 10 s settings floor keeps a report from overtaking itself)
+        if st.hold and st.started ~= nil then
+            if (now - st.started) >= ((o and o.TsayInt or 30) * 100) then
+                st.active, st.idx, st.started, st.next_t, st.seq = true, 0, now, 0, audio_seq
+            end
+        end
+        return
+    end
+
+    if now < (st.next_t or 0) then return end
+
+    -- foreign audio since our last utterance = an alert (or any other voice) spoke.
+    -- TsayPrio 1 aborts the report; 2 stands back and resumes with the next item.
+    -- The third variant -- the warning waiting for the report -- was decided OUT.
+    if st.idx > 0 and audio_seq ~= st.seq then
+        if (o and o.TsayPrio or 1) == 1 then
+            st.active = false
+            ultidash_functions.log("TSAY aborted at item %d: an alert spoke", st.idx)
+            return
+        end
+        st.seq = audio_seq
+        st.next_t = now + TSAY_PAUSE_CS
+        return
+    end
+
+    if tsay_resolver == nil then st.active = false return end
+    while true do
+        st.idx = st.idx + 1
+        if st.idx > TSAY_N then
+            st.active = false
+            return
+        end
+        local name = o and o["TsayV" .. st.idx]
+        if not (name == nil or name == "~off" or name == "") then
+            if name == "~volt" then
+                -- the smart voltage speaks exactly like the voltage alert does
+                -- (latched values, VoltVoice format)
+                if o.TsayNames == 1 and tsay_wav_exists("volt") then play_audio("s_volt") end
+                announce_voltage(wgt)
+                st.seq = audio_seq
+                st.next_t = now + TSAY_ITEM_GAP
+                return
+            end
+            local v, unit, dec, wav = tsay_resolver(wgt, name)
+            if v ~= nil then
+                if o.TsayNames == 1 and wav and tsay_wav_exists(wav) then
+                    play_audio("s_" .. wav)
+                end
+                play_number(math.floor(v * (10 ^ (dec or 0)) + 0.5), unit or 0,
+                    (dec == 1) and PREC1 or (dec == 2) and PREC2 or 0)
+                st.seq = audio_seq
+                st.next_t = now + TSAY_ITEM_GAP
+                return
+            end
+            -- E2: a sensor with no value is SKIPPED, and the log says so -- with the
+            -- name option off the pilot infers the sensor from the configured order,
+            -- and a silent hole in that order must at least be on record
+            ultidash_functions.log("TSAY skip %s: no value", tostring(name))
+        end
+    end
+end
+
 -- ESC/status event LOG (modeled after eStatus' app-mode view): every status
 -- change is recorded with a wall-clock timestamp for the status detail page.
 local ESC_LOG_MAX = 30
@@ -1988,17 +2382,33 @@ end
 -- eStatus integration: throttle %, multi-vendor ESC status/fault line,
 -- arming-disable reasons when disarmed, and armed/disarm voice callouts.
 function ultidash_functions.update_estatus(wgt)
+    -- ONE accessor call for the whole function: this runs on every 5 Hz telemetry pass and
+    -- reads six ESC constants, so the alternative is six nil-checks per pass for nothing
+    local e = get_esc()
     local connected = is_rf_connected(wgt)
     local armed = is_craft_armed(wgt)
 
-    -- throttle
+    -- throttle. Memoised on the integer reading: the formatted string is identical whenever
+    -- the reading is, and this runs at 5 Hz for a whole armed flight. thr_text_key is
+    -- cleared on every branch that writes a NON-formatted text, so a return to the same
+    -- reading after "Safe" / "**" / "--" still rebuilds. The spec that asked for this (H-4)
+    -- prices it as completeness rather than as a lever -- the reading does move on most
+    -- passes; what it buys is the steady-throttle case, and it cannot cost anything.
     if not connected then
         wgt.values.throttle_text = "**"
+        wgt.thr_text_key = nil
     elseif not armed then
         wgt.values.throttle_text = "Safe"
+        wgt.thr_text_key = nil
     else
         local thr = read_src(wgt, "Thr")
-        wgt.values.throttle_text = thr and string.format("%d%%", thr) or "--"
+        if thr == nil then
+            wgt.values.throttle_text = "--"
+            wgt.thr_text_key = nil
+        elseif thr ~= wgt.thr_text_key then
+            wgt.thr_text_key = thr
+            wgt.values.throttle_text = string.format("%d%%", thr)
+        end
     end
     if ultidash_functions.simu_mode then
         connected, armed = true, true
@@ -2012,17 +2422,17 @@ function ultidash_functions.update_estatus(wgt)
     wgt.esc_last_flags = flags
 
     local status_text, status_color
-    if connected and sig == esc.SIG_RESTART then
+    if connected and sig == e.SIG_RESTART then
         status_text = "RESTART ESC"
         status_color = sem_red   -- TEXT colour (theme-aware), not a bar fill
-        wgt.esc_status_level = esc.LEVEL_ERROR
-        estatus_log(wgt, "RESTART ESC", esc.LEVEL_ERROR)
+        wgt.esc_status_level = e.LEVEL_ERROR
+        estatus_log(wgt, "RESTART ESC", e.LEVEL_ERROR)
     elseif connected then
         -- memo: get_status allocates a result table + concat strings each call, but the
         -- inputs only move on a flag/signature change. Still called with `changed` exactly
         -- when the flags changed, so the YGE SPN counter (which only counts then) is intact.
         if changed or sig ~= wgt.esc_status_sig or wgt.esc_status_st == nil then
-            wgt.esc_status_st = esc.get_status(sig, flags, changed)
+            wgt.esc_status_st = e.get_status(sig, flags, changed)
             wgt.esc_status_sig = sig
         end
         local st = wgt.esc_status_st
@@ -2035,7 +2445,7 @@ function ultidash_functions.update_estatus(wgt)
                 wgt.esc_status_level = st.level
             end
             status_text = wgt.esc_status_text
-            status_color = ESC_LEVEL_COLORS[wgt.esc_status_level or esc.LEVEL_INFO]
+            status_color = ESC_LEVEL_COLORS[wgt.esc_status_level or e.LEVEL_INFO]
         end
     end
 
@@ -2101,7 +2511,7 @@ function ultidash_functions.update_estatus(wgt)
                     clear_repeat(wgt, "Arm")
                 end
             end
-            estatus_log(wgt, armed and "Armed" or "Disarmed", esc.LEVEL_INFO)
+            estatus_log(wgt, armed and "Armed" or "Disarmed", e.LEVEL_INFO)
         end
         wgt.estatus_armed = armed
     else
@@ -3086,7 +3496,140 @@ end
 -- off). The layer is PREBUILT into the view builders (add_alert_overlay below) and
 -- toggled purely via reactive `visible` closures -- showing/hiding never rebuilds
 -- (rule: no lvgl.box, build-table primitives only, same pattern as the warn banners).
-local OVL_TITLES = { Pwr = "MAIN POWER LOST", Volt = "BATTERY CRITICAL", Telem = "TELEMETRY LOST" }
+-- Note = the generic NOTICE slot: a message handed in from outside (wgt.ovl_note)
+-- rather than derived from a live sensor condition. Its entry here is the DEFAULT
+-- title and, just as important, the FITTING string -- the title font is chosen so
+-- that the longest entry in this table fits the box, so a notice title longer than
+-- this one would clip. Keep the longest title in the table honest.
+local OVL_TITLES = { Pwr = "MAIN POWER LOST", Volt = "BATTERY CRITICAL", Telem = "TELEMETRY LOST",
+                     Note = "TELEMETRY RATE MISMATCH" }
+
+-- ============================================================================
+-- ELRS LINK CONFIGURATION VERDICT
+-- ============================================================================
+-- What the TX module is actually configured to, held against what the flight
+-- controller was TOLD the link carries. It lives here rather than in the ELRS
+-- Status page because the notice overlay needs it in the 5 Hz pass with no menu
+-- module loaded -- and because one copy is the only way the page and the overlay
+-- cannot drift apart.
+--
+-- THE COMPARISON IS THE TELEMETRY SLOT RATE, NOT THE TWO NUMBERS.
+-- Rotorflight fills a token bucket at `rate / (ratio * 1e6)` slots per us
+-- (telemetry/crsf.c:1393) and spends `(bytes+9)/5` slots per frame (:118-126), so
+-- ONLY the quotient rate/ratio ever reaches the wire. ExpressLRS sizes its own
+-- telemetry bandwidth the same way (`hz / ratiodiv`, TXModuleParameters.cpp). A
+-- module on 500 Hz 1:16 against an FC told 250 / 1:8 is therefore CORRECT, and
+-- comparing the two pairs for equality -- which is what the ELRS Status page did
+-- until 0.8.0 -- reports it as a mismatch. Cross-multiplied here, so the test stays
+-- integer-exact and needs no float tolerance.
+
+--- ELRS packet-rate option name -> packets per second ON THE LINK.
+--- NOT the number in the name. The DVDA rates repeat every packet 2-4x and keep the
+--- fast send interval, so their link rate is 1/interval -- which is exactly what
+--- ELRS itself uses to size the telemetry ratio (`hz = 1000000 / interval`). From
+--- the rate table in ExpressLRS `src/src/common.cpp` (field `interval`, in us):
+---   D500   interval 1000 us, 2x sends -> 1000 Hz   (the name says  500)
+---   D250   interval 1000 us, 4x sends -> 1000 Hz   (the name says  250)
+---   D50Hz  interval 5000 us, 4x sends ->  200 Hz   (the name says   50; 900 MHz)
+--- Everything else carries its real rate in the name ("150Hz", "333Hz Full",
+--- "F500", "F1000"). An UNKNOWN name yields nil -> no verdict at all, which is the
+--- honest answer: a guessed rate would send the pilot off to change a setting that
+--- was right.
+local ELRS_DVDA_HZ = { ["D250"] = 1000, ["D500"] = 1000, ["D50Hz"] = 200 }
+
+--- "150Hz(-112dBm)" -> 150 . "D500(-104dBm)" -> 1000 . "F1000(-104dBm)" -> 1000.
+function ultidash_functions.elrs_rate_hz(s)
+    if type(s) ~= "string" then return nil end
+    -- The DVDA names go first: "D50Hz" also matches the generic Hz pattern below and
+    -- would come out as 50, where the link actually runs at 200.
+    local head = string.match(s, "^([%a%d]+)")
+    if head == nil then return nil end
+    if ELRS_DVDA_HZ[head] ~= nil then return ELRS_DVDA_HZ[head] end
+    if string.match(head, "^D%d") then return nil end       -- an unknown DVDA rate: no guess
+    local f = tonumber(string.match(s, "^F(%d+)"))           -- FLRC, "F500" / "F1000"
+    if f ~= nil then return f end
+    return tonumber(string.match(s, "(%d+)%s*[Hh][Zz]"))
+end
+
+--- "1:32" -> 32. "Std", "Race", "Dynamic" carry no fixed ratio -> nil, no verdict.
+--- "Off" is not a ratio either, but it IS a finding -- see elrs_link_verdict.
+function ultidash_functions.elrs_tlm_ratio(s)
+    if type(s) ~= "string" then return nil end
+    return tonumber(string.match(s, "^1:(%d+)"))
+end
+
+--- The verdict, or nil when either side is unknown (no scan yet, an unparsable rate
+--- name, a dynamic telemetry ratio). Never guesses.
+--- Returns { off = true }                                  -- telemetry ratio is Off
+---      or { ok = bool, hz_m, rt_m, hz_f, rt_f, factor }
+--- `factor` = the FC's slot rate over the module's: > 1 means the FC paces FASTER
+--- than the link carries (frames back up, values read stale), < 1 that it paces
+--- slower than the link would allow.
+function ultidash_functions.elrs_link_verdict(wgt)
+    local v = wgt.values
+    if v == nil then return nil end
+    -- Telem Ratio = Off takes the whole dashboard out, whatever the FC was told.
+    -- Reported on its own rather than folded into the rate comparison.
+    if type(v.elrs_cfg_tlm) == "string" and string.match(v.elrs_cfg_tlm, "^[Oo]ff") then
+        return { off = true }
+    end
+    local hz_m = ultidash_functions.elrs_rate_hz(v.elrs_cfg_rate)
+    local rt_m = ultidash_functions.elrs_tlm_ratio(v.elrs_cfg_tlm)
+    local hz_f, rt_f = v.rf_crsf_rate, v.rf_crsf_ratio
+    if hz_m == nil or rt_m == nil or hz_f == nil or rt_f == nil then return nil end
+    if hz_m <= 0 or rt_m <= 0 or hz_f <= 0 or rt_f <= 0 then return nil end
+    -- slot rate is hz/rt on each side; cross-multiplied so the test is integer-exact
+    local ok = (hz_f * rt_m) == (hz_m * rt_f)
+    return { ok = ok, hz_m = hz_m, rt_m = rt_m, hz_f = hz_f, rt_f = rt_f,
+             factor = (hz_f / rt_f) / (hz_m / rt_m) }
+end
+
+--- Turn the verdict into the notice the overlay shows -- or clear it. Cheap enough
+--- for the 5 Hz pass because it only RECOMPUTES when one of the four inputs moved;
+--- every other pass is four table reads and four comparisons.
+--- Clearing is also what makes "once per connect" free: ultidashElrs wipes its
+--- values when a scan starts, the verdict goes nil, the episode machine resets, and
+--- the next scan that still finds a mismatch opens a NEW episode.
+function ultidash_functions.update_elrs_notice(wgt)
+    local v = wgt.values
+    if v == nil then return end
+    local c = wgt.ovl_note_cache
+    if c ~= nil and c.a == v.elrs_cfg_rate and c.b == v.elrs_cfg_tlm
+        and c.c == v.rf_crsf_rate and c.d == v.rf_crsf_ratio then return end
+    if c == nil then c = {}; wgt.ovl_note_cache = c end
+    c.a, c.b, c.c, c.d = v.elrs_cfg_rate, v.elrs_cfg_tlm, v.rf_crsf_rate, v.rf_crsf_ratio
+    local r = ultidash_functions.elrs_link_verdict(wgt)
+    if r == nil or r.ok then
+        wgt.ovl_note = nil
+        return
+    end
+    if r.off then
+        wgt.ovl_note = {
+            title = "TELEMETRY IS OFF",
+            body  = "Module telem ratio:  Off",
+            hint  = "The module sends no telemetry slots at all -\n"
+                 .. "every value on this dashboard stays blank.\n"
+                 .. "Set Telem Ratio on the ELRS module.",
+        }
+        return
+    end
+    -- "4.0x slower" reads better than a raw quotient, and the DIRECTION is the part a
+    -- pilot can act on: too fast = a backlog of stale frames, too slow = bandwidth
+    -- the link has and the FC never uses.
+    local f = r.factor
+    local dir
+    if f > 1 then
+        dir = string.format("FC paces %.1fx FASTER than the link carries -\nframes back up, values read stale.", f)
+    else
+        dir = string.format("FC paces %.1fx SLOWER than the link allows -\ntelemetry is sluggish for no reason.", 1 / f)
+    end
+    wgt.ovl_note = {
+        title = "TELEMETRY RATE MISMATCH",
+        body  = string.format("Radio sends  %d Hz  1:%d\nFC expects   %d Hz  1:%d",
+                              r.hz_m, r.rt_m, r.hz_f, r.rt_f),
+        hint  = dir .. string.format("\nSet on the FC:  link_rate %d   link_ratio %d", r.hz_m, r.rt_m),
+    }
+end
 
 -- Episode state machine, run in the publisher's 5 Hz foreground pass (display-only,
 -- so no background variant). Highest-priority active condition wins (Pwr > Volt >
@@ -3113,6 +3656,17 @@ function ultidash_functions.update_alert_overlay(wgt)
         code = "Volt"
     elseif o.TelemOvl == 1 and o.SndTelem == 1 and wgt.link_lost_armed then
         code = "Telem"
+    elseif o.NoteOvl ~= 0 and wgt.ovl_note ~= nil and not wgt.armed_now then
+        -- The NOTICE slot, deliberately last: the three above are armed, in-flight
+        -- safety conditions and must never be pushed aside by a configuration
+        -- message. DISARMED ONLY -- a config notice has no business over a flight
+        -- screen, and the thing it reports can only be acted on with the blades
+        -- stopped anyway. `armed_now` is set one pass (200 ms) after this runs, so
+        -- the notice survives arming by that much and no longer; the alternative is
+        -- a second is_armed() sensor lookup per pass for no safety gain.
+        -- Read as `~= 0` so a cfg written before this key existed (nil) still shows
+        -- it rather than silently losing the feature.
+        code = "Note"
     end
     if code == nil then                       -- nothing active: reset the episode
         wgt.ovl_active, wgt.ovl_dismissed, wgt.ovl_since = nil, nil, nil
@@ -3145,10 +3699,17 @@ function ultidash_functions.add_alert_overlay(panel, wgt, w, h)
     local bw, bh = math.floor(w * 0.8), math.floor(h * 0.8)
     local bx, by = math.floor((w - bw) / 2), math.floor((h - bh) / 2)
     local vis = function() return wgt.ovl_active ~= nil end
-    -- title font: the largest that fits the longest title in the box width
+    -- title font: the largest that fits the longest title in the box width. Measured
+    -- over OVL_TITLES rather than against one hard-coded string -- the notice slot
+    -- added a longer title than "MAIN POWER LOST", and a literal here would have gone
+    -- on fitting the box to a title that is no longer the widest.
+    local longest = ""
+    for _, t in pairs(OVL_TITLES) do
+        if #t > #longest then longest = t end
+    end
     local title_font, tfh = SMLSIZE, select(2, lcd.sizeText("Ag", SMLSIZE))
     for _, f in ipairs({ DBLSIZE, MIDSIZE, 0, SMLSIZE }) do
-        if lcd.sizeText("MAIN POWER LOST", f) <= bw - 16 then
+        if lcd.sizeText(longest, f) <= bw - 16 then
             title_font = f
             tfh = select(2, lcd.sizeText("Ag", f))
             break
@@ -3160,12 +3721,22 @@ function ultidash_functions.add_alert_overlay(panel, wgt, w, h)
     local ty = by + math.floor(bh * 0.22)
     local title = function()
         local c = wgt.ovl_active
+        if c == "Note" then
+            local n = wgt.ovl_note
+            return (n and n.title) or OVL_TITLES.Note
+        end
         return c and OVL_TITLES[c] or ""
     end
     local value = function()
         -- live value line: Pwr = the buffer/BEC voltage, Volt = the cell voltage;
-        -- memoized so the format runs only when the reading changes
+        -- memoized so the format runs only when the reading changes.
+        -- Note = the notice's own body, already formatted (and possibly two lines) by
+        -- whoever set wgt.ovl_note -- no per-frame work at all.
         local code = wgt.ovl_active
+        if code == "Note" then
+            local n = wgt.ovl_note
+            return (n and n.body) or ""
+        end
         local raw
         if code == "Pwr" then raw = wgt.values.vbec
         elseif code == "Volt" then raw = wgt.values.vcel end
@@ -3178,6 +3749,38 @@ function ultidash_functions.add_alert_overlay(panel, wgt, w, h)
         else wgt.ovl_vcache = { code = code, raw = raw, s = s } end
         return s
     end
+    -- The explanatory line under the value: what the message MEANS and what to do
+    -- about it. Empty for the three alert codes -- an empty label draws nothing, so
+    -- their box is unchanged. Notices are the reason it exists: a mismatch a pilot
+    -- cannot interpret is not a warning, it is a puzzle.
+    local hint = function()
+        if wgt.ovl_active ~= "Note" then return "" end
+        local n = wgt.ovl_note
+        return (n and n.hint) or ""
+    end
+    -- The close control: an X in the box's top-right corner, and SINCE 0.8.0 the only
+    -- way this box closes by touch. The tap-anywhere that used to dismiss it is gone --
+    -- it was invisible, and on a message the pilot is meant to read and act on, every
+    -- mis-tap threw it away before it had been read. Same reasoning, and the same
+    -- glyph, as the detail pages (host `close_button`, 0.8.0). Built inline rather
+    -- than through `close_control` because every element in this box carries the
+    -- overlay's `visible` closure -- a statically built X would stand on the dashboard
+    -- with nothing behind it. The auto-close (`OvlClose`) is untouched.
+    local xsz = sfh + 8
+    local xx, xy = bx + bw - 8 - xsz, by + 6
+    -- generous on purpose, exactly as on the detail pages: the glyph is small and the
+    -- corner is the one place in the box nothing else can be hit
+    wgt.ovl_close_rect = { x = xx - 8, y = xy - 6, w = xsz + 16, h = xsz + 12 }
+    -- Vertical layout, computed once at build time and from the BOTTOM up, because
+    -- that is the edge the box cannot grow past. The value block is two lines and the
+    -- hint four, so on the smallest zone (480x272 -> a 217 px box) the old 8%-of-box
+    -- gap under the title no longer fits; it is kept where there IS room and squeezed
+    -- to 4 px where there is not. The old "tap to dismiss" line is gone with the
+    -- behaviour it described, and the hint inherited its space.
+    -- The layout sweep checks this box for overflow at all three sizes.
+    local hy = by + bh - 6 - 4 * sfh             -- hint block, four lines, to the bottom
+    local gap = math.min(math.floor(bh * 0.08), math.max(4, hy - 4 - (ty + tfh) - 2 * vfh))
+    local vy = ty + tfh + gap                    -- value block, two lines
     panel:build({
         { type = "rectangle", x = bx, y = by, w = bw, h = bh, filled = true, rounded = 8,
           color = lcd.RGB(190, 16, 16), visible = vis },
@@ -3185,10 +3788,17 @@ function ultidash_functions.add_alert_overlay(panel, wgt, w, h)
           color = white, visible = vis },
         { type = "label", x = bx + 8, y = ty, w = bw - 16, h = tfh, font = title_font,
           align = CENTER, color = white, text = title, visible = vis },
-        { type = "label", x = bx + 8, y = ty + tfh + math.floor(bh * 0.08), w = bw - 16, h = vfh,
+        { type = "label", x = bx + 8, y = vy, w = bw - 16, h = 2 * vfh,
           font = MIDSIZE, align = CENTER, color = white, text = value, visible = vis },
-        { type = "label", x = bx + 8, y = by + bh - sfh - 6, w = bw - 16, h = sfh,
-          font = SMLSIZE, align = CENTER, color = white, text = "tap to dismiss", visible = vis },
+        { type = "label", x = bx + 8, y = hy, w = bw - 16, h = 4 * sfh,
+          font = SMLSIZE, align = CENTER, color = white, text = hint, visible = vis },
+        -- the close control, last so it sits over the box: a plain capital X, because
+        -- the EdgeTX fonts carry no cross glyph (the same gap the status log's scroll
+        -- arrows work around)
+        { type = "rectangle", x = xx, y = xy, w = xsz, h = xsz, thickness = 1, rounded = 4,
+          color = white, visible = vis },
+        { type = "label", x = xx, y = xy + math.floor((xsz - sfh) / 2), w = xsz, h = sfh + 2,
+          font = SMLSIZE, align = CENTER, color = white, text = "X", visible = vis },
     })
 end
 
@@ -3245,6 +3855,129 @@ function ultidash_functions.add_perf_overlay(wgt, w, h)
         color = lcd.RGB(0, 255, 128), text = txt })
 end
 
+--- Draw the page-close control: a small bordered "X", right-aligned to `right_x` and
+--- starting at `top_y`. Returns its left edge and its side length, so the caller can
+--- both keep its own content clear of it and build the tap rect.
+---
+--- DRAWN, not an lvgl.button, and the reason is the same one the detail pages carry
+--- in their own comments: a focusable object on a full-screen page captures
+--- PAGE/RTN/TELE, so the page can no longer be left with the keys. The tap is
+--- hit-tested in refresh() against wgt.close_rect, exactly like the status log's
+--- scroll arrows and the menu glyph. The CALLER sets that rect: only it knows the
+--- container's own origin, and both call sites deliberately make the rect larger
+--- than the glyph (the same trick settings_icon_rect uses for the menu bars).
+--- `band_h`, when given, is the height of the row it has to fit into: the control is
+--- clamped to it and centred in it (the top bar is 20 px on a 480x272 MK2 and 34 on
+--- the MK3, so a size derived from the font alone does not fit both).
+function ultidash_functions.close_control(container, right_x, top_y, col_border, col_ink, band_h)
+    local _, gh = lcd.sizeText("Ag", SMLSIZE)
+    local sz = gh + 8
+    local y = top_y
+    if band_h ~= nil then
+        if band_h < sz then sz = band_h end
+        y = top_y + math.floor((band_h - sz) / 2)
+    end
+    local x = right_x - sz
+    -- No panel to draw into: a skin's detail-page hook returns none (docs/SKINS.md D3),
+    -- so the host's guarantee has to become its own top-level object -- the same shape
+    -- the "skin page failed" banner uses, and for the same reason.
+    if container == nil then
+        local box = lvgl.rectangle({ x = x, y = y, w = sz, h = sz, thickness = 1,
+                                     rounded = 4, color = col_border })
+        box:label({ x = 0, y = math.floor((sz - gh) / 2), w = sz, h = gh + 2, text = "X",
+                    font = SMLSIZE, color = col_ink, align = CENTER })
+        return x, sz
+    end
+    local els = {}
+    -- A border that would cut into the glyph is worse than no border, so below that
+    -- size the X stands on its own -- which is the MK2's top bar. The tap rect is the
+    -- affordance either way, and it is the caller's, not this box.
+    if sz >= gh + 2 then
+        els[1] = { type = "rectangle", x = x, y = y, w = sz, h = sz, thickness = 1, rounded = 4, color = col_border }
+    end
+    -- a plain capital X: the EdgeTX fonts carry no multiplication/cross glyph, the
+    -- same gap that made the status log's scroll arrows stacked rectangles
+    els[#els + 1] = { type = "label", x = x, y = y + math.floor((sz - gh) / 2), w = sz, h = gh + 2,
+                      text = "X", font = SMLSIZE, color = col_ink, align = CENTER }
+    container:build(els)
+    return x, sz
+end
+
+--- A FOCUS STOP on a read-only lvgl.page: the encoder's only route across it.
+---
+--- The rotary is not an EVENT for a useLvgl widget and never can be. It is an
+--- LV_INDEV_TYPE_ENCODER feeding the LVGL focus group, and the editing mode that would
+--- translate it into EVT_ROTARY_* is denied to us by LuaWidget::enableFullScreenRE() =
+--- !useLvglLayout(). Such a page therefore reacts to the encoder ONLY through focusable
+--- objects, and only as focus movement -- which LVGL turns into scrolling by pulling the
+--- focused control into view (LV_OBJ_FLAG_SCROLL_ON_FOCUS sits on the CONTROL, never on
+--- the page body). A page built from pg:label alone is encoder-dead: measured on the ELRS
+--- Status page, eight detents produced a byte-identical picture.
+---
+--- Hence stops -- ONE PER SECTION HEAD, plus one on the page's closing note. Three things
+--- shaped that:
+---   * It has to be a `type="button"`. That is the only focusable object the Lua LVGL API
+---     offers that carries no value to edit, and its press is a NO-OP -- the sibling
+---     strip's own cell is the precedent that already does exactly that.
+---   * A button is always theme-painted: border and rounding come from etx_btn_style and
+---     there is no parameter to turn either off. So the section head becomes a BAR, and
+---     the text keeps its left alignment by riding in a CHILD label -- a button centres
+---     its own `text` and takes no `align`. The child is neither focusable nor clickable,
+---     so the encoder still sees exactly one control per stop.
+---   * The CLOSING NOTE carries the last stop, and that is not decoration. LVGL scrolls
+---     the minimum distance, so walking DOWN lands a control on the BOTTOM edge of the
+---     viewport: a stop at a section head reveals what is ABOVE it, not the rows below
+---     it. Stop k brings section k-1 into view, and without a stop past the LAST section
+---     that section's rows stay under the fold -- which on the ELRS Status page is the
+---     whole "Flight controller expects" block the 0.8.0 rework is about.
+---
+--- Child x/y are CONTENT-relative: EdgeTX's border+padding inset is already taken off and
+--- cannot be switched off, so the bar is sized from the text outwards. Returns the height
+--- the bar occupies, so the caller's row cursor stays free of that arithmetic.
+---
+--- `zw` is the ZONE width, not the bar's: the bar always spans 10 .. zw - 20 (the sibling
+--- strip's box, clear of the scrollbar) and the inset is keyed on the same number. Taking
+--- the zone rather than reading LCD_W is not cosmetic -- nothing in this widget keys layout
+--- on that global, and the budget harness does not define it.
+---
+--- Returns the ELEMENT and its height. Pages that emit as they go take focus_stop below;
+--- a page that collects into one `elems` table (the sensor check) appends this instead, so
+--- its rows keep their single pg:build. `text` may be a function -- it rides in an ordinary
+--- label, so a reactive closure works exactly as it does anywhere else.
+--- `wrap` = the text is longer than one line and has to be MEASURED (the sensor check's
+--- legend). The measurement belongs here rather than in the caller, because it has to run
+--- against the CHILD's width -- the bar minus the inset -- which is this function's own
+--- arithmetic and nothing the caller can see.
+function ultidash_functions.focus_stop_elem(y, zw, text, font, color, wrap)
+    -- the button's own inset, per side: 10/5 px at zone width 800, 8/4 at 480. Keyed on
+    -- WIDTH, the way LAYOUT_SCALE and the sibling strip's cells already are.
+    local ins_x = (zw >= 800) and 10 or 8
+    local ins_y = (zw >= 800) and 5 or 4
+    local _, th = lcd.sizeText("Ag", font or 0)
+    local w = math.max(2 * ins_x + 2, zw - 30)
+    local cw = math.max(1, w - 2 * ins_x)
+    local lines = 1
+    if wrap and type(text) == "string" then
+        -- 0.90 because LVGL breaks on word boundaries: a line rarely fills to its last
+        -- pixel, so the raw division under-counts. Same correction build_status_view's
+        -- `grow` rows make, for the same reason.
+        lines = math.max(1, math.ceil(lcd.sizeText(text, font or 0) / (cw * 0.90)))
+    end
+    local ch = lines * th + 2
+    local h = ch + 2 * ins_y
+    return { type = "button", x = 10, y = y, w = w, h = h,
+             press = function() end,
+             children = { { type = "label", x = 0, y = 0, w = cw, h = ch,
+                            text = text, font = font, color = color, align = LEFT } } }, h
+end
+
+--- The same stop, emitted straight onto the page. Returns its height.
+function ultidash_functions.focus_stop(pg, y, zw, text, font, color, wrap)
+    local e, h = ultidash_functions.focus_stop_elem(y, zw, text, font, color, wrap)
+    pg:build({ e })
+    return h
+end
+
 -- Background refresh: runs the same alert cascade as the foreground pass, but off
 -- screen (another view is active). It MUST refresh every sensor value the alerts
 -- consume first — otherwise EscL/BEC/RSSI would run on frozen values latched by the
@@ -3255,6 +3988,7 @@ function ultidash_functions.background_refresh(wgt)
     master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
     refresh_audio_volume(wgt)
     ultidash_functions.update_switch_voices(wgt)
+    ultidash_functions.update_telemetry_report(wgt)
     maybe_reset_stats(wgt)
 
     -- Sensor updates FIRST (the alert cascade below reads these caches; without them
@@ -3317,6 +4051,7 @@ function ultidash_functions.refresh(wgt)
     master_muted = wgt.options and wgt.options.Mute == 2   -- CHOICE: 1=None, 2=All
     refresh_audio_volume(wgt)
     ultidash_functions.update_switch_voices(wgt)
+    ultidash_functions.update_telemetry_report(wgt)
     if ultidash_functions.simu_mode then
         wgt.telemetry_alive = true
         ultidash_functions.refresh_ui(wgt)
@@ -3350,6 +4085,80 @@ function ultidash_functions.refresh(wgt)
     ultidash_functions.update_skp_warning(wgt)
     ultidash_functions.update_escalation(wgt)   -- after the alert latches are current
     ultidash_functions.crank_repeats(wgt)       -- re-announce armed repeats when due
+end
+
+
+-- Deferred module data (host stage 2a0): the reference tables above are declared as
+-- empty shells and filled here, in the staged cycle's budget instead of the module
+-- level's -- module load runs inside create()'s ~20k together with four other chunks.
+-- Everything here is module-LOCAL (nothing captures a reference before the stage gates
+-- run; set_palette mutates ESC_LEVEL_COLORS only from the apply stage onward, which is
+-- strictly after this). Self-clearing: runs exactly once per session.
+function ultidash_functions.deferred_init()
+    -- the ESC module's load lands HERE on a cold start (this stage runs before the first
+    -- palette apply), i.e. in this staged cycle's budget rather than in create()'s
+    local e = get_esc()
+    ESC_LEVEL_COLORS = {
+        [e.LEVEL_TRACE] = COLOR_THEME_DISABLED,
+        [e.LEVEL_INFO]  = COLOR_THEME_PRIMARY1,
+        [e.LEVEL_WARN]  = BAR_COLOR_LOW,
+        [e.LEVEL_ERROR] = BAR_COLOR_CRITICAL,
+    }
+    ARM_DISABLE_DESCS = {
+        "NOGYRO", "FAILSAFE", "RXLOSS", "BADRX", "BOXFAILSAFE", "GOVERNOR", "RPM_SIGNAL",
+        "THROTTLE", "ANGLE", "BOOTGRACE", "NOPREARM", "LOAD", "CALIB", "CLI", "CMS",
+        "BST", "MSP", "PARALYZE", "GPS", "RESCUE_SW", "RPMFILTER", "REBOOT_REQD",
+        "DSHOT_BBANG", "NO_ACC_CAL", "MOTOR_PROTO", "ARMSWITCH",
+    }
+    do
+        local defs = {
+            { "Fuel", "Fuel" }, { "Volt", "Volt" }, { "Cell", "Cell" }, { "Arm", "Arm" },
+            { "Telem", "Telem" }, { "Link", "Link" }, { "Rssi", "Rssi" }, { "Pwr", "Pwr" },
+            { "Bec", "Bec" }, { "Skp", "Skp" }, { "EscL", "EscL" }, { "Temp", "Temp" },
+        }
+        for i = 1, #defs do
+            REP_ALERTS[i] = { code = defs[i][1], name = defs[i][2],
+                rep = defs[i][1] .. "Rep", cnt = defs[i][1] .. "Cnt", int = defs[i][1] .. "Int" }
+        end
+    end
+    RFMD_INFO = {
+        [1]={"25Hz",-123,"25Hz (LORA)"},   [2]={"50Hz",-115,"50Hz (LORA)"},   [3]={"100Hz",-117,"100Hz (LORA)"},
+        [4]={"100HzF",-112,"100Hz (LORA-full)"}, [5]={"150Hz",-112,"150Hz (LORA)"}, [6]={"200Hz",-112,"200Hz (LORA)"},
+        [7]={"250Hz",-108,"250Hz (LORA)"}, [8]={"333HzF",-105,"333Hz (LORA-full)"}, [9]={"500Hz",-105,"500Hz (LORA)"},
+        [10]={"D250",-104,"250Hz (FLRC-DVDA)",true}, [11]={"D500",-104,"500Hz (FLRC-DVDA)",true}, [12]={"F500",-104,"500Hz (FLRC)",true}, [13]={"F1000",-104,"1000Hz (FLRC)",true},
+        -- 3.x additive gaps confirmed against expresslrs.org/info/signal-health (2026-07):
+        -- D50/DK500/K1000Full previously fell through to "no link". Floors per that doc; note
+        -- the low-index floors are band-dependent (this block is treated 2.4GHz — see .md).
+        [14]={"D50",-112,"50Hz (DVDA LoRa)"}, [16]={"DK500",-101,"500Hz (DVDA FSK)",true}, [19]={"K1000F",-101,"1000Hz FSK-full",true},
+        [21]={"50Hz",-115,"50Hz (LORA)"},  [23]={"100HzF",-112,"100Hz (LORA-full)"}, [24]={"150Hz",-112,"150Hz (LORA)"},
+        [27]={"250Hz",-108,"250Hz (LORA)"}, [28]={"333HzF",-105,"333Hz (LORA-full)"}, [29]={"500Hz",-105,"500Hz (LORA)"},
+        [30]={"D250",-104,"250Hz (FLRC-DVDA)",true}, [31]={"D500",-104,"500Hz (FLRC-DVDA)",true}, [32]={"F500",-104,"500Hz (FLRC)",true}, [33]={"F1000",-103,"1000Hz (FLRC)",true},
+        -- 34-36 per signal-health 4.x table (2026-07): Kernel/DK modes are FSK+FEC (LR1121),
+        -- floors -103; the table lists NO K500 and ends at 36 — [37] kept as a defensive
+        -- alias so an unexpected 37 doesn't fall through to "no link".
+        [34]={"DK250",-103,"250Hz (DVDA FSK)",true}, [35]={"DK500",-103,"500Hz (DVDA FSK)",true}, [36]={"K1000",-103,"1000Hz (FSK)",true}, [37]={"K1000",-103,"1000Hz (FSK)",true},
+        [40]={"AP500",-105,"500Hz (Airport)"}, [41]={"APF1000",-103,"1000Hz FLRC (Airport)",true},
+        [100]={"GX100",-112,"100Hz 8CH (GemX)"}, [101]={"GX150",-112,"150Hz (GemX)"}, [102]={"GX333",-105,"333Hz 8CH (GemX)"}, [103]={"GX500",-105,"500Hz (GemX)"},
+    }
+    SWITCH_VOICES = {
+        { key = "MotorSrc",   on = "motor_on",  off = "motor_off" },
+        { key = "RescueSrc",  on = "rescue_on", off = "rescue_off" },
+        { key = "GovSrc",     on = "gov_on",    off = "gov_off" },
+        { key = "ProfileSrc", profile = true },
+    }
+    GOV_VOICE_FILES = {
+        [0] = "gs_thoff",   [1] = "gs_idle",    [2] = "gs_spool",
+        [3] = "gs_recov",   [4] = "gs_active",  [5] = "gs_hold",
+        [6] = "gs_fallbk",  [7] = "gs_autorot", [8] = "gs_bailout",
+        [9] = "gs_bypass",
+    }
+    GOV_VOICE_KEYS = {
+        [0] = "GvsOff",   [1] = "GvsIdle",    [2] = "GvsSpool",
+        [3] = "GvsRecov", [4] = "GvsActive",  [5] = "GvsHold",
+        [6] = "GvsFallbk",[7] = "GvsAutorot", [8] = "GvsBailout",
+        [9] = "GvsBypass",
+    }
+    ultidash_functions.deferred_init = nil
 end
 
 return ultidash_functions

@@ -29,6 +29,8 @@ Rob "bob00" Gayle:
 | `ultidashFunctions.lua` | Telemetry updates, battery logic, callout engine, switch voices, eStatus, shared-state publisher |
 | `ultidashValues.lua` | Value table with formatting/color getters |
 | `ultidashRf.lua` | RF service: connection state, MSP (battery profile, flight statistics) |
+| `ultidashRfs.lua` | Second MSP provider: the same read surface served through **RFSuite for EdgeTX**'s published MSP service instead of RF Tool (§2.9). Loaded only on a card where that service is actually published, so a card with RF Tool — or with neither — never pays for it |
+| `ultidashElrs.lua` | ELRS TX-module configuration client: reads the ExpressLRS transmitter module's own CRSF parameters (packet rate, telemetry ratio, antenna mode) that no telemetry sensor carries. **Read only** — the parameter-write command is never sent |
 | `ultidashOptions.lua` | The EdgeTX widget-option list (empty — everything is configured in-widget, §2.2) |
 | `ultidashSettings.lua` | Per-model settings store (SD-card cfg files) — the in-widget settings overlay |
 | `ultidashEsc.lua` | Multi-vendor ESC status/fault decoder (from eStatus) |
@@ -38,22 +40,64 @@ Rob "bob00" Gayle:
 | `toolbox/common.lua` | Shared adjustment tables and helpers behind the Map and the Editor, loaded once so a `labels.lua` override applies identically to both |
 | `toolbox/labels.example.lua` | Optional custom adjustment-function labels (copy to `labels.lua`) |
 | `toolbox/logview.lua` | Toolbox tool page: telemetry Log Viewer (graphs `/LOGS/*.csv`; WIP, disarmed-only) |
+| `toolbox/livemon.lua` | Toolbox tool page: **Live Monitor** — up to 4 sensors as live min/max curves of the last 15–60 s (§2.3b; in-flight capable, the sampling runs in the host) |
 | `toolbox/logtemplates.example.lua` | Commented template for stocking own Log Viewer sensor sets from a PC (copy to `cfg/logtemplates.lua`) — since 0.7.0 the radio itself maintains that file |
 | `toolbox/rf2cfg.lua` | Toolbox tool page: RF2 Config — zero-copy adapter running the original rotorflight-lua-scripts tool from `/SCRIPTS/RF2/` (disarmed-only) |
 | `toolbox/fltdata.lua` | Flight-log data core: battery registry parse, `flights.csv` append, cycle counters (see §12) |
+| `toolbox/rfscfg.lua` | Toolbox tool page: **RFSuite (exp.)** — zero-copy adapter running the RFSuite for EdgeTX suite from `/SCRIPTS/TOOLS/rfsuite-core/` (optional install, disarmed-only, **highly experimental**: a warning page precedes every open; see [TOOLBOX.md](TOOLBOX.md) §8) |
 | `toolbox/fltlog.lua` | Toolbox tool page: Flight Log viewer (flights / per-model totals / batteries; disarmed-only) |
+| `toolbox/fltbatt.lua` | Battery detail, editor and models sub-page behind the Flight Log — one form, reached both from the viewer and from the battery query's *+ New* (disarmed-only; only *Save* writes) |
+| `toolbox/adjnames.lua` | Adjustment function id → display name, all 83 ids of the Rotorflight 4.6.0 line. Loaded lazily, and only when the adjustment table comes from the flight controller (which answers with a number, never a name) |
+| `img/` | The menu icon set — 39 32×32 PNGs (`ud_*.png`), used as the menu tiles' glyphs, every menu page's header icon, the sibling strip's cells and the alert cards' state marks (§2.2, §2.6a). Part of the install; a missing file makes that one tile fall back to text alone rather than failing |
 | `cfg/` | Widget-owned data folder, never overwritten by an update: `cfg_m_<model-name>.cfg` per-model settings (§2.8) and `logtemplates.lua`, the Log Viewer's own sensor sets |
 | `logs/` | Debug-log folder: `debug_NN.log`, written only while *General ▸ Debug log to SD card* is on (§11) |
-| `fltlog/` | Flight-log data folder: `flights.csv` (written by the widget) + `batteries.cfg` (your battery registry, PC-edited) |
+| `fltlog/` | Flight-log data folder: `flights.csv` (written by the widget) + `batteries.cfg` (your battery registry, editable on the radio and on the PC) |
 | `fltlog/batteries.example.cfg` | Commented template for the battery registry (copy to `batteries.cfg`) |
+
+One file lives **outside** the widget folder, because EdgeTX's Tools menu only reads its own
+directory:
+
+| File | Content |
+|-------|--------|
+| `/SCRIPTS/TOOLS/udlogview.lua` | Launcher that puts the **Log Viewer** in EdgeTX's *SYS ▸ Apps* menu. It loads and drives `WIDGETS/UltiDash/toolbox/logview.lua` — no second implementation, and it does nothing on a card without UltiDash but say so (§2.7b) |
 
 ---
 
 ## 2. Configuration
 
-### 2.1 EdgeTX widget options: none
+### 2.1 EdgeTX widget options: the craft target
 
-The widget declares **no EdgeTX options**. Place **exactly one** UltiDash instance — if
+The widget declares **one EdgeTX option**, set in the widget-settings dialog where the
+widget is **placed** — not in the in-widget settings menu, and not per model file:
+
+| Option | Values | Default |
+|---|---|---|
+| **Craft target** | *Rotorflight* | *Rotorflight* |
+
+The list has a single entry today, because Rotorflight is the only craft firmware UltiDash
+realises. The option exists so the widget **says** which firmware it is reading rather than
+assuming it, and so the Rotorflight-specific machinery is only loaded for a Rotorflight
+craft. Nothing else changes: with one entry there is nothing to choose wrongly.
+
+**Upgrading needs no action.** An UltiDash placed under 0.7.x carries no stored value for an
+option that did not exist then; EdgeTX hands it to the widget as an out-of-range `0` and the
+widget reads that as *Rotorflight*. Nothing is announced, nothing is reset and no setting
+moves — the option simply shows *Rotorflight* the next time you open the dialog. The same
+applies to a model file hand-edited to a nonsense value, or written by a later UltiDash that
+offered more entries: anything unrecognised falls back to *Rotorflight*.
+
+A `Target=` line in a per-model `cfg_m_<model>.cfg` is **ignored** — this option lives in the
+EdgeTX model file, never in the settings store, and the dialog always wins.
+
+**The cross-check.** When the declared target is *Rotorflight*, the link is up, the model has
+telemetry sensors, the sensor resolver derived its index base, **and** not one Rotorflight
+telemetry sensor was recognised, the *Sensor check* page (§3.6) and **menu ▸ Status** say so:
+*"no Rotorflight sensors found"*. It states what was observed, not what is wrong — a model
+whose sensors were renamed away from their Rotorflight IDs looks identical from the radio's
+side. All five conditions must hold, so a cold radio, a powered-down craft or a model without
+telemetry never triggers it.
+
+Place **exactly one** UltiDash instance — if
 two are placed, both drive callouts and the shared state (doubled announcements) and a
 **"2 Dashboard instances active!"** banner appears on both until you remove one.
 
@@ -64,33 +108,69 @@ two are placed, both drive callouts and the shared state (doubled announcements)
 > as the Dashboard's own detail pages (tap the link bars / the status line) and the
 > menu's **Status** entry.
 
-Everything is configured **inside the widget**, not in the EdgeTX option list.
+Everything else is configured **inside the widget**, not in the EdgeTX option list.
 
 ### 2.2 The in-widget settings menu
 
 1. **Long-press** the widget → **Full screen**.
 2. Tap the **☰ menu glyph** (top-left, before the clock) — **disarmed only** (no config
    in flight). The tap target is the whole top-left corner.
-3. Menu entries (laid out as a button grid): **Settings**, **Status**, **Sensor check**
-   (§3.6), **Toolbox** (opens the tool pages, §2.7b).
+3. The **menu hub** is a **two-column** grid of icon tiles. First the two things you *do* —
+   **Settings** and **Toolbox** (the tool pages, §2.7b) — then a **‹ Diagnostics ›** heading
+   over the three pages that only read something out: **Status**, **ELRS Status** (§3.6a)
+   and **Sensor check** (§3.6). The heading groups them; it costs no tap, all three stay
+   exactly where they were.
 
-**Settings** opens a **submenu** of the configuration groups — a 3-column grid under four
-themed section headers; pick a group to open its page, its back arrow returns here:
+**Settings** shows the **whole configuration on one screen**: all 13 groups as icon tiles in
+a 3-column grid under four themed section headings. Nothing scrolls on the TX16S MK3 (55 px
+rows) or the TX15; the 480×272 MK2 scrolls by about one row. Pick a group to open its page,
+its back arrow returns here:
 
 | Section | Groups |
 |---------|--------|
 | **Appearance** | **Display**, **Skin** (§2.3s — the active skin's own colour scheme + options), **Colors** (§2.3b — submenu, one page per scheme of the active skin) |
-| **Battery & limits** | **Telemetry** (submenu: *Tele Main* / *Tele Details*, §2.3a), **Battery**, **Thresholds**, **ESC load** (§2.5a) |
-| **Sound & callouts** | **Volume** (§2.6), **Alerts** (§2.6a — submenu, one page per alert), **Voice** (submenu: *Switch voice* §2.7 / *Gov voice* §2.7-gov) |
+| **Battery & limits** | **Telemetry** (submenu: *Tele Main* / *Tele Details* / *Live monitor*, §2.3a/§2.3b), **Battery**, **Thresholds**, **ESC load** (§2.5a) |
+| **Sound & callouts** | **Volume** (§2.6), **Alerts** (§2.6a — submenu, one page per alert), **Voice** (submenu: *Switch voice* §2.7 / *Gov voice* §2.7-gov / *Telemetry report* §2.7-say) |
 | **System** | **Shortcuts** (§2.7c), **Toolbox** (§2.7b), **General** (§2.7a) |
+
+**Every menu page carries its own header icon** — the same glyph as the tile that opened it,
+so a page shows where you are before a word of it is read.
+
+**And the header spells that path out.** On every page of the menu tree the title stays
+**UltiDash**; the line under it is the **full navigation chain**, joined by ` > `. The hub
+reads *Menu*, the settings grid *Settings*, the Toolbox menu *Toolbox*; a plain group page
+reads *Settings > Display*, the alert list *Settings > Alerts* and one alert *Settings >
+Alerts > Voltage*, a colour page *Settings > Colors > UltiDash dark*, a Telemetry page
+*Settings > Telemetry > Tele Main*. The three read-out pages sit under the hub's
+*Diagnostics* heading and say so: *Diagnostics > Status*, *Diagnostics > ELRS Status*,
+*Diagnostics > Sensor check*. The tool pages (§2.7b) and the battery pickers are not part of
+that tree and keep their own titles.
+
+**Sibling pages have two ways forward, and both are on the page.** Where several pages belong
+to one set — the eight plain settings groups, the 13 alert pages, and the pages inside
+*Colors*, *Telemetry*, *Voice* and *Shortcuts* — the page header carries **‹ ›** arrows that
+step to the previous / next page and **grey out at the ends** of the set, and the top of the
+page body carries an **icon strip**: one cell per sibling, the current one highlighted. Tap a
+cell to jump straight to that page, or turn the **rotary encoder** onto it and press. The
+strip is the encoder's route (EdgeTX offers the header arrows to touch only), which is why it
+is there and not in the header: it sits inside the scrolling body, so it **scrolls away with
+the content** — and comes back by itself as soon as encoder focus reaches it again. Where a
+whole set shares one glyph (the 13 alert pages, the three Telemetry pages) the strip reads as
+a position indicator: it still shows where in the set you are, and every cell still jumps.
 
 Bools are real toggle switches, multi-value options are dropdown pickers, numbers use
 −/+ buttons (long-press = bigger step), the two volume percentages are real sliders; all
 controls on a page share one right edge and rows are separated by thin lines. Edits are
 **saved automatically** when a page is left (back arrow or **RTN**); arming or leaving
 full-screen also saves. Each group page also has a **Reset <page> to defaults** button
-(with confirmation) that resets only that page's settings; below the settings grid,
-**Reset to defaults** (with confirmation) resets the whole model.
+(with confirmation) that resets only that page's settings.
+
+**Resetting everything is a row now, not a button under the grid.** *Reset to defaults* for
+the whole model is the **last row of the *General* group** (§2.7a) — same confirmation, same
+effect as before, only its place changed (that button and the space it reserved are what the
+13 group tiles now use). Confirming it resets every setting of this model, **drops the
+unsaved edits** of the page you are on so nothing can be written back over the fresh
+defaults, and returns you to the settings menu.
 
 ### 2.3 Settings — Display
 
@@ -101,10 +181,11 @@ particular layout — including the **colour scheme** — lives in the **Skin** 
 |---------|------|---------|-------|
 | **Dashboard skin** | choice | UltiDash | the flight/stats **layout** (§2.3s). This release carries the built-in **UltiDash** look; the choice lists every skin file found in `skins/` beside it. Each skin has its own colour scheme + options in the *Skin* group |
 | **Fill background** | bool | on | fill the panel background color |
-| **Units beside values** | bool | **off** | show the unit (V / A / rpm / °C …) as a small suffix next to each value — flight panel, Telemetry cards and every skin slot fed by the skin API. **Off = the original formatting:** the value keeps the whole column and therefore the biggest font that fits. Worth turning on where there is room (800×480); on 480×320 (TX15) / 480×272 (TX16S MK2) it costs font size where there is none to spare |
+| **Units on detail pages** | bool | **off** | show the unit (V / A / rpm / °C …) as a small suffix next to each value on the **detail pages**. **Off = the original formatting:** the value keeps the whole column and therefore the biggest font that fits. Worth turning on where there is room (800×480); on 480×320 (TX15) / 480×272 (TX16S MK2) it costs font size where there is none to spare. **Since 0.8.0 the dashboard's own units belong to the skin** — *Skin ▸ Units beside values* — because what a unit costs in font size is a property of the layout. Under the built-in **UltiDash** skin the two rows are the same switch, exactly as before; another skin may carry its own, and a skin that declares none follows this row |
 | **Stats page** | choice | On disconnected | Never / On disarmed / On disconnected |
 | **Voltage shown as** | choice | Cell voltage | Cell voltage / Battery voltage |
 | **Close detail pages on arm** | bool | off | when on, arming closes an open detail page (off = keep ELRS detail open in flight) |
+| **Open page on arming** | choice | Off | bring a **detail page up by itself** when the craft arms — the in-flight counterpart to *Stats page*, which governs the disarmed side. Off / ELRS / Status log / Battery / Telemetry. It opens **once per arm**, a moment after the arm so the view switch is settled, and only in full screen with nothing else on screen; close it like any other page (the **X**, RTN, a bound switch) and it stays closed until the next arm. Nothing happens if you were already looking at something else. **Greyed out while *Close detail pages on arm* is on** — that option re-closes any detail page for as long as you are armed, so the two cannot both hold |
 | **Tap zones for detail pages** | bool | on | enable tapping the bars / status line / gauge to open detail pages (the menu glyph stays active either way) |
 | **Keep backlight on (full screen)** | bool | on | while UltiDash owns the **whole** display, defer the radio's *Backlight off after* timeout each pass. With the backlight already off, EdgeTX spends the next press on waking the screen and no widget sees it — that is the tap meant to open a detail page. Only in full screen: in a layout zone the radio's own power saving stands. Your *Backlight off after* setting is deferred, never overridden |
 
@@ -207,6 +288,27 @@ Each row is a **two-field hybrid**, both writing the same slot:
 - Known Rotorflight sensors get a friendly label, decimals and a **unit** (V, A, °C, mAh,
   %, rpm, …); raw sensors show their EdgeTX name and the precision EdgeTX reports.
 
+### 2.3b Settings — Live monitor (the Toolbox curve tool's sensors)
+
+The **Live Monitor** (Toolbox ▸ Logs, §2.7b) draws up to **4 sensors as live curves** —
+after a manoeuvre, one glance answers *how deep did the headspeed sag, how fast did it
+recover*, without a PC and without waiting for the flight's log file. Its slots are the
+same sensor-picker rows as above:
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
+| **Strip 1..4** | sensor | Off | each configured sensor gets a full-width strip; the screen divides by the number configured |
+| **Window** | choice | 30 s | 15 / 30 / 60 s — also switchable on the page itself; the recorder always keeps 60 s |
+
+**Sampling runs while the page is closed** (that is the point: open it *after* the
+manoeuvre and the manoeuvre is there). Every reading the radio sees is kept as a 0.2 s
+**min/max band**, so a one-frame spike cannot fall between samples. Three honest limits:
+a peak shorter than the **sensor's own telemetry interval** never reaches the radio and so
+never reaches the strip; sampling is **coarser while another screen is shown** (EdgeTX
+calls a hidden widget less often); and with **no sensor configured the feature costs
+nothing at all** — no memory, no per-cycle work. `menu ▸ Status ▸ Live monitor` shows
+whether the recorder is actually running and how much of the 60 s ring is filled.
+
 > **Duplicate / renamed sensors.** UltiDash reads its known sensors by their Rotorflight
 > **sensor ID**, so it is immune to duplicate names (a leftover native CRSF `Curr`/`Capa`/… next
 > to the custom-telemetry one) and to renaming a known sensor on the radio. After moving a
@@ -232,7 +334,9 @@ defaults* reverts the whole scheme.
 
 Overrides are stored **per model** in the cfg file (§2.8) as `Clr<scheme><role>=0xRRGGBB`
 keys — only for colors you actually changed; everything else follows the built-ins (and, on
-the EdgeTX-theme scheme, the active radio theme). Colors apply on the next rebuild after
+the EdgeTX-theme scheme, the active radio theme). That is no longer a colour speciality: the
+cfg file stores *any* setting only while its value differs from the default, and a color put
+back on **Def** simply loses its line again (§2.8). Colors apply on the next rebuild after
 leaving the settings (autosave as usual).
 
 > Upgrading from v0.5.x: the *Color scheme* list order changed (dark is now slot 2, EdgeTX
@@ -256,7 +360,7 @@ leaving the settings (autosave as usual).
 | **Full cell (manual)** | num | 4.12 V | only used when *Manual* |
 | **Low cell (manual)** | num | 3.45 V | only used when *Manual* |
 | **Critical cell (manual)** | num | 3.30 V | only used when *Manual* |
-| **Cell-check delay (s)** | num | 4 | duration of the startup cell-check |
+| **Cell-check delay (s)** | num | 4 | duration of the startup cell-check. The verdict waits for a reading that belongs to **this** pack: while the voltage is still the previous pack's, or while no per-cell value exists yet (the FC's cell count has not arrived), the grey bar keeps running and the delay restarts — for at most **30 s**, after which the check decides on what it has |
 | **Announce voltage as** | choice | Battery | voice: **Battery** (total pack, PREC1) / **Cell** (per-cell, PREC2) — for the voltage alert + cell check |
 | **Current sensor** | choice | Curr | which sensor feeds the Current row, ESC load and current min/max (see *Data sources* below) |
 
@@ -418,20 +522,47 @@ Without it, callouts simply use the radio volume and the two sliders do nothing.
 ### 2.6a Settings — Alerts (per-alert pages)
 
 **Alerts** is a submenu: a **Voice / mute** page plus **one page per alert**, so every
-alert is configured in one place. Each alert's button shows its state at a glance:
-**On/Off** plus compact feature markers — **+R** repeat, **+E** escalation volume,
-**+V** vibrate, **+O** fullscreen overlay (a legend sits under the grid; only markers
-that are actually *effective* appear, e.g. **+E** needs the master-volume GVAR). Every
-alert page opens with a one-line summary of **when the alert fires**.
+alert is configured in one place. Every alert page opens with a one-line summary of **when
+the alert fires**.
+
+**The list is a column of cards, and it scrolls** (0.8.0 — it used to be a two-column tile
+grid). One card per page: the **name** on the first line, and on the second the alert's state
+as glyphs together with the values it is actually working with.
+
+| On the second line | Means |
+|---|---|
+| **bell** | the alert is on |
+| **struck bell** | it is off — the card **dims but still opens**; its page is where you switch it back on |
+| **loop** + `3x 5s`, `inf 5s` | *Repeat* is on, with its count and interval; `inf` = repeat until the condition clears |
+| **vibration mark** | *Vibrate* is on |
+| **loudspeaker** | *Escalation volume* is on — drawn only where it is effective (it needs the master-volume GVAR, §2.6) |
+| **overlay mark** | *Fullscreen overlay* is on — only on the alerts that offer one |
+
+The value beside the glyphs is read from **the same settings the alert itself reads**, so it
+cannot disagree with what the alert does: the fuel reserve, announce start and step; the extra
+voltage levels and their hold; the link and RSSI warn/crit pairs; the power threshold with the
+source it uses; the BEC drops; the ESC and MCU temperature steps; the skipped-packet limit. Two
+cards say why there is no number of yours to show — **Cell check** reads *"thresholds from FC
+config"* unless *Cell thresholds from* is set to *Manual* (§2.4), and **ESC load** reads
+*"monitoring off"* until both the monitor and its GVAR are set up (§2.5a) — and the alerts
+that have no threshold at all (*Armed / disarm*, *Telemetry*) say **"no threshold"**. A value
+the widget does not have yet shows as `-` rather than a number that would only be a guess. The
+**Voice / mute** card carries the two master switches on the same bell and vibration glyphs,
+plus the voice language in force.
+
+> **Gone with the grid (0.8.0):** the **+R / +E / +V / +O** text markers and the legend row
+> that explained them. The glyphs are the legend, and the numbers that used to be one page
+> deeper are on the card.
 
 **Voice / mute**
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
-| **Voice language** | choice | English | English / Deutsch — picks the `/SOUNDS/<lang>/ultidash/` voice pack (spoken numbers/units still follow the radio's system language) |
+| **Voice language** | choice | English | English / Deutsch — picks the `/SOUNDS/<lang>/ultidash/` voice pack (spoken numbers/units still follow the radio's system language). **Deutsch needs the separate voice-pack download**; without those files the callouts are simply silent |
 | **Mute (master)** | choice | None | None / **All** silences every **voice** callout (audio only) |
 | **Vibration (master)** | bool | on | master switch for **haptic** feedback, independent of *Mute* — turn off to stop all vibration while keeping (or muting) sound separately |
 | **Overlay auto-close (s)** | num | until tapped | shared timer for the **fullscreen alert overlay** (below): >0 = the overlay closes itself after that many seconds; 0 = it stays until tapped or the condition clears. The timer counts from the episode's **start** — also while a menu or detail page covers the overlay |
+| **Config warning overlay** | bool | **on** | shows a **misconfiguration** in the same red box, in words you can act on. Today one message: the ELRS module's link rate and telemetry ratio against what the flight controller was told (§3.6a) — both sides, what the difference does, and the two values to set. **Disarmed only**, and only after a link connect actually measured one; the three alert overlays above always take precedence. Closed with the **X** in its corner, and it does not come back until the next connect |
 | **Test callout** | button | — | *Play* previews a callout in the **currently selected (unsaved)** language |
 
 **Per-alert pages** — Fuel, Voltage, Cell check, Armed / disarm, Telemetry, Link quality,
@@ -446,7 +577,10 @@ page has the same rows:
 | **Repeat interval (s)** | num | spacing between repeats |
 | **Escalation volume** | bool | while this alert is active, boost the GVAR master volume to *Escalation volume (%)* (§2.6 — GVAR world only). **Not shown on Cell check / Armed-disarm** (one-shot alerts with no escalation) |
 | **Vibrate** | bool | haptic pulse with this alert |
-| **Fullscreen overlay** | bool | **only on Main power lost / Voltage / Telemetry** (default off): while the alert is active, an unmissable red inset box covers the flight/stats view — big alert title plus the live value (buffer/BEC voltage, cell voltage). A tap dismisses it for this episode; *Overlay auto-close* (Voice / mute page) can close it by itself. It reappears only when the condition clears and fires again; the Voltage overlay covers the **critical** level only |
+| **Fullscreen overlay** | bool | **only on Main power lost / Voltage / Telemetry** (default off): while the alert is active, an unmissable red inset box covers the flight/stats view — big alert title plus the live value (buffer/BEC voltage, cell voltage). **The X in the box's top-right corner closes it, and nothing else does** — a tap elsewhere on the box is swallowed and ignored, so a mis-tap cannot throw the warning away before it has been read (0.8.0; the tap-anywhere it replaces is the same change the detail pages got). *Overlay auto-close* (Voice / mute page) can still close it by itself. It reappears only when the condition clears and fires again; the Voltage overlay covers the **critical** level only |
+
+The same box carries one message that is **not** an alert — see *Config warning overlay*
+below.
 | **Test callout** | button | *Play* previews **this alert's** real announcement (with a sample number where the live callout speaks one; voltage alerts follow *Announce voltage as*) using the current, unsaved language/volume/mute — works even while the alert is off, so you can hear it before enabling |
 
 Rows that depend on another setting (e.g. *Repeat count* / *Repeat interval* when *Repeat* is
@@ -509,6 +643,29 @@ of arming is taken as the silent baseline (no announcement for it). Honors *Mute
 callout volume like every other callout. Disarmed, the feature is silent and re-baselines,
 so it never fires on a state that was already there when you arm.
 
+### 2.7-say Settings — Telemetry report (spoken)
+
+Your **own telemetry readout, on demand**: up to eight sensors, spoken **in the configured
+order**, triggered by a **shortcut switch** — bind any position or toggle slot (§2.7c) to
+the target *Voice: Telemetry report*. A momentary press speaks one report; a **held
+position slot repeats** it at the configured interval. It **may speak in flight** — alerts
+keep precedence (below).
+
+| Setting | Type | Default | Notes |
+|---------|------|---------|-------|
+| **Slot 1…8** | sensor | Voltage (auto), Headspeed, Current, ESC Temp, BEC, Link Qual, Off, Off | the sensors, spoken in this order (~2 s each). An empty/off slot is skipped; a sensor with no value is skipped too (with a debug-log line) |
+| **Repeat (switch held)** | num | 30 s | 10–120 s, counted from the report's **start**. The 10 s floor is functional: eight slots run ~15–20 s — but see *Speak sensor names*, which roughly doubles that, so with names on pick an interval to match |
+| **When an alert speaks** | choice | Report stops | or *Report pauses* — the report stands back and resumes after the alert. Either way an alert is never delayed by the report |
+| **Speak sensor names** | bool | Off | opt-in: speak each sensor's name before its value, from `SOUNDS/<lang>/ultidash/s_<sensor>.wav` (lowercased sensor name, `%`→`pct`, `#`→`n`: `s_vbat.wav`, `s_batpct.wav`). **A missing file falls back to value-and-unit, never to silence** — *menu ▸ Status ▸ Report name wavs* counts the coverage. The **whole sensor catalogue ships recorded**, 62 clips per language in **English and German** (same voices as the governor callouts); a name averages **1.8 s (EN) / 1.9 s (DE)**, which is what roughly doubles the report's length |
+
+*Voltage (auto)* speaks exactly like the voltage alert (latched value, in the format the
+*Announce voltage as* setting selects). Honors *Mute* and the callout volume like every
+other callout.
+
+The name recordings are generated from the sensor catalogue, and their coverage is checked
+against `SENSOR_INFO` in the source rather than against a list of its own — so a sensor added
+without a recording is caught before it can turn the report quiet on the radio.
+
 ### 2.7a Settings — General
 
 Meta settings: diagnostics, flight log and battery behaviour.
@@ -523,6 +680,7 @@ Meta settings: diagnostics, flight log and battery behaviour.
 | **Min. flight time** | num | 30 s | 0–300 s — shorter arm cycles are not a flight (0 = log every arm) |
 | **Ask battery on connect** | bool | off | battery query page after a fresh connect (needs `fltlog/batteries.cfg`, see §12) |
 | **Battery sets FC profile** | bool | off | selecting a battery activates the matching FC battery profile — by capacity, or an explicit `profile=` override (MSP, disarmed) |
+| **Reset to defaults** | button | — | *Reset* (with confirmation) puts **every** setting of this model back to its default — the whole-model reset, which until 0.8.0 sat as a button under the settings grid (§2.2). It also drops this page's unsaved edits and returns to the settings menu; the settings file is left holding nothing but its bookkeeping stamps (§2.8) |
 
 ### 2.7b Settings — Toolbox
 
@@ -530,7 +688,7 @@ The Toolbox embeds the **RF Adjustment Map / Editor** tool pages (view and touch
 Rotorflight adjustment functions from the radio). Full setup — model prerequisites,
 channels, GVAR pulse, labels — in **[TOOLBOX.md](TOOLBOX.md)**.
 
-The Toolbox submenu additionally hosts four zero-config, **disarmed-only** tool pages
+The Toolbox submenu additionally hosts five zero-config, **disarmed-only** tool pages
 (no settings below apply to them): the **Flight Log** viewer (recent flights, per-model
 totals and battery usage from the flight log — see §12), the **Log Viewer** (graphs EdgeTX telemetry logs
 from `/LOGS/*.csv` — swipe-scroll the file list, then pick a built-in template or one of
@@ -542,8 +700,19 @@ controller's active battery profile — the same page the dashboard's *B-Profile
 opens, so it stays reachable with a layout that has no such field; it is the one page that
 writes to the FC, and it needs a live MSP connection).
 
+One more tool is deliberately **not** disarmed-only: the **Live Monitor** (up to 4 sensors
+as live min/max curves of the last 15–60 s, §2.3b) — reading it *in flight* is its purpose,
+so like the two adjustment tools it opens armed and is exempt from the arm-close. It reads
+EdgeTX telemetry sources only; no MSP.
+
 Opening a Toolbox tool by switch moved to the **Shortcuts** group (§2.7c) — a shortcut can
 now open *Adjust Map*, *Adjust Edit*, *Log Viewer* or *RF2 Config* like any other page.
+
+The **Log Viewer has a second entry point** outside the widget: EdgeTX's own **SYS ▸ Apps ▸
+UltiDash Log Viewer** (`SCRIPTS/TOOLS/udlogview.lua`), which launches the very same module
+with the same templates. It needs UltiDash installed on the card, and — unlike the Toolbox
+entry — it has no arm-close, because EdgeTX suspends the widget for as long as any Tools
+script runs. See [TOOLBOX.md](TOOLBOX.md) §8.
 
 | Setting | Type | Default | Notes |
 |---------|------|---------|-------|
@@ -554,21 +723,25 @@ now open *Adjust Map*, *Adjust Edit*, *Log Viewer* or *RF2 Config* like any othe
 | **Adj value divider** | num | 1 | display divider for the value channel |
 | **Adj editor: ranges hint** | bool | off | show the recommended-range hint in the editor |
 | **Toolbox sunlight mode** | bool | off | high-contrast toolbox palette |
-| **Announce bank (voice)** | bool | on | speak "bank" + number when the adjustment bank changes |
+| **Announce bank (voice)** | bool | on | speak "bank" + number when the adjustment bank changes — debounced: a bank must hold 0.3 s and two announcements stay 1.5 s apart, so a sweep speaks only its destination |
 
 ### 2.7c Settings — Shortcuts
 
 Bind switches to pages, hands-free. Any target below can be a **detail page** (ELRS /
-Status log / Battery / Telemetry) or a **Toolbox tool** (Adjust Map / Adjust Edit / Log
-Viewer / RF2 Config / Flight Log / FC battery profile). Detail targets open only over the
-flight view; the disarmed-only tools (Log Viewer, RF2 Config, Flight Log, FC battery
-profile) refuse to open while armed. *FC battery profile* additionally needs a live MSP
-connection — it is the one page that writes to the flight controller — and re-reads the
-profile before it opens.
+Status log / Battery / Telemetry), a **Toolbox tool** (Adjust Map / Adjust Edit / Log
+Viewer / RF2 Config / Flight Log / FC battery profile / Live Monitor — the last one opens
+**armed too**, like the adjust tools), the **spoken telemetry report**
+(*Voice: Telemetry report*, §2.7-say — no page: it speaks, armed included, and a held
+position slot repeats it) or the **menu** (*Page: Menu / settings* — opens the settings
+hub on exactly the menu glyph's own condition: refused only while genuinely flying).
+Detail targets open only over the flight view; the disarmed-only tools (Log Viewer,
+RF2 Config, Flight Log, FC battery profile) refuse to open while armed. *FC battery
+profile* additionally needs a live MSP connection — it is the one page that writes to the
+flight controller — and re-reads the profile before it opens.
 **Every** target opens only while the widget is **fullscreen** (both the detail pages and
 the tools are fullscreen pages) — a switch held while not fullscreen opens as soon as you
 enter fullscreen. In a widget-grid zone a detail page would have no way out: a zone gets no
-touch, so its *tap anywhere to close* hint is dead. Throwing a bound switch while **not**
+touch, so its close button cannot be pressed. Throwing a bound switch while **not**
 fullscreen therefore does nothing — and says so: the dashboard shows a brief
 **"Shortcut needs Full screen"** banner, because in a zone there is no menu glyph to ask and
 a silently dead switch is indistinguishable from a broken setting.
@@ -700,6 +873,22 @@ SD card and overlay the (effectively empty) EdgeTX option list at runtime.
 - Defaults come from the settings tables above; a missing file simply means defaults.
   A value that is corrupt or the wrong type in the file (hand-edited, damaged) falls
   back to its default instead of causing an error.
+- **Only what you changed is stored.** The file holds a line for every setting whose value
+  differs from its default, and nothing else beyond three bookkeeping stamps
+  (`ClrSchemeV`, `ModelFile`, `SkinsSeen`). Put a setting back to its default and its line
+  leaves the file on the next save. A file written in full by an earlier version **compacts
+  page by page**: a save rewrites the settings of the page you were on and leaves every other
+  line alone, so the redundant lines go as you visit the pages they belong to, and a full-size
+  file may stay full-size for a long time. Nothing waits on that, because a line holding a
+  default value and no line at all are the same state, and *Reset to defaults* clears the
+  whole file in one step whenever you want it gone. A key that is **not** in the file means the
+  default for that key, exactly as a missing file means the defaults for all of them — so
+  *"never touched"* and *"set to the default"* are one and the same state, and *Reset to
+  defaults* writes a file that is nothing but the stamps. This has a consequence worth
+  knowing: if a later UltiDash version changes a default, that new default applies to every
+  setting you never touched, because nothing is stored to hold the old value in place. It
+  was always how colour overrides behaved (§2.3b); since 0.8.0 it is how every setting
+  behaves.
 - **Unknown keys are dropped on save:** a key the current version doesn't know (a typo,
   or one left behind by a different version) is removed the next time the file is
   written. Downgrading to an older UltiDash therefore loses the newer version's
@@ -711,7 +900,11 @@ SD card and overlay the (effectively empty) EdgeTX option list at runtime.
 - **Orphaned files are harmless.** Deleting a model, or renaming it, leaves its `cfg_m_*.cfg`
   behind in `cfg/`, and rotated `debug_NN.log` files accumulate in `logs/`. UltiDash never
   auto-deletes them; they do no harm. Delete them from `/WIDGETS/UltiDash/cfg/` or `…/logs/`
-  on a PC if you like — UltiDash recreates what it needs.
+  on a PC if you like — UltiDash recreates what it needs. The same goes for a stray
+  `cfg_m_*.cfg.new`: saves are written there first and renamed into place only after a size
+  check, so switching the radio off mid-save leaves that leftover beside an intact config —
+  never a half-written config. Nothing ever reads a `.new` file and the next save overwrites
+  it.
 
 ---
 
@@ -731,8 +924,18 @@ tap-to-open **detail pages**, the **battery-profile picker** and the **settings 
 > **"Armed this connection":** stats only appears after the craft was **armed during the
 > current connection**. The has-flown flag resets on every fresh connect, so a stats page
 > from an earlier flight doesn't reappear on a new connection that never armed.
-> **Manual dismiss:** tapping anywhere on the stats page (full-screen) returns to the
-> flight view; it reappears with the next arm / reconnect cycle.
+> **Manual dismiss (changed in 0.8.0):** the stats page carries an **X** in the top bar,
+> left of the radio-battery pill; tapping it (full-screen) returns to the flight view, and
+> it reappears with the next arm / reconnect cycle. Until 0.7.1 a tap **anywhere** did
+> this, with nothing on the page saying so — which also meant any fumbled touch while you
+> were reading the page threw it away. A tap that hits nothing now does nothing.
+
+**Manual open (new in 0.8.0):** tapping the **status panel** (the left card with the
+flight counter and total time — anywhere outside its status line, which opens the Status
+log) opens the statistics page **on demand, disarmed only** — and it does so **whatever
+*Stats page* says**: *Never* governs only the automatic route, a deliberate tap is a
+second, manual one. Close it with the **X** as usual; the next arm retires a tap-open
+like it retires a manual dismiss.
 
 ### 3.2 Flight view
 
@@ -833,8 +1036,8 @@ Flight Time / Flights" (cumulative, from the FC via MSP).
 
 ### 3.4 Detail pages (tap a panel, full-screen)
 
-Tap-zones are gated by *Display → Tap zones for detail pages*. Close with a tap anywhere,
-**RTN**, or (optionally) by arming. A configured **Shortcut** switch (§2.7c) opens/closes a
+Tap-zones are gated by *Display → Tap zones for detail pages*. **Close with the X in the
+top-right corner**, **RTN**, or (optionally) by arming. A configured **Shortcut** switch (§2.7c) opens/closes a
 chosen page hands-free — independently of the tap zones (so it works even with them off); it
 closes only the page it opened, and *Close detail pages on arm* still applies. The whole
 telemetry/alert engine keeps running while a detail page is open — you can watch the ELRS
@@ -851,16 +1054,26 @@ detail in flight without losing callouts.
   budget light.)*
 - **ELRS link** (tap the top-bar bars): seven labelled bars — **RQ, TQ, 1RSS, 2RSS, TRSS,
   SNR, TPWR** — with reactive threshold ticks and values; the rate/mode header; footer with
-  active antenna and session RQ-min. **TRSS** is the **downlink RSSI** (measured at the TX
+  the **antenna pair**, the transmitter module's antenna mode and the session RQ-min. **TRSS**
+  is the **downlink RSSI** (measured at the TX
   module) — it separates downlink issues (telemetry dropouts, module antenna, too-low
   telemetry ratio) from uplink/control ones; its bar uses the same rate floor as the uplink
   RSSI. The **SNR** value shows uplink / downlink combined (e.g. "8 / 5dB") while the bar
   tracks the uplink; in **FLRC and FSK/Kernel** modes the radio chip reports SNR as a
   constant 0, so the value and bar read
   "-". **Diversity** is reported only once the data proves a second antenna (2RSS live, or the
-  antenna field actually switching) and latched for the session — a single-antenna receiver
-  reads "Diversity: no". *(On a Gemini/GemX dual-band receiver 1RSS is the 900 MHz path, 2RSS
-  the 2.4 GHz path — "yes" is correct there.)* TPWR is inverted (high power = working hard)
+  antenna field actually switching) and latched for the session. Since 0.8.0 the footer draws
+  it as **two antenna symbols** instead of the words "Diversity: yes/no" beside "Ant 1": a
+  **filled head on a mast** means that antenna is there, the one currently carrying the link
+  (the `ANT` sensor) is **green and drawn radiating**, and a **hollow, dimmed** second antenna
+  means the receiver has only one. *(On a Gemini/GemX dual-band receiver 1RSS is the 900 MHz path, 2RSS the 2.4 GHz path —
+  two filled antennas are correct there.)* Beside them the footer names the **antenna mode of
+  the ExpressLRS transmitter module** — *Gemini*, *Ant 1*, *Ant 2*, *Switch* — read from the
+  module itself by the once-per-connect configuration scan (§ *menu ▸ ELRS Status*). It is the
+  **transmitter's** setting, while the antennas beside it are the **receiver's**; a module that
+  does not have the setting at all (any single-radio 2.4 GHz module never registers the field)
+  shows nothing there rather than a permanent dash, which would read as a failed read.
+  TPWR is inverted (high power = working hard)
   relative to *Thresholds ▸ TX power limit* (shows a hint until that is set).
 - **Status & events** (tap the ESC/status line): a bordered **status card** — arm state /
   governor / throttle, the ESC status and the arming status including the **full
@@ -874,11 +1087,39 @@ detail in flight without losing callouts.
   cannot know it at runtime, so the build tooling writes it onto the card as an extra
   `WIDGETS/UltiDash/build.lua`; a `+` after it means the build came from an uncommitted
   working tree. **A release card has no such file** and the row shows the version alone.
-  Under it, a **Config file** row names the `cfg_m_*.cfg` this radio is actually reading and
+  Under it, a **Craft target** row names the firmware this instance was placed for (§2.1) —
+  *Rotorflight*, and with a connected craft on which no Rotorflight sensor was recognised at
+  all, *"(no Rotorflight sensors found)"* beside it.
+  Then a **Config file** row names the `cfg_m_*.cfg` this radio is actually reading and
   writing — the question §2.8 leaves open once a connected craft can rename the model. Two
   markers may follow the file name: **(found)** means the lookup by name missed and this file
   was located by its model-file stamp, i.e. the model is wearing a craft name right now;
   **(! model7)** means the file found by name says it belongs to another model.
+  An **MSP provider** row names **who is answering the flight controller for this radio**
+  (§8). *RFTool* is the normal case. *RFTool  (RFSuite also seen)* means both config suites
+  are loaded — UltiDash keeps to RFTool and says so, because both would master the radio's
+  single CRSF transmit slot. *RFSuite service v1 (active)* is the second provider serving;
+  **(idle)** is the same surface with nobody driving it, which is the one case where the FC
+  rows below stay empty and nothing else looks wrong. *RFSuite (no API)* is an RFSuite
+  install that publishes no consumer surface — for UltiDash that is the same as none.
+  *RFSuite service (no back end)* is the opposite and is **UltiDash's own fault**: the
+  service is there and `WIDGETS/UltiDash/ultidashRfs.lua` did not reach the card — re-deploy.
+  The row exists so that "why is there no FC data" has an answer on screen.
+  A **Flight controller** section below that carries what the FC itself is configured for,
+  read over MSP at connect and never shown on the dashboard (it is configuration — it cannot
+  change while you fly): **Meters V / I** (the voltage and current meter sources; a current
+  meter of *None* is one of the conditions under which a SmartFuel percentage cannot move),
+  **FC fuel warn (info)** — the flight controller's own consumption warning, shown **to
+  compare** with your own fuel thresholds and never used to drive a callout — **LVC / cell
+  max**, the **governor** mode with its spool-up / start-up / handover figures and its
+  throttle block, **Telemetry** (the craft's CRSF mode and how many of the 40 slots it fills),
+  **SmartFuel** and **ESC protocol**. A row reads `-` when the flight controller has not been
+  asked yet, or when the value does not exist on that firmware version.
+  **Adjust table** names the source the two Toolbox adjust tools are **actually** using:
+  `manual`, or `FC - N slots` once the craft's own adjustment table has been read
+  (*Settings ▸ Toolbox ▸ Adj table from*). The option can say FC while a failed or
+  not-yet-run read leaves the manual table in force — this row is where that state is
+  visible, since the tools themselves fall back silently rather than showing an empty grid.
 - **Battery** (tap the gauge): a **cell-voltage scale** with the active crit/low/full
   thresholds marked (and whether they come from FC or manual), then the battery in the
   dashboard segment look with % and used mAh inside it, and a Batt / Cell-min / Reserve
@@ -896,9 +1137,11 @@ profile on the FC**.
 
 > ⚠️ **This is the only place UltiDash *writes* to the flight controller.** It is therefore
 > gated to **disarmed** (the picker won't open armed, and the FC also rejects config writes
-> while armed). The switch goes through the RFTool MSP API — `mspBatteryProfile.write`
-> (MSP 176, the same call the RFTool's own battery page uses) — and persists **without an
-> FC reboot** (`settingsSaved(true, false)`). The picker re-reads the FC's current profile
+> while armed). The switch is **MSP 176**, the same call the RFTool's own battery page uses,
+> and persists **without an FC reboot** (an EEPROM write with the reboot flag off). It goes
+> through whichever MSP provider is serving (§8) — `mspBatteryProfile.write` +
+> `settingsSaved(true, false)` under RFTool, MSP 176 followed by MSP 250 under the RFSuite
+> service, which is the same two messages written out. The picker re-reads the FC's current profile
 > fresh on open, so it reflects external profile switches too. Everything else in UltiDash
 > stays **read/announce-only**.
 
@@ -907,8 +1150,8 @@ profile on the FC**.
 A read-only page that evaluates the telemetry sensors UltiDash relies on and explains what a
 gap breaks. Each row: a **colored status badge** — green **OK** (present, live data), gray
 **--** (discovered but no data right now — normal with the FC off), red/yellow **MISS**
-(never discovered) — the sensor's friendly name, and the sensor code at the right edge; a
-legend at the bottom explains the states. **While the FC is connected, the right column also
+(never discovered), red/yellow **N/S** (*not sent* — see below) — the sensor's friendly name,
+and the sensor code at the right edge; a legend at the bottom explains the states. **While the FC is connected, the right column also
 shows each sensor's live value** (updated 1 Hz), making the page a quick diagnostic view. It
 resolves sensors by their Rotorflight sensor ID (immune to duplicates/renames), with a name
 fallback for the ELRS / decoder sensors that carry no ID. The scan runs only while the page
@@ -917,7 +1160,8 @@ is open (≤ 1 Hz) — no cost in normal use, no MSP.
 - **Required** (RFTool running · RF2 telemetry discovered · ARM · Vbat · Bat% · Cel# · Vcel ·
   Hspd · Gov · RQly): a MISS here is **red** and counts in the summary ("N required sensor(s)
   missing"), with a one-line note on what it breaks. If the RF2 custom telemetry was never
-  discovered, the hint points you to *Discover new sensors* (with the FC powered).
+  discovered, the hint points you to *Discover new sensors* (with the FC powered) — and if that
+  finds nothing, to §6.2.
 - **Active features**: only the sensors used by whatever you have enabled (current source, BEC
   alert, RSSI, skipped-packet alert, temperature alert, ESC / arming decoders, profile line,
   uplink / TX power). A MISS here is a **yellow** advisory (except the current source, which is
@@ -926,7 +1170,95 @@ is open (≤ 1 Hz) — no cost in normal use, no MSP.
   sensor or an orphaned slot.
 
 When the FC is disconnected the page adds a "FC not connected — showing discovered state only"
-line and shows discovered-but-dataless sensors as **--** (not an error).
+line and shows discovered-but-dataless sensors as **--** (not an error). In its place, a
+connected craft on which **no** Rotorflight sensor was recognised at all gets the craft-target
+cross-check line — *"No Rotorflight sensors found"* — see §2.1 for what it does and does not
+claim.
+
+**N/S — the flight controller does not send this row.** A sensor can exist on the radio and
+still never be transmitted: your craft's `telemetry_sensors` names at most 40 rows, and a
+sensor that was discovered once and later dropped from that list keeps its place in the model
+and reads a constant **0**. EdgeTX serves that 0 like any other reading, so such a row used to
+show a green *OK 0.0* — worst exactly where 0 is also a legitimate value (ESC faults, arming
+flags, governor state). UltiDash now reads the flight controller's own slot list and marks
+those rows **N/S**; a *required* one counts in the summary line, which then reads "N required
+sensor(s) missing or not sent". The fix is on the flight controller — put the row back into
+`telemetry_sensors` — after which the radio may need *Discover new sensors* again, and §6.2
+if that turns up nothing.
+
+### 3.6a ELRS Status (menu ▸ ELRS Status) — **experimental**
+
+A read-only page showing what the **ExpressLRS transmitter module** is configured to, and
+holding it against what the **flight controller** was told the link carries. No telemetry
+sensor reports any of this: it is read out of the module itself over CRSF, the same
+parameter conversation the stock `elrs.lua` tool script has.
+
+| Section | Rows |
+|---------|------|
+| **TX module** | module name, firmware version, the build **commit**, and the state of the last read |
+| **Link configuration** | RF band (dual-band modules), packet rate, **link rate**, telemetry ratio, antenna mode, switch mode, link mode, model match, max power, dynamic power |
+| **Flight controller expects** | the FC's `crsf_telemetry_link_rate` / `_link_ratio`, its telemetry mode and slot count, and a **rate/ratio match** verdict |
+
+**Why the last section exists.** The flight controller's rate and ratio are a *declaration*,
+not a measurement — Rotorflight turns them into the token bucket that paces every telemetry
+frame it emits, and nothing checks them against the real link. Declared faster than the link
+is (the default 250 Hz / 1:8 against, say, 150 Hz / 1:32) and the FC schedules several times
+what the link drains: backlog, dropped frames, values that are stale rather than absent.
+Declared slower and the bandwidth is simply unused. Both feel like *"telemetry is laggy"* and
+neither raises an error. The verdict row reads **ok**, **MISMATCH** or **TELEM OFF**, and
+stays `-` unless both sides are known. Since 0.8.0 the same verdict also raises the
+**config warning overlay** on the dashboard (§2.6a) — the page is where you look it up, the
+overlay is what tells you to.
+
+**What is actually compared — and it is not the two numbers.** The flight controller only
+ever sees the *quotient*: it refills a bucket at `rate ÷ ratio` telemetry slots per second
+and spends slots per frame. ExpressLRS sizes its own telemetry bandwidth the same way. So a
+module on **500 Hz 1:16** against an FC told **250 Hz / 1:8** is **correct** — same 31.25
+slots per second — and comparing the pairs for equality (which is what this page did before
+0.8.0) called it a mismatch. The comparison is the slot rate.
+
+**The link rate row, and why a packet rate can lie.** The rate the module *displays* is not
+always the rate the link *runs at*, and the FC has to be told the latter. The **DVDA** rates
+repeat every packet two to four times and keep the fast send interval:
+
+| Module shows | Packets/s on the link |
+|---|---|
+| `F500` / `F1000` | 500 / 1000 |
+| `D500` | **1000** |
+| `D250` | **1000** |
+| `D50Hz` (900 MHz) | **200** |
+| everything else (`150Hz`, `333Hz Full`, …) | the number in the name |
+
+**The firmware row, and why it used to show a bare hash.** ExpressLRS registers its version
+as `{version_domain, CRSF_INFO}, commit` — so the field's **name** carries the version and the
+frequency domain (`4.1.0 ISM2G4`, at most 26 characters) and its **value** is only the short
+build commit. Until 0.8.0 UltiDash read the value, which is why *Firmware* showed something
+like `4eafzt` where a version belongs. They are now two rows: *Firmware* is the version,
+*Commit* the hash, kept because it is what a bug report needs.
+
+The *Link rate* row shows the value the verdict actually used, so a `D500` module reading
+`1000 Hz` there is right, not a display bug. A rate name UltiDash does not know reads `-`,
+and then **no verdict is given at all** — an invented rate would send you off to change a
+setting that was correct.
+
+**When it reads.** Once per link **connect**, **disarmed only** — never on opening the page,
+never on a timer. Each request the read makes replaces one RC channel frame on the way to the
+module, so the scan is paced at one request per background pass, skips the remainder of any
+field it will not keep after the first chunk named it, and jumps straight to the last field
+(the firmware version) once everything else is in — a few seconds for a typical module — and
+is aborted if the craft arms, keeping whatever it already has. The **RF band** row appears
+only when the module registers the parameter (dual-band LR1121 hardware); other absent values
+read `-`. On ExpressLRS 4.x the firmware manages the antenna mode itself, so the value shown
+is the *effective* one, not necessarily the one you picked.
+
+Two limits, both deliberate:
+
+- **NATIVE CRSF telemetry makes no claim at all.** In `crsf_telemetry_mode = NATIVE` the
+  firmware sends a fixed legacy set and ignores `telemetry_sensors` completely, so there is
+  nothing to compare a row against and every row keeps its old badge. The *Telemetry* row on
+  the Status page names the mode.
+- **The list is read once per connect.** Change a telemetry setting without rebooting the
+  flight controller and the page shows the previous list until the next connect.
 
 ---
 
@@ -965,7 +1297,8 @@ voice + spoken total voltage.
 ## 5. Voice callouts & vibration
 
 All outputs are UltiDash's own WAVs in `/SOUNDS/en/ultidash/` or `/SOUNDS/de/ultidash/`
-(*Voice language*; spoken numbers/units come from the EdgeTX voice pack). Every alert has
+(*Voice language*; spoken numbers/units come from the EdgeTX voice pack). English ships with
+the widget, **German is a separate download** — see §8. Every alert has
 its own page (§2.6a) with Active / Repeat / Vibrate / Escalation; `Mute = All` overrides
 everything.
 
@@ -1124,6 +1457,32 @@ that shows `—`/no value**, and turn **"Discover new sensors" off** so they are
 The in-widget **Sensor check** page (menu) lists the sensors UltiDash needs and flags
 anything missing or data-less, so you can see at a glance whether a clean-up is worthwhile.
 
+### 6.2 *Discover new sensors* finds nothing — discovery is off, or the list is full
+
+EdgeTX creates a telemetry sensor only while *Discover new sensors* is **on**, and a model's
+list is capped at **60 sensors** on the radios UltiDash targets. When that cap is reached the
+radio turns the switch **off by itself and says nothing about it** — the *telemetry full*
+warning EdgeTX carries is compiled for the monochrome radios only. From the outside the two
+causes are therefore indistinguishable: discovery was off, or discovery was on and the list
+was full.
+
+The consequence is the one that bites during setup: **adding rows to the craft's
+`telemetry_sensors` and running *Discover new sensors* again can produce nothing at all** — no
+new entry, no error — while the flight controller demonstrably transmits them and the **Sensor
+check** page (§3.6) keeps calling them **MISS**. A Rotorflight craft (up to 40 rows) plus the
+ELRS link sensors plus the receiver's own empty defaults (§6.1) sits close to the cap, so this
+is the normal case rather than an exotic one.
+
+**The remedy is to clear the page and let it rebuild:** delete **every** sensor on the model's
+*Telemetry* page, switch *Discover new sensors* on, power the flight controller, and let the
+whole list be discovered in one pass.
+
+**What a rebuild costs.** Hand edits on that page go with it — a renamed sensor, a changed
+precision or ratio, a *Logs* flag — and EdgeTX's own telemetry screens address sensors by
+their slot, so those are worth a look afterwards. UltiDash itself is indifferent to the new
+order: it resolves its known sensors by Rotorflight **sensor ID** (§6.1), and a value slot you
+filled with a raw sensor **by name** keeps matching the same name.
+
 ---
 
 ## 7. ESC status decoder (eStatus)
@@ -1135,12 +1494,29 @@ signature. Supported vendors:
 |----------|-----------|
 | `0xA5` | OpenYGE / YGE |
 | `0x53` | Scorpion / Tribunus |
-| `0xFD` | HobbyWing Platinum/HW5 |
+| `0xFD` | HobbyWing Platinum/HW5 (this is what the CLI's `HOBBYWINGV5` selects — **not** `HW4`) |
 | `0x73` | FLYROTOR |
-| `0xD0` | OMP / OFW |
+| `0xD0` · `0xDD` · `0xA6` | OMP / OFW · ZTW · XDFly — **one protocol** since firmware 4.6.0 (same frame, different sync byte), so one decoder; ZTW contributes three extra throttle bits |
+| `0xA0` | APD (Advanced Power Drives) |
+| `0xC0` | Graupner |
+| `0x4B` | Kontronik |
 | `0xC8` | BLHeli_32 |
 | `0xFF` | "RESTART ESC" (special case) |
 | else | generic status code |
+
+**Three families send no status word at all** — `HW4` (`0x9B`), `BLHeli_32` (`0xC8`) and
+Castle (`0xCC`): their telemetry frames have no such field, so `EscF` stays `0` for the whole
+flight and a decoder for them cannot exist. What they report is therefore always "OK".
+
+**Everything above is decoded from the bit layouts the flight-controller firmware documents
+in `sensors/esc_sensor.c`, and proven against synthetic status words** in 44 cases.
+What that does **not** prove is the layouts
+themselves: no helicopter here runs a Kontronik, an APD, a Graupner, a ZTW or an XDFly, so
+those five decoders have never seen a real ESC.
+
+> **Fixed in 0.8.0 — a Scorpion throttle error read as "Scorpion ESC OK".** Bit 7 of the
+> Tribunus error word (throttle error) had no branch, so a real fault was reported as health.
+> Also new: the four OpenYGE braking states are named instead of showing a raw `Code x09`.
 
 Severity (text color): **Trace** (grey) · **Info** (theme) · **Warn** (yellow) · **Error** (red).
 The worst message is held until the next (re)connect; every status change is also logged
@@ -1191,8 +1567,21 @@ to the Status detail's event log.
 ## 8. Dependencies & behaviour
 
 - **No external libraries** – UltiDash loads only its own files (no `eLib`/`lib_common`).
-- **RFTool widget** must be present (`rf2` global) → connection state and MSP data. If
-  absent, the state stays "disconnected". **MSP is only read on connect/disarm, and the
+- **An MSP provider** must be present → connection state and MSP data. If none is, the state
+  stays "disconnected" and every FC-read row shows `-`. Two are supported and **menu ▸ Status
+  ▸ MSP provider** names the one in force (§3):
+  - **RFTool** (`rf2` global) — the shipping path, and the one the radio has proven.
+  - **RFSuite for EdgeTX** *(0.8.0, experimental)* — used only when its **MSP service**
+    (`rfsuite.msp`, consumer contract v1) is published **and RFTool is not there**. It fills
+    the same rows from the same MSP commands, and it is only ever *active* while something
+    on the radio is driving that suite's link; a published-but-undriven service reads
+    *(idle)* and UltiDash asks it nothing. An RFSuite install without the service surface
+    counts as no provider at all. **Untested against a flight controller** — treat it as
+    experimental, and keep RFTool installed if you want the proven path.
+  - **When both are loaded UltiDash uses RFTool**, by decision rather than by accident: the
+    radio has exactly one CRSF transmit slot and two MSP clients pushing into it lose each
+    other's replies. The Status row says the other one was seen.
+  **MSP is only read on connect/disarm, and the
   only MSP *write* is the battery-profile switch (§3.5), disarmed — never during armed
   flight.** The FC-read values (battery config / capacity / cell count, FC thresholds,
   governor mode) **survive a mid-flight telemetry blip**: they are cleared only on a
@@ -1202,7 +1591,10 @@ to the Status detail's event log.
   to 2 Hz while disconnected); touch is handled every cycle. The Status detail footer
   shows the live UI loop rate as a load indicator.
 - **Sounds** in `/SOUNDS/en/ultidash/` and `/SOUNDS/de/ultidash/` (own subfolders,
-  selected by *Voice language*). All shipped:
+  selected by *Voice language*). **English is in the main download; German is the separate
+  `-voice-de` addon zip** — the same catalogue, recorded in German, and needed only if you
+  switch the setting. A missing WAV is not an error in EdgeTX: the callout is simply silent.
+  All shipped, in both languages:
   - Battery: `batcrt`, `batlow`, `battry` · Arm: `armed`, `disarm`
   - Link/telemetry: `telem_lost`, `telem_ok`, `link_warn`, `link_crit`
   - Signal/RSSI: `rssi_warn`, `rssi_crit` · Packets: `skp_high`
@@ -1241,9 +1633,17 @@ to the Status detail's event log.
 - The **fullscreen alert overlay** (§2.6a) shows on the flight/stats views; while a
   detail page or menu is open the overlay waits underneath and reappears when that view
   closes — *Overlay auto-close* keeps counting from the episode's start meanwhile.
-  Tap-dismiss needs full-screen (touch rule above) — with the widget in a normal zone
-  the **first tap opens fullscreen** (that is EdgeTX's widget tap), a **second tap then
-  dismisses**; otherwise the overlay clears via auto-close or when the condition ends.
+- The **config warning overlay** uses the same box and is the **lowest** priority in it: a
+  live safety alert always wins, and it is suppressed entirely while armed. It is raised by
+  the ELRS link-configuration verdict (§3.6a), which is measured once per connect while
+  disarmed — so "once per connect" is what it shows, and the X silences it until the next
+  one.
+- **Closing is the X in the corner and nothing else** (0.8.0, both for the alert overlays and
+  for the config warning). A tap anywhere else on the box does nothing — but it is still
+  *swallowed*, so it cannot click through onto the tap zones the box is covering. Reaching the
+  X needs full-screen (touch rule above): with the widget in a normal zone the **first tap
+  opens fullscreen** (that is EdgeTX's own widget tap), and the X is hittable after that.
+  Without touch at all, the overlay clears via *Overlay auto-close* or when the condition ends.
 
 ---
 
@@ -1339,10 +1739,15 @@ The file **grows forever by design** — UltiDash never prunes it (a season of f
 a few hundred small lines). Archive or trim it on the PC whenever you like; the viewer
 (§12.4) lists the newest 300 flights either way.
 
-### 12.2 Battery registry (`fltlog/batteries.cfg`, PC-edited)
+### 12.2 Battery registry (`fltlog/batteries.cfg`, editable on the radio and on the PC)
 
-Start from the shipped, commented template: copy `fltlog/batteries.example.cfg` to
-`fltlog/batteries.cfg` and edit it. Only `batteries.cfg` is read, so a widget update
+Since 0.8.0 packs can be **created, edited and deleted on the radio**: from the Flight
+Log's *Batteries* tab (tap a pack → detail page → **Edit** / **Delete**; **+ New** in the
+header) and from the battery query's **+ New battery** button (§12.3). On the PC, start
+from the shipped, commented template: copy `fltlog/batteries.example.cfg` to
+`fltlog/batteries.cfg` and edit it — both routes work on the same file, and the radio's
+editor rewrites **only the edited pack's line** (comments, unknown fields and every other
+line survive byte-for-byte). Only `batteries.cfg` is read, so a widget update
 never overwrites your list. One battery per line, a leading `#` marks a comment line:
 
 ```
@@ -1358,12 +1763,28 @@ id=1;name=Tattu 6S 3700;cap=3700;models=Goblin 580,Logo 550;profile=2;cycles=0;l
 | `profile` | optional override: FC battery profile 1–6 activated on selection *instead of* the capacity match — only needed when capacities are ambiguous or not set in the FC (MSP write, disarmed only — same call as the profile picker §3.5; the write is deferred a moment after the pick, skipped when the profile is already active, and retried while rf2's MSP queue is still busy with the connect reads) |
 | `cycles`, `last` | maintained by the widget: +1 and the date **once per battery session**, on the first logged flight |
 
-The widget only rewrites the matched pack's `cycles`/`last` fields — comments and any
-extra fields you add survive. The update is **atomic**: the new content is written to a
+The widget only rewrites what it must — the cycle stamp touches the matched pack's
+`cycles`/`last` fields, the on-radio editor only the edited pack's line — comments and any
+extra fields you add survive. Every update is **atomic**: the new content is written to a
 temp file, size-verified, and only then swapped in — the previous version stays behind
 as `batteries.cfg.bak` (normal, not an error; a failed SD write leaves the original
-untouched and skips that cycle count). `id` must be **unique** — on duplicates the first
-entry wins and the rest are ignored.
+untouched). `id` must be **unique** — on duplicates the first
+entry wins and the rest are ignored, and the on-radio editor refuses to create one.
+
+Field rules, shared by both editing routes (the on-radio editor enforces them; keep to
+them on the PC too):
+
+- **`id`**: characters `A–Z a–z 0–9 _ -`, non-empty, unique. New packs are prefilled with
+  the smallest free positive integer; the field stays editable. **Renaming an id does not
+  rewrite `flights.csv`** — old flights keep the old id (the editor warns with the flight
+  count before renaming a pack that has logged flights).
+- **`name`**: free text without `;`, up to 24 characters; empty falls back to the id.
+- **Clearing an optional field removes it from the line**: capacity 0 = no `cap=` (the
+  query page shows *capacity ?*, no capacity match), profile *auto* = no `profile=` (match
+  by capacity as usual), models *All models* = no `models=` (offered for every model).
+- The on-radio editor refuses a registry **larger than 64 KiB** with a visible message
+  (*"batteries.cfg too large to edit on the radio"*) — a file that size must be tended on
+  the PC.
 
 ### 12.3 Battery query (`Ask battery on connect`)
 
@@ -1372,20 +1793,34 @@ selection page — **fullscreen only** (touch), disarmed, with nothing else on s
 no registry pack matches the model it silently never opens. Packs are listed in their
 `batteries.cfg` order — stable across connects, so the rows never shift when you rotate
 packs; **No battery / skip** (or RTN) continues without an id — flights
-still log with an empty battery column. The selection sticks until the disarmed unplug
-(a telemetry blip or a crash-retrieve-replug within ~2 min keeps it; arming closes the
-query window).
+still log with an empty battery column. **+ New battery** (below the skip button) opens
+the registry create form (§12.2) with *models* preset to the connected craft — for the
+moment an unknown pack is plugged in at the field; after Save the pick list reloads with
+the new pack at the end, Cancel returns unchanged. The selection sticks until the
+disarmed unplug (a telemetry blip or a crash-retrieve-replug within ~2 min keeps it;
+arming closes the query window, an open create form included — nothing is written).
 
-### 12.4 Toolbox ▸ Flight Log (viewer)
+### 12.4 Toolbox ▸ Flight Log (viewer & battery editor)
 
-Lazy-loaded, **disarmed-only** (auto-closes on arm). Three tabs, each with a column-header
-line and a totals/paging footer:
+Lazy-loaded, **disarmed-only** (auto-closes on arm; an open edit form is discarded,
+nothing written). Since 0.8.0 the page is drawn in the same detail-page style as the other
+Toolbox tools: title left, the three tabs as **chips** in the header (filled = active),
+a totals/paging footer. Every tappable row ends in a `>` chevron; **all three tabs are
+tappable**:
 
 - **Flights** — *Date / Model / Battery / Time*, newest first, paged; the newest 300
   flights are listable, the totals line counts everything. **Tap a flight row** to open its
   **detail page**: a summary (model / battery / duration+mAh, sag count) plus a min/max
   table mirroring the flight-statistics view (cell voltage, headspeed P1-3, current, ESC
   temperature, BEC). Only present when *Log per-flight stats* (§2.7a) was on for that flight;
-  otherwise the detail page says *No stats recorded*. RTN / back returns to the list.
-- **Models** — *Model / Flights / Total time*.
+  otherwise the detail page says *No stats recorded*. RTN or a tap on the header returns
+  to the list.
+- **Models** — *Model / Flights / Total time*. **Tap a model row** to jump to the Flights
+  tab **filtered to that model**: a `Model: … x` chip appears in the header (tap it — or
+  RTN — to clear the filter) and the footer counts `N of M flights` with the filtered
+  total time. The filter is session-local; leaving the Flights tab clears it.
 - **Batteries** — *Battery / Capacity / Cycles / Flights / Last use*, every registry pack.
+  **Tap a pack row** for its **detail page** (id, capacity, cycles, flights, last use,
+  profile, models) with **Edit** and **Delete**; **+ New** in the header creates a pack.
+  The edit form and its rules are §12.2; deleting asks first and names the pack's logged
+  flight count (those flights keep the id and show it raw afterwards).

@@ -37,15 +37,23 @@ local RANGES = {
 
 local function rowCode(row, up) local mag = (7 - row) * 15; return up and mag or -mag end
 
+-- The active bank. With the FC-served table (TbSource) C.posFor consults the real
+-- enable windows and returns NIL inside a dead gap -- "no bank", every consumer guards.
 local function activePos(m)
   local src = C.srcOf(m, "Config")
   if src == 0 then return 1 end
-  return C.posFromValue(getValue(src))
+  return C.posFor(getValue(src))
 end
 
 local function hasFunc(m, row)
-  local g = C.TBL[row][2][m.pos]   -- m.pos cached per cycle (see M.refresh)
-  return g ~= nil and g ~= ""
+  if m.pos == nil then return false end     -- dead gap: nothing is live, no buttons
+  local g = C.cur[row][2][m.pos]            -- m.pos cached per cycle (see M.refresh)
+  if g == nil or g == "" then return false end
+  -- FC-served table: a slot whose adjust channel is NOT the configured value channel
+  -- cannot be driven by this editor's GVAR pulse -- showing its +/- would be a button
+  -- that does nothing. The name stays visible; only the controls go.
+  local d = C.DRIVE
+  return d == nil or d[row][m.pos] ~= false
 end
 
 -- pulse the GVAR to the trim code, start the pulse timer
@@ -147,7 +155,7 @@ function M.refresh(wgt, event, touchState)
   end
 
   local av = C.srcOf(m,"AdjVal")
-  if av and av ~= 0 and m.connected and m.adjRow ~= nil then
+  if av and av ~= 0 and m.connected and m.adjRow ~= nil and m.pos ~= nil then
     local v = getValue(av)
     if v ~= 0 then
       local pos = m.pos
@@ -182,13 +190,13 @@ function M.refresh(wgt, event, touchState)
   end
 
   -- voice: announce the active EnCh bank (1..6) on open and on change (gated by TbVoice;
-  -- the host provides wgt.tb_announce, which honors master mute + widget volume)
+  -- the host provides wgt.tb_announce, which honors master mute + widget volume).
+  -- The HOST owns the debounce AND the "speak once after opening" latch: it is handed the
+  -- current bank every cycle -- pos == nil (a dead gap between the FC's windows) speaks
+  -- nothing and keeps the state, so the first real bank after the gap is still spoken --
+  -- and it holds while the knob is moving instead of queueing one announcement per step.
   if wgt.options and wgt.options.TbVoice == 1 and wgt.tb_announce then
-    local pos = m.pos
-    if m.announce_pending or (m.lastSpokenPos ~= nil and pos ~= m.lastSpokenPos) then
-      wgt.tb_announce(pos)
-    end
-    m.lastSpokenPos = pos
+    wgt.tb_announce(m.pos, m.announce_pending)
     m.announce_pending = false
   end
 end
@@ -214,6 +222,8 @@ function M.build(wgt, zone)
     return
   end
 
+  C.applyFcTable(wgt)   -- render the CURRENT active table (hand or FC-served); the host
+                        -- watches for later changes and rebuilds the page (adj_gen)
   m.announce_pending = true   -- speak the current bank once after (re)opening the page
 
   if C.srcOf(m, "Config") == 0 then
@@ -234,7 +244,7 @@ function M.build(wgt, zone)
   local _, th  = lcd.sizeText("Ag", font)
   local _, sth = lcd.sizeText("Ag", SMLSIZE)
   local headH = th + 6
-  local rowH  = (H - headH) / #C.TBL
+  local rowH  = (H - headH) / #C.cur
 
   local gap    = 6
   local btnW   = math.min(70, math.floor(W * 0.15))
@@ -257,6 +267,22 @@ function M.build(wgt, zone)
   local _, rth = lcd.sizeText("Ag", rangeFont)
   local rangeW = bert and (lcd.sizeText("180-450", rangeFont) + 8) or 0
   local nameW  = funcW - (bert and (rangeW + gap) or 0)
+  -- T4: the name font used to be picked by row HEIGHT alone, and on the 480 px radios
+  -- the row is tall enough for MIDSIZE while the name column (123 px with the ranges
+  -- hint on) is nowhere near wide enough for it -- 10 of the 31 shipping names clipped.
+  -- Measure the ACTUAL cell texts against the column and drop one size when any would
+  -- clip. Build-time only (up to 36 sizeText calls), never per frame.
+  local nameFont = font
+  if font == MIDSIZE then
+    for r = 1, #C.cur do
+      for p = 1, 6 do
+        local g = C.cur[r][2][p]
+        if g and g ~= "" and lcd.sizeText(g, MIDSIZE) > nameW then nameFont = SMLSIZE break end
+      end
+      if nameFont ~= font then break end
+    end
+  end
+  local _, nth = lcd.sizeText("Ag", nameFont)
   local sc = (opt.TbScale and opt.TbScale >= 1) and opt.TbScale or 1
 
   -- palette: the host (UltiDash) hands its scheme-matched colours via wgt.tb_pal so the
@@ -282,20 +308,23 @@ function M.build(wgt, zone)
   layout[#layout + 1] = { type = "label", x = 6, y = (headH - th) / 2, w = W - 12, h = th, font = font, color = P.accent,
     text = function()
       local p = m.pos
-      if m.has_profile then return string.format("Pos %d (%s)   PID %d", p, C.SUB[p], m.profile) end
-      return string.format("Pos %d   (%s)", p, C.SUB[p])
+      if p == nil then     -- FC windows known and the channel sits in a dead gap
+        return m.has_profile and string.format("Pos -   PID %d", m.profile) or "Pos -"
+      end
+      if m.has_profile then return string.format("Pos %d (%s)   PID %d", p, C.curSUB[p], m.profile) end
+      return string.format("Pos %d   (%s)", p, C.curSUB[p])
     end }
   layout[#layout + 1] = { type = "label", x = 6, y = (headH - sth) / 2, w = W - 12, h = sth, font = SMLSIZE, align = RIGHT,
     color = P.hint, text = "Adjustment Editor" }
   layout[#layout + 1] = { type = "rectangle", filled = true, x = 0, y = headH - 1, w = W, h = 1, color = P.line }
 
-  for i, row in ipairs(C.TBL) do
+  for i, row in ipairs(C.cur) do
     local rowY = headH + (i - 1) * rowH
-    local ly = rowY + (rowH - th) / 2
+    local ly = rowY + (rowH - nth) / 2
     local by = rowY + (rowH - btnH) / 2
     local idx = i
-    layout[#layout + 1] = { type = "label", x = funcX, y = ly, w = nameW, h = th, font = font, color = P.text,
-      text = function() local g = C.TBL[idx][2][m.pos]; if g == nil or g == "" then return "-" end return g end }
+    layout[#layout + 1] = { type = "label", x = funcX, y = ly, w = nameW, h = nth, font = nameFont, color = P.text,
+      text = function() local g = m.pos and C.cur[idx][2][m.pos]; if g == nil or g == "" then return "-" end return g end }
     local visFunc = function() return hasFunc(m, idx) end
     if bert then
       layout[#layout + 1] = { type = "label", x = funcX + nameW + gap, y = rowY + (rowH - rth) / 2, w = rangeW, h = rth,

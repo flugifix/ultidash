@@ -174,8 +174,16 @@ local ARM_DISABLE_FLAG_NAMES = {
 
 local function get_arming_disable_flag_names()
     -- the last two indices depend on the FC API version; set them on the cached table
-    -- (cheap, no allocation) instead of rebuilding the whole 27-entry table each call
-    if rf2 and rf2.apiVersion and rf2.apiVersion >= 12.09 then
+    -- (cheap, no allocation) instead of rebuilding the whole 27-entry table each call.
+    -- The version comes from whichever suite serves MSP -- RFTool's number or the RFSuite
+    -- session's string -- in the same order ultidashRf picks a provider. Mirrored in
+    -- ultidashFunctions.get_arm_disable_descs; keep the two in step.
+    local api = rf2 and rf2.apiVersion
+    if type(api) ~= "number" then
+        local s = _G.rfsuite and _G.rfsuite.session
+        api = (type(s) == "table") and tonumber(s.apiVersion) or nil
+    end
+    if api and api >= 12.09 then
         ARM_DISABLE_FLAG_NAMES[25] = "Override"
         ARM_DISABLE_FLAG_NAMES[26] = "Arm Switch"
     else

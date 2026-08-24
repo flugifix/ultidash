@@ -15,9 +15,9 @@ Rotorflight's **trim-based adjustment functions**:
 Open them from the fullscreen menu (**☰ → Toolbox**, disarmed only) **or** via a
 **shortcut switch** that works any time, including in flight (see §5).
 
-Four further, zero-config pages live in the same Toolbox submenu — the **Log Viewer**,
-**RF2 Config**, the **Flight Log** and the **FC battery profile** picker — described
-briefly in §8.
+Five further, zero-config pages live in the same Toolbox submenu — the **Log Viewer**,
+**RF2 Config**, **RFSuite**, the **Flight Log** and the **FC battery profile** picker —
+described briefly in §8.
 
 ---
 
@@ -125,6 +125,14 @@ The example wires the four stick trims (rows 1–4); extend the same pattern wit
 model: one more `MAX / 0 / REPL` line on a switch position that forces the channel to 0
 while the tools are not in use.)*
 
+> ⚠️ **Switch the trims themselves OFF.** These lines are gated on the trim **buttons**, not
+> on the trim **values** — so unless trimming is disabled, every tuning press *also* trims the
+> corresponding flight axis. In EdgeTX: **Model ▸ Flight Modes ▸ FM0 ▸ Trim** = off for all six
+> (Ele / Ail / Rud / Thr / T5 / T6). The working model above has all six off.
+>
+> And claim each trim **once**: a trim button used by a line here must not drive anything else
+> as well, for the same reason the Editor's GVAR has to be dedicated (§3.3).
+
 ### 3.3 Editor — the GVAR mixer line
 The Editor performs a step by briefly **pulsing a dedicated GVAR** onto the value channel
 and back to 0; the FC then adjusts exactly as if you pressed that trim.
@@ -160,7 +168,12 @@ needed): the reported value (`AdjV`) is only latched while the FC is connected.
 ## 5. Opening the tools — menu or a shortcut switch
 
 - **Menu:** ☰ menu glyph (disarmed) → **Toolbox** → **Adjust Map** / **Adjust Edit**. Back =
-  **RTN**.
+  **RTN**. Since 0.8.0 the Toolbox page groups its tiles by what the tool is *for* —
+  **Adjustments** (Adjust Map, Adjust Edit) · **Logs** (Log Viewer, Flight Log) · **Flight
+  controller** (RF2 Config, RFSuite, Battery profile) — and lays them out in two columns
+  where the
+  screen is wide enough, which is what pays for the three headings: on a 480×272 MK2 the six
+  tiles in one column already ran past the bottom of the page.
 - **Shortcut switch (recommended for flight):** under *Settings ▸ Shortcuts* (REFERENCE §2.7c)
   bind a switch position — or a toggle step — to *Adjust Map* / *Adjust Edit* (or any other
   page). A **position slot** opens the tool while the switch is held there and closes it when
@@ -178,6 +191,7 @@ needed): the reported value (`AdjV`) is only latched while the FC is connected.
 
 | Setting | Key | Notes |
 |---------|-----|-------|
+| Adj table from | `TbSource` | where the displayed table comes from: **Manual** (the built-in table + `labels.lua`, today's behaviour) · **Flight controller** · **FC + labels.lua** (the FC's table with your `labels.lua` overrides on top). See *The FC-served table* below |
 | Adj: Config channel | `TbConfigCh` | the 6-position selector channel (default CH11) |
 | Adj: Value channel | `TbValueCh` | the trim-magnitude channel (default CH12) |
 | Adj editor: GVAR | `TbGvar` | the GVAR pulsed by the editor (GV1…GV15) |
@@ -185,11 +199,23 @@ needed): the reported value (`AdjV`) is only latched while the FC is connected.
 | Adj value divider | `TbScale` | divides the displayed `AdjV` |
 | Adj editor: ranges hint | `TbBert` | show recommended value ranges next to each name |
 | Toolbox sunlight mode | `TbSun` | high-contrast light scheme for bright sun |
-| Announce bank (voice) | `TbVoice` | speak "Bank N" (the active Config-channel position) on open + on change |
+| Announce bank (voice) | `TbVoice` | speak "Bank N" (the active Config-channel position) on open + on change; **off** silences it entirely |
+
+**The announcement waits for the knob to settle.** Each one queues two clips and EdgeTX
+offers Lua no way to flush the sound queue, so speaking every position a sweep passes
+through used to chain them all: turning the Config channel from bank 1 to bank 6 spoke six
+announcements over the next several seconds. A bank now has to hold for **0.3 s** before it
+is spoken, and two announcements keep at least **1.5 s** apart — so a sweep says its
+destination and nothing else, while an ordinary single change speaks with no delay worth
+noticing. A position between the FC's windows (see *The FC-served table*) stays silent and
+does not consume the announcement: the next real bank is still spoken.
 
 The tool pages follow the **active skin's colour scheme** (*Settings ▸ Skin ▸ Color
 scheme* — for the built-in UltiDash look: *UltiDash* / *UltiDash dark* / *EdgeTX theme*);
-the sunlight option overrides to a high-contrast light scheme. The
+the sunlight option overrides to a high-contrast light scheme. **The two curve pages — Log
+Viewer and Live Monitor — pick their curve colours from that same scheme**, a bright set on
+a dark background and a deeper set on a light one, so a curve is never a pale line on white.
+The
 per-session values shown in the tools are **cleared on every fresh (re)connect** so they
 start empty again.
 
@@ -212,6 +238,32 @@ return {
 }
 ```
 
+### The FC-served table (`TbSource` = *Flight controller* / *FC + labels.lua*)
+
+With one of the two FC states selected, UltiDash reads the craft's **own `adjfunc`
+configuration** over MSP **once per connect** (about 4–7 s, during which the telemetry
+sensors pause — the read runs at plug-in, and *only* when this option asks for it;
+on *Manual* nothing is ever read). It **queues behind the connect reads**, never ahead of
+them: the flight controller's battery configuration (cell count, full-cell voltage) has to
+land first, because the startup cell-check needs it seconds after the pack is plugged in.
+The tools then rebuild their table from the answer:
+
+- **Cells and columns follow the craft.** Where the craft carries the standard layout the
+  table looks exactly like the built-in one; a custom `adjfunc` setup shows *its* functions,
+  named from a built-in table of all 83 adjustment functions. With *FC + labels.lua* your
+  `labels.lua` renames apply on top; with plain *Flight controller* they do not.
+- **The bank comes from the FC's real enable windows**, not from an even six-way split of
+  the Config channel. The standard windows leave five dead gaps between banks — a selector
+  sitting in a gap now reads **`Pos -`** (no bank, no live cell) instead of the nearest
+  bank. This also removes the edge error near every window boundary.
+- **A cell the editor cannot drive shows no `[-]`/`[+]`** — a slot whose adjust channel is
+  not the configured Value channel would get buttons that do nothing.
+- **menu ▸ Status ▸ Adjust table** names the source actually in force: the option can say
+  FC while a failed or not-yet-run read leaves the manual table in use (after a read
+  failure the tools fall back rather than showing an empty grid).
+- The `ranges` hints (`TbBert`) stay **positional** (row × position), whatever the source —
+  they describe the standard layout unless your `labels.lua` overrides them.
+
 ## 7. Known limitations / WIP
 
 - The telemetry sensor names are fixed to the Rotorflight standard (`AdjV` / `PID#`);
@@ -228,10 +280,11 @@ return {
   the "no MSP while armed" rule is untouched; the FC's adjustment functions (your model
   setup) perform the actual change.
 
-## 8. The other Toolbox pages: Log Viewer, RF2 Config, Flight Log & Battery profile
+## 8. The other Toolbox pages: Log Viewer, RF2 Config, RFSuite, Flight Log, Battery profile & Live Monitor
 
-All need **no model setup and no settings** and are **disarmed-only** (an armed tap
-is refused with a hint; they close automatically on arming). The first three are
+The first four need **no model setup and no settings** and are **disarmed-only** (an armed
+tap is refused with a hint; they close automatically on arming). The **Live Monitor** at the
+end of this section is the exception — in-flight use is its purpose. All the big ones are
 **lazy-loaded**: the modules are read from the SD card only when the page is opened and
 released again on close, so they cost no memory while flying.
 
@@ -301,6 +354,29 @@ released again on close, so they cost no memory while flying.
   maintainer from then on.
 
   **No restart is needed** to pick up template changes: close and reopen the Log Viewer.
+
+  **Standalone access — the EdgeTX Tools menu.** The Log Viewer is also reachable without the
+  dashboard: **SYS ▸ Apps ▸ UltiDash Log Viewer**. It is the *same* viewer — one file, the
+  same templates, the same charts; the Tools entry is only a launcher
+  (`SCRIPTS/TOOLS/udlogview.lua`) for the installed
+  `WIDGETS/UltiDash/toolbox/logview.lua`. Three properties of that route are EdgeTX's, not
+  ours, and are stated rather than worked around:
+
+  - **UltiDash is not running while the tool is open.** EdgeTX suspends widget scripts for the
+    duration of *any* Tools script — no callouts, no announcements, no flight-log capture. That
+    is the menu's doing and applies to every tool in it.
+  - **No auto-close on arming.** Opening a Tools script is your own decision, and there is no
+    widget left running that a gate could protect; the viewer reads log files and nothing else.
+    The Toolbox entry inside the widget keeps its arm-close unchanged.
+  - **UltiDash has to be installed on the same card.** The launcher loads the widget's own
+    module and the templates live in the widget's `cfg/`. On a card without UltiDash the entry
+    opens a page saying so instead of failing.
+  - **It wears the RADIO's theme, not your UltiDash colour scheme.** A Tools script has no
+    widget behind it and therefore no model configuration to read a scheme from, so the
+    standalone viewer builds its palette — and its curve colours — from the EdgeTX theme the
+    radio is running. The same viewer opened from *Toolbox ▸ Log Viewer* follows the UltiDash
+    scheme as before, so the two look different on purpose. For the same reason the Toolbox
+    *sunlight mode* option has no effect here: switch the radio to a light theme instead.
 - **RF2 Config** — runs the **original rotorflight-lua-scripts configuration tool**
   (main menu, all config pages, Save, the Reload/Reboot popup) with its original look,
   navigation and key handling, inside UltiDash's fullscreen. Nothing is copied: the
@@ -314,10 +390,68 @@ released again on close, so they cost no memory while flying.
   or reconnect the FC to get out.
   Unlike the standalone tool it is blocked while armed (UltiDash's
   no-MSP-while-armed rule).
-- **Flight Log** — browses the flight history UltiDash records on the SD card: three
-  tabs, **Flights** (date / model / battery / duration per flight), **Models** (flights +
-  total time per model) and **Batteries** (per-pack cycle counts from `batteries.cfg`).
-  The data files, the optional PC-maintained battery registry and the related
+- **RFSuite (exp.)** *(0.8.0, optional and **highly experimental** — the tile only appears
+  if the adapter is installed)* — runs
+  the **RFSuite for EdgeTX** configuration suite (`rotorflight-lua-edgetx-suite`) inside
+  UltiDash's fullscreen, the same way *RF2 Config* runs the classic tool. Nothing is copied:
+  the suite loads from `/SCRIPTS/TOOLS/rfsuite-core/` on the SD card, so updating RFSuite
+  updates this page. **RFSuite is a separate, optional install and does not replace RF Tool** —
+  UltiDash reads the flight controller through RF Tool's `rf2` runtime either way. Without the
+  suite on the card the tile opens a page that says so and what to do about it.
+  Disarmed-only, force-closes on arming, RTN walks back through RFSuite's own navigation.
+
+  **The tile carries `(exp.)` and the page in front of it says why.** Tapping it shows
+  *HIGHLY EXPERIMENTAL* with the two effects below, and only the **Open anyway** button
+  loads the suite; RTN goes back to the Toolbox. That page appears **every time** — there is
+  no setting to switch it off — because once RFSuite is up it paints the whole screen itself
+  and nothing of UltiDash's is left on it to carry a marker.
+
+  Two things are worth knowing before you rely on it, and both come from how EdgeTX runs Lua
+  rather than from either project:
+
+  - **Pages can stutter, and one may go blank.** EdgeTX gives a *widget* 20 000 instructions
+    per call and kills the call at that point; a **standalone Tools script** is suspended and
+    resumed instead, with no such ceiling. RFSuite's pages are written for the second regime,
+    so running them here means some page builds are cut short. UltiDash retries rather than
+    closing the tool, and pages then finish across several passes — but if the cut lands in
+    the middle of a page's own redraw, RFSuite loses the redraw request and **the page stays
+    blank**. **RTN still works**, so you are never stuck; reopen the page and it usually
+    comes up. You may also see EdgeTX print its own
+    *“Error in widget UltiDash widget function: CPU limit”* line while a heavy RFSuite page
+    is open. It is **cosmetic**: the next widget pass starts with a fresh budget and the
+    dashboard carries on. UltiDash cannot suppress it — EdgeTX clears the counter only when
+    a call *begins*, so once it has fired, anything still running in that same call can fire
+    it again where no error handler of ours can reach.
+    Running RFSuite from EdgeTX's own *Tools* menu is not affected by any of this.
+  - **It costs memory while it is open.** The suite's module graph lands in the shared widget
+    Lua state — measured at ~0,7 MB — and closing the page gives roughly two thirds of that
+    back. Open it when you need it rather than leaving it open.
+- **Flight Log** — browses the flight history UltiDash records on the SD card, and since
+  0.8.0 **edits the battery registry** there too. Drawn in the same detail-page style as
+  the other tools (own header, the three tabs as chips, palette-matched); every tappable
+  row ends in a `>` chevron and **all three tabs are tappable**:
+  **Flights** (date / model / battery / duration; tap a row for the per-flight stats
+  detail), **Models** (flights + total time per model; tap a row to filter the Flights tab
+  to that model — a header chip shows and clears the filter, the footer counts
+  `N of M flights`) and **Batteries** (per-pack cycle counts from `batteries.cfg`; tap a
+  pack for its detail page with **Edit** / **Delete**, **+ New** in the header creates
+  one). The same create form opens from the battery query's **+ New battery** button —
+  the moment an unknown pack is plugged in at the field — with *models* preset to the
+  connected craft.
+
+  The editor performs **line surgery**: only the edited pack's line is rewritten, atomically
+  — comments, unknown fields and every other line stay byte-identical, so a hand-maintained
+  file survives radio edits. A registry **larger than 64 KiB** is refused for editing with
+  a visible message (viewing works; tend a file that size on the PC). Renaming an id never
+  rewrites `flights.csv` — the editor warns with the flight count instead. Everything here
+  is **disarmed-only**; arming closes every page and discards an open form.
+
+  One caveat for users of the Radio Sync Tool (EdgeTX Toolsuite): its `batteries` merge has
+  so far only ever seen radio-side *cycle stamps* — **a pack deleted on one radio may come
+  back after a sync** until the sync tool's deletion handling is verified, and two radios
+  creating packs between two syncs can mint the same id for different packs (the sync tool
+  should report that rather than merge silently). Both are recorded as open items there.
+  The data files, the battery registry format and field rules, and the related
   settings are described in **REFERENCE §12** (Flight log & battery management).
 - **Battery profile** — switches the **flight controller's** active battery profile (1…6),
   showing each profile's configured capacity where the FC reports one. This is the one page
@@ -331,3 +465,23 @@ released again on close, so they cost no memory while flying.
   the list never shows a value cached at connect time. The back arrow returns to the Toolbox
   when it was opened from here, and to the dashboard otherwise; picking a profile always
   closes to the dashboard.
+
+- **Live Monitor** — up to **4 sensors as live curves** of the last **15 / 30 / 60 s**:
+  stacked full-width strips, each a 0.2 s **min/max band** with the sensor's current value
+  and the window's min/max as numbers, auto-scaled with a noise floor. Configure the sensors
+  under *Settings ▸ Telemetry ▸ Live monitor* (REFERENCE §2.3b); the window is switchable on
+  the page (the bordered chip, top-left).
+
+  **The arm marker** is a vertical line in the page's accent colour, standing in the curve
+  areas of every strip (it stops short of the label lines). It marks the moment you armed,
+  so it **travels left with the data** and disappears once that moment has scrolled out of
+  the window — a line that is not there simply means you armed longer ago than the window
+  is long.
+
+  **In flight is the point**: like the two adjustment tools it opens armed, does not
+  auto-close on arming, and uses **no MSP** — it reads EdgeTX telemetry sources only. The
+  recorder runs in the widget itself, page open or not, so opening the page *after* a
+  manoeuvre shows the manoeuvre; what it cannot show is a peak shorter than the sensor's own
+  telemetry interval (that never reaches the radio at all), and sampling is coarser while
+  another screen is shown. With no sensor configured the whole feature is off and costs
+  nothing. `menu ▸ Status ▸ Live monitor` shows the recorder's actual state.

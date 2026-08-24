@@ -5,3 +5,7 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# Local virtualenv for building the documentation figures. Created on demand,
+# never needed to build, deploy or run the widget.
+.venv-docs/

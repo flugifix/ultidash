@@ -2,7 +2,11 @@
 --  UltiDash Toolbox: Flight Log viewer
 --  Shows the flight log (fltlog/flights.csv) and the battery registry
 --  (fltlog/batteries.cfg): recent flights, per-model totals and battery
---  usage (cycles / last use). Three tabs: Flights / Models / Batteries.
+--  usage. Three tabs: Flights / Models / Batteries -- ALL rows tappable
+--  (Flights -> per-flight detail, Batteries -> battery detail/editor via
+--  toolbox/fltbatt.lua, Models -> the Flights tab filtered to that model).
+--  Drawn in the Toolbox detail-page style (own header, tab chips, palette
+--  via wgt.tb_pal) -- NOT lvgl.page, and no COLOR_THEME_* colours.
 --
 --  DISARMED-ONLY, LAZY-loaded on open and released on close (same policy
 --  as the Log Viewer -- boot-resident modules measurably drag the UI).
@@ -18,6 +22,23 @@ local CHUNK       = 2048   -- io.read chunk per tick
 local LINES_TICK  = 90     -- CSV lines parsed per tick (one string.match each)
 local MAX_FLIGHTS = 300    -- flight ring: on overflow the OLDEST entries drop,
                            -- totals/aggregates still count EVERY line
+
+-- shared palettes live in toolbox/common.lua, handed in by the host loader
+-- via M.init (the adj tools' pattern); nil-guarded for a partial deploy
+local C = nil
+function M.init(common) C = common end
+
+local function palette(wgt)
+    local opt = wgt.options or {}
+    if C ~= nil and (opt.TbSun == 1 or opt.TbSun == true) then return C.sun_palette() end
+    if wgt.tb_pal then return wgt.tb_pal end
+    if C ~= nil then return C.fallback_palette() end
+    -- last resort (common.lua missing): the dark fallback literals
+    return { bg = lcd.RGB(0, 0, 0), accent = lcd.RGB(0, 229, 255),
+             hint = lcd.RGB(255, 122, 26), line = lcd.RGB(56, 60, 64),
+             text = lcd.RGB(240, 240, 240), textDim = lcd.RGB(150, 156, 162),
+             bannerBg = lcd.RGB(255, 68, 56), bannerFg = lcd.RGB(0, 0, 0) }
+end
 
 -- ---------------------------------------------------------------------
 -- state
@@ -36,6 +57,8 @@ local function ensure(wgt)
             reg = {},               -- battery registry (fltdata)
             names = {},             -- battery_id -> display name
             page = 0,
+            hit = {},               -- tap targets of the CURRENT build
+            filter_model = nil,     -- session-local Flights filter (spec 4.4)
         }
         wgt.fl = fl
     end
@@ -49,17 +72,98 @@ function M.close(wgt)
         fl.fh = nil
     end
     wgt.fl = nil
+    wgt.fb = nil        -- the battery editor's state dies with the tool
 end
 
 -- forced-exit cleanup (fullscreen exit via close_tool_page): release the file
 M.cleanup = M.close
 
--- RTN: from a per-flight detail page it returns to the list (handled = true); from
--- the list it leaves the tool (host closes on false).
+-- forward declaration: defined with the chunked loader below, needed by
+-- batt_ctx's on_change (a registry write reloads the list in place)
+local load_registry
+
+-- ---------------------------------------------------------------------
+-- battery detail/editor (toolbox/fltbatt.lua): lazily loaded on the first
+-- Batteries-row tap / "+ New"; while open it owns build/refresh/RTN
+-- ---------------------------------------------------------------------
+local function load_batt_mod(wgt, fl)
+    if fl.B == nil then
+        local ok, m = pcall(function() return loadScript("/WIDGETS/UltiDash/toolbox/fltbatt.lua")() end)
+        if ok and m ~= nil then
+            if m.init ~= nil then pcall(m.init, C) end
+            fl.B = m
+        end
+    end
+    return fl.B
+end
+
+local function batt_ctx(wgt, fl, entry)
+    -- known model names: as typed in flights.csv, plus the connected craft
+    local known = {}
+    for i = 1, #fl.morder do known[#known + 1] = fl.morder[i] end
+    local craft = wgt.values ~= nil and wgt.values.craft_name or nil
+    if craft ~= nil and craft ~= "" then known[#known + 1] = craft end
+    return {
+        D = fl.D or wgt.flt_data_mod,
+        reg = fl.reg,
+        entry = entry,
+        known_models = known,
+        flights_for = function(id) return fl.by_id[id] or 0 end,
+        return_to = "fltlog",
+        on_change = function(w, what, id)
+            -- a write landed: reload the registry in place (one read, in the
+            -- tool's exclusive cycle); returns the fresh entry for `id`
+            local flx = w.fl
+            if flx == nil then return nil end
+            flx.reg, flx.names = {}, {}
+            load_registry(w, flx)
+            w.fl_dirty = true
+            if id ~= nil then
+                for i = 1, #flx.reg do
+                    if flx.reg[i].id == id then return flx.reg[i] end
+                end
+            end
+            return nil
+        end,
+        on_close = function(w)
+            local flx = w.fl
+            if flx ~= nil then flx.batt_open = nil end
+            w.fl_dirty = true
+        end,
+    }
+end
+
+local function open_batt(wgt, fl, entry, mode)
+    local B = load_batt_mod(wgt, fl)
+    if B == nil then return end
+    if pcall(B.open, wgt, mode, batt_ctx(wgt, fl, entry)) then
+        fl.batt_open = true
+        wgt.fl_dirty = true
+    end
+end
+
+-- RTN: battery pages first (the editor consumes internally; at its top it
+-- closes back to the Batteries tab), then a per-flight detail back to the
+-- list, then an active model filter is CLEARED before the tool is left
+-- (spec 4.4); only then does RTN leave the tool (host closes on false).
 function M.on_exit_key(wgt)
     local fl = wgt.fl
-    if fl ~= nil and fl.detail ~= nil then
+    if fl == nil then return false end
+    if fl.batt_open and fl.B ~= nil then
+        if not fl.B.on_exit_key(wgt) then
+            if fl.B.close ~= nil then fl.B.close(wgt) end
+            fl.batt_open = nil
+        end
+        wgt.fl_dirty = true
+        return true
+    end
+    if fl.detail ~= nil then
         fl.detail = nil
+        wgt.fl_dirty = true
+        return true
+    end
+    if fl.filter_model ~= nil then
+        fl.filter_model = nil
         wgt.fl_dirty = true
         return true
     end
@@ -69,7 +173,7 @@ end
 -- ---------------------------------------------------------------------
 -- chunked CSV load (runs in M.refresh's own budget)
 -- ---------------------------------------------------------------------
-local function load_registry(wgt, fl)
+load_registry = function(wgt, fl)
     -- prefer the HOST's resident fltdata instance (wgt.flt_data_mod, set by the
     -- dispatch) — loading a second module copy per viewer open wasted heap and
     -- could diverge; own load stays as the fallback for a partial deploy
@@ -179,45 +283,104 @@ end
 -- the second line then bleeds into the next row (a long pack name printed
 -- "Tattu 6S" / "62" across two rows). Truncating with an ellipsis keeps rows on
 -- one line. Only a few rows per page, so the measure loop is cheap.
-local function fit(txt, max_w)
+local function fit(txt, max_w, font)
     txt = tostring(txt or "")
     if txt == "" then return txt end
-    local tw = lcd.sizeText(txt, SMLSIZE)
+    font = font or SMLSIZE
+    local tw = lcd.sizeText(txt, font)
     if tw <= max_w then return txt end
     local n = #txt
     while n > 1 do
         n = n - 1
         local cut = string.sub(txt, 1, n) .. "."
-        if lcd.sizeText(cut, SMLSIZE) <= max_w then return cut end
+        if lcd.sizeText(cut, font) <= max_w then return cut end
     end
     return string.sub(txt, 1, 1)
 end
 
 -- ---------------------------------------------------------------------
--- UI (lvgl.page like the host menu pages; rebuilt via wgt.fl_dirty)
+-- UI (detail-page style: own header + tab chips, plain rects and own hit
+-- testing -- a focusable type="button" would capture PAGE/RTN, see
+-- logview.lua; rebuilt via wgt.fl_dirty)
 -- ---------------------------------------------------------------------
+local function add_hit(fl, x, y, w, h, fn, cool)
+    fl.hit[#fl.hit + 1] = { x = x, y = y, w = w, h = h, fn = fn, cool = cool }
+end
+
+-- plain-rect button (footer pager)
+local function button(fl, layout, P, x, y, w, h, txt, fn)
+    layout[#layout + 1] = { type = "rectangle", x = x, y = y, w = w, h = h,
+        thickness = 1, rounded = 4, color = P.line }
+    local _, th = lcd.sizeText(txt, SMLSIZE)
+    layout[#layout + 1] = { type = "label", x = x, y = y + (h - th) / 2,
+        w = w, h = th, font = SMLSIZE, align = CENTER, color = P.text, text = txt }
+    add_hit(fl, x, y, w, h, fn, 30)
+end
+
+-- a filled/outlined chip; `on` decides the fill (logview's chip pattern)
+local function chip(fl, layout, P, x, y, w, h, txt, on, fn)
+    if on then
+        layout[#layout + 1] = { type = "rectangle", filled = true, rounded = 4,
+            x = x, y = y, w = w, h = h, color = P.accent }
+    else
+        layout[#layout + 1] = { type = "rectangle", rounded = 4, thickness = 1,
+            x = x, y = y, w = w, h = h, color = P.line }
+    end
+    local _, th = lcd.sizeText(txt, SMLSIZE)
+    layout[#layout + 1] = { type = "label", x = x, y = y + (h - th) / 2, w = w, h = th,
+        font = SMLSIZE, align = CENTER,
+        color = on and (P.bg or lcd.RGB(0, 0, 0)) or P.text, text = txt }
+    add_hit(fl, x, y, w, h, fn, 30)
+end
+
 -- Two INDEPENDENT size flags. `big` (height) drives row heights / fonts, like the
 -- rest of the widget. `wide` (WIDTH) drives the column layouts -- the TX15 is
 -- 480x320, so its height passes the >=300 "big" test while its width is only 60 %
 -- of the TX16S's 800: keying the columns off the height overlapped them (the
 -- battery tab printed "1 fl26-07-10", the flight tab wrapped the pack name).
-local function page_geometry(fl, zone)
+local function page_geometry(zone)
     local big = zone.h >= 300
     local wide = zone.w >= 700
+    local titleFont = big and MIDSIZE or SMLSIZE
+    local _, tth = lcd.sizeText("Ag", titleFont)
     local _, fh = lcd.sizeText("Ag", SMLSIZE)
+    local headH = tth + 8
     local row_h = fh + (big and 8 or 4)
-    local top = big and 12 or 6              -- below the page header
-    local tab_h = big and 36 or 26
+    local top = big and 10 or 5              -- gap below the header
     local foot_h = big and 38 or 28
-    local header_px = big and 56 or 40       -- page title bar
-    local avail = zone.h - header_px - top - tab_h - 8 - foot_h - 4
+    local avail = zone.h - headH - top - foot_h - 6
     local rows = math.max(3, math.floor(avail / row_h))
-    return big, wide, fh, row_h, top, tab_h, foot_h, rows
+    return big, wide, fh, tth, titleFont, headH, row_h, top, foot_h, rows
+end
+
+local function set_mode(wgt, fl, mode)
+    if fl.mode ~= mode then
+        fl.filter_model = nil       -- leaving the Flights tab clears the filter
+        fl.mode = mode
+        fl.page = 0
+        wgt.fl_dirty = true
+    end
+end
+
+-- flights matching the model filter: absolute ring indices, newest first
+-- (bounded by the ring like the unfiltered list; totals over these entries)
+local function filtered_idx(fl)
+    local out, sum = {}, 0
+    local lo = math.max(1, fl.n - MAX_FLIGHTS + 1)
+    for j = fl.n, lo, -1 do
+        local e = fl.ring[((j - 1) % MAX_FLIGHTS) + 1]
+        if e.m == fl.filter_model then
+            out[#out + 1] = j
+            sum = sum + e.s
+        end
+    end
+    return out, sum
 end
 
 local function item_count(fl)
     if fl.mode == "models" then return #fl.morder end
     if fl.mode == "batts" then return #fl.reg end
+    if fl.filter_model ~= nil then return #(fl.fidx or {}) end
     return math.min(fl.n, MAX_FLIGHTS)
 end
 
@@ -240,30 +403,42 @@ local function fmt_num(v, dec)
     return string.format("%." .. dec .. "f", v)
 end
 
--- per-flight detail page (opened by tapping a Flights row): summary + a min/max table.
-local function build_detail(wgt, fl, zone)
+-- per-flight detail page (opened by tapping a Flights row): summary + a min/max
+-- table, in the detail-page style; back = RTN or a tap on the header title row
+local function build_detail(wgt, fl, zone, P)
     local e = fl.detail
-    local w = zone.w
-    local big = zone.h >= 300
+    local w, H = zone.w, zone.h
+    local big = H >= 300
+    local titleFont = big and MIDSIZE or SMLSIZE
+    local _, tth = lcd.sizeText("Ag", titleFont)
     local _, fh = lcd.sizeText("Ag", SMLSIZE)
+    local headH = tth + 8
     local hhmm = string.sub(e.t or "", 1, 5)
-    local pg = lvgl.page({
-        title = "Flight",
-        subtitle = (e.d or "") .. " " .. hhmm,
-        back = function() fl.detail = nil; wgt.fl_dirty = true end,
-    })
+    local elems = {}
+    if P.bg then
+        elems[#elems + 1] = { type = "rectangle", filled = true, x = 0, y = 0, w = w, h = H, color = P.bg }
+    end
+    elems[#elems + 1] = { type = "label", x = 6, y = (headH - tth) / 2, w = w - 150, h = tth,
+        font = titleFont, color = P.accent, text = "Flight" }
+    elems[#elems + 1] = { type = "label", x = 6, y = (headH - fh) / 2, w = w - 12, h = fh,
+        font = SMLSIZE, align = RIGHT, color = P.hint, text = (e.d or "") .. " " .. hhmm }
+    elems[#elems + 1] = { type = "rectangle", filled = true, x = 0, y = headH - 1, w = w, h = 1, color = P.line }
+    add_hit(fl, 0, 0, w, headH, function(w2)
+        local flx = w2.fl
+        if flx ~= nil then flx.detail = nil end
+        w2.fl_dirty = true
+    end, 30)
     local row_h = fh + (big and 6 or 3)
     local lblw = math.floor(w * 0.42)
     local vw = w - lblw - 22
-    local elems = {}
-    local y = big and 10 or 4
+    local y = headH + (big and 10 or 4)
     local stats = fl.D and fl.D.parse_stats(e.x) or nil
     -- summary block: model / battery / duration+mAh (+ sag count if any)
     local function kv(label, val)
         elems[#elems + 1] = { type = "label", x = 8, y = y, w = lblw, h = fh + 2,
-            font = SMLSIZE, color = COLOR_THEME_SECONDARY1, text = label }
+            font = SMLSIZE, color = P.textDim, text = label }
         elems[#elems + 1] = { type = "label", x = 8 + lblw + 6, y = y, w = vw, h = fh + 2,
-            font = SMLSIZE, color = COLOR_THEME_PRIMARY1, text = val }
+            font = SMLSIZE, color = P.text, text = val }
         y = y + row_h
     end
     kv("Model", fit(e.m or "-", vw))
@@ -276,85 +451,125 @@ local function build_detail(wgt, fl, zone)
     end
     if stats == nil then
         elems[#elems + 1] = { type = "label", x = 8, y = y + 6, w = w - 16, h = fh + 2,
-            font = SMLSIZE, align = CENTER, color = COLOR_THEME_DISABLED,
+            font = SMLSIZE, align = CENTER, color = P.textDim,
             text = "No stats recorded for this flight" }
-        pg:build(elems)
+        lvgl.build(elems)
         return
     end
     -- min/max table
     elems[#elems + 1] = { type = "rectangle", x = 8, y = y + 2, w = w - 16, h = 1,
-        filled = true, color = COLOR_THEME_SECONDARY1 }
+        filled = true, color = P.line }
     y = y + 8
     local colw = math.floor((w - lblw - 16) / 2)
     local xmin = 8 + lblw
     local xmax = xmin + colw
     elems[#elems + 1] = { type = "label", x = xmin, y = y, w = colw, h = fh + 2,
-        font = SMLSIZE, align = RIGHT, color = COLOR_THEME_SECONDARY1, text = "Min" }
+        font = SMLSIZE, align = RIGHT, color = P.textDim, text = "Min" }
     elems[#elems + 1] = { type = "label", x = xmax, y = y, w = colw, h = fh + 2,
-        font = SMLSIZE, align = RIGHT, color = COLOR_THEME_SECONDARY1, text = "Max" }
+        font = SMLSIZE, align = RIGHT, color = P.textDim, text = "Max" }
     y = y + row_h
     for i = 1, #STAT_ROWS do
         local r = STAT_ROWS[i]
         local mn, mx = stats[r.min], stats[r.max]
         if not (r.hs and mn == nil and mx == nil) then   -- skip unused headspeed profiles
             elems[#elems + 1] = { type = "label", x = 8, y = y, w = lblw - 4, h = fh + 2,
-                font = SMLSIZE, color = COLOR_THEME_SECONDARY1, text = r.label }
+                font = SMLSIZE, color = P.textDim, text = r.label }
             elems[#elems + 1] = { type = "label", x = xmin, y = y, w = colw, h = fh + 2,
-                font = SMLSIZE, align = RIGHT, color = COLOR_THEME_PRIMARY1, text = fmt_num(mn, r.dec) }
+                font = SMLSIZE, align = RIGHT, color = P.text, text = fmt_num(mn, r.dec) }
             elems[#elems + 1] = { type = "label", x = xmax, y = y, w = colw, h = fh + 2,
-                font = SMLSIZE, align = RIGHT, color = COLOR_THEME_PRIMARY1, text = fmt_num(mx, r.dec) }
+                font = SMLSIZE, align = RIGHT, color = P.text, text = fmt_num(mx, r.dec) }
             y = y + row_h
         end
     end
-    pg:build(elems)
+    lvgl.build(elems)
 end
 
 function M.build(wgt, zone)
     local fl = ensure(wgt)
+    fl.hit = {}
+    -- the battery detail/editor owns the screen while open
+    if fl.batt_open and fl.B ~= nil then
+        fl.B.build(wgt, zone)
+        return
+    end
+    local P = palette(wgt)
     -- a tapped Flights row shows its per-flight detail (stats) instead of the list
     if fl.detail ~= nil and fl.stage == nil then
-        build_detail(wgt, fl, zone)
+        build_detail(wgt, fl, zone, P)
         return
     end
-    local pg = lvgl.page({
-        title = "Flight Log",
-        subtitle = (fl.mode == "models") and "Per model"
-            or (fl.mode == "batts") and "Batteries"
-            or "Flights",
-        back = function()
-            M.close(wgt)
-            wgt.fl_close_req = true
-        end,
-    })
-    local big, wide, fh, row_h, top, tab_h, foot_h, rows = page_geometry(fl, zone)
+    local big, wide, fh, tth, titleFont, headH, row_h, top, foot_h, rows = page_geometry(zone)
     local w = zone.w
     local elems = {}
-
-    -- tab row
-    local tabs = { { "Flights", "flights" }, { "Models", "models" }, { "Batteries", "batts" } }
-    local gap = 6
-    local tw = math.floor((w - 16 - 2 * gap) / 3)
-    for i = 1, 3 do
-        local mode = tabs[i][2]
-        local txt = (fl.mode == mode and "[ " .. tabs[i][1] .. " ]") or tabs[i][1]
-        elems[#elems + 1] = { type = "button", x = 8 + (i - 1) * (tw + gap), y = top,
-            w = tw, h = tab_h, font = big and 0 or SMLSIZE, text = txt,
-            press = function()
-                if fl.mode ~= mode then
-                    fl.mode = mode
-                    fl.page = 0
-                    wgt.fl_dirty = true
-                end
-            end }
+    if P.bg then
+        elems[#elems + 1] = { type = "rectangle", filled = true, x = 0, y = 0, w = w, h = zone.h, color = P.bg }
     end
 
-    local y = top + tab_h + 8
+    -- header: tab chips right-aligned (B2), then "+ New" / the filter chip,
+    -- then the title in whatever is left -- on 480-wide the title yields
+    -- first (clipped, then dropped; the templates picker-bar rule)
+    local chipY, chipH = 3, headH - 6
+    local gap = 6
+    local tabs = { { "Flights", "flights" }, { "Models", "models" }, { "Batteries", "batts" } }
+    local x = w - 6
+    for i = 3, 1, -1 do
+        local mode = tabs[i][2]
+        local cw = lcd.sizeText(tabs[i][1], SMLSIZE) + 22
+        x = x - cw
+        chip(fl, elems, P, x, chipY, cw, chipH, tabs[i][1], fl.mode == mode,
+            function(w2) set_mode(w2, w2.fl, mode) end)
+        x = x - gap
+    end
+    if fl.mode == "batts" and fl.stage == nil then
+        -- "+ New" opens the create form (B5); the editor lives in fltbatt.lua
+        local cw = lcd.sizeText("+ New", SMLSIZE) + 22
+        x = x - cw
+        chip(fl, elems, P, x, chipY, cw, chipH, "+ New", false,
+            function(w2) open_batt(w2, w2.fl, nil, "create") end)
+        x = x - gap
+    elseif fl.mode == "flights" and fl.filter_model ~= nil then
+        -- the model filter chip (spec 4.4): filled, P.hint border, tap clears
+        local ftxt = "Model: " .. fit(fl.filter_model, 140) .. "  x"
+        local cw = lcd.sizeText(ftxt, SMLSIZE) + 22
+        x = x - cw
+        elems[#elems + 1] = { type = "rectangle", filled = true, rounded = 4,
+            x = x, y = chipY, w = cw, h = chipH, color = P.accent }
+        elems[#elems + 1] = { type = "rectangle", rounded = 4, thickness = 1,
+            x = x, y = chipY, w = cw, h = chipH, color = P.hint }
+        elems[#elems + 1] = { type = "label", x = x, y = chipY + (chipH - fh) / 2,
+            w = cw, h = fh, font = SMLSIZE, align = CENTER,
+            color = P.bg or lcd.RGB(0, 0, 0), text = ftxt }
+        add_hit(fl, x, chipY, cw, chipH, function(w2)
+            local flx = w2.fl
+            if flx ~= nil then flx.filter_model = nil; flx.page = 0 end
+            w2.fl_dirty = true
+        end, 30)
+        x = x - gap
+    end
+    local titleW = x - 10
+    if titleW >= 40 then
+        elems[#elems + 1] = { type = "label", x = 6, y = (headH - tth) / 2,
+            w = titleW, h = tth, font = titleFont, color = P.accent,
+            text = fit("Flight Log", titleW, titleFont) }
+    end
+    elems[#elems + 1] = { type = "rectangle", filled = true, x = 0, y = headH - 1,
+        w = w, h = 1, color = P.line }
+
+    local y = headH + top
     if fl.stage ~= nil then
         elems[#elems + 1] = { type = "label", x = 8, y = y + 12, w = w - 16, h = fh + 4,
-            font = SMLSIZE, align = CENTER, color = COLOR_THEME_DISABLED,
+            font = SMLSIZE, align = CENTER, color = P.textDim,
             text = "Reading flight log ..." }
-        pg:build(elems)
+        lvgl.build(elems)
         return
+    end
+
+    -- the filtered index list is rebuilt per build (ring-bounded, spec 4.4)
+    local fsum = 0
+    if fl.mode == "flights" and fl.filter_model ~= nil then
+        fl.fidx, fsum = filtered_idx(fl)
+    else
+        fl.fidx = nil
     end
 
     local count = item_count(fl)
@@ -366,82 +581,111 @@ function M.build(wgt, zone)
     if fl.page < 0 then fl.page = 0 end
 
     -- column layout per tab (fractions of the width)
-    local function put(x, ww, txt, color, align)
-        elems[#elems + 1] = { type = "label", x = x, y = y, w = ww, h = fh + 2,
-            font = SMLSIZE, text = txt, color = color or COLOR_THEME_PRIMARY1,
+    local function put(x2, ww, txt, color, align)
+        elems[#elems + 1] = { type = "label", x = x2, y = y, w = ww, h = fh + 2,
+            font = SMLSIZE, text = txt, color = color or P.text,
             align = align or LEFT }
     end
 
     -- Column geometry is DERIVED from the width (never hardcoded for one radio):
     -- the fixed-width columns keep their measured size, the free text columns
     -- (model / pack name) share whatever is left. Works at 480 and at 800.
+    -- Tappable rows end in a `>` chevron (B4) -- the columns stop before it.
     local GAP = 8
-    -- header lines match the muted data-column gray, NOT COLOR_THEME_DISABLED --
-    -- the UltiDash palette repurposes DISABLED as an orange accent, which made the
-    -- headers/footer read like warnings
-    local HDR_COLOR = COLOR_THEME_SECONDARY1
+    local chev = lcd.sizeText(">", SMLSIZE) + 10
+    -- the chevron: the VISIBLE affordance that a row is tappable (the touch
+    -- target is the whole row); vertically centered in the row
+    local function chevron(rowy)
+        elems[#elems + 1] = { type = "label", x = w - chev, y = rowy + math.floor((row_h - fh) / 2),
+            w = chev - 4, h = fh + 2, font = SMLSIZE, align = RIGHT, color = P.textDim, text = ">" }
+    end
     if count == 0 then
         local hint = (fl.mode == "batts")
-            and "No batteries - edit fltlog/batteries.cfg on the PC"
+            and "No batteries - + New adds the first pack"
+            or (fl.filter_model ~= nil) and "No flights for this model"
             or "No flights logged yet"
-        put(8, w - 16, hint, COLOR_THEME_DISABLED, CENTER)
+        put(8, w - 16, hint, P.textDim, CENTER)
     elseif fl.mode == "flights" then
-        -- date+time | model | pack | duration(right)
+        -- date+time | model | pack | duration(right) | >
         local w_dur = wide and 70 or 52
-        local x_dur = w - w_dur - 6
+        local x_dur = w - w_dur - chev
         local w_when = wide and 178 or 112
         local x_model = 6 + w_when + GAP
         local free = x_dur - GAP - x_model         -- shared by model + pack
         local w_model = math.floor(free * 0.5)
         local x_pack = x_model + w_model + GAP
         local w_pack = free - w_model - GAP
-        put(6, w_when, "Date", HDR_COLOR)
-        put(x_model, w_model, "Model", HDR_COLOR)
-        put(x_pack, w_pack, "Battery", HDR_COLOR)
-        put(x_dur, w_dur, "Time", HDR_COLOR, RIGHT)
+        put(6, w_when, "Date", P.textDim)
+        put(x_model, w_model, "Model", P.textDim)
+        put(x_pack, w_pack, "Battery", P.textDim)
+        put(x_dur, w_dur, "Time", P.textDim, RIGHT)
         y = y + row_h
-        -- newest first: absolute index j counts down from fl.n
+        -- newest first: absolute index j counts down from fl.n (or walks the
+        -- filtered index list, which is already newest-first)
         local first = fl.n - fl.page * rows_eff
-        local vpad = math.max(0, math.floor((row_h - fh) / 2))   -- center text in the row button
+        local vpad = math.max(0, math.floor((row_h - fh) / 2))
         for i = 0, rows_eff - 1 do
-            local j = first - i
-            if j < 1 or j <= fl.n - MAX_FLIGHTS then break end
+            local j
+            if fl.fidx ~= nil then
+                j = fl.fidx[fl.page * rows_eff + i + 1]
+                if j == nil then break end
+            else
+                j = first - i
+                if j < 1 or j <= fl.n - MAX_FLIGHTS then break end
+            end
             local e = fl.ring[((j - 1) % MAX_FLIGHTS) + 1]
             local hhmm = string.sub(e.t or "", 1, 5)
             -- narrow drops the year: "07-10 10:26" instead of "2026-07-10 10:26"
             local when = (wide and (e.d or "") or string.sub(e.d or "", 6)) .. " " .. hhmm
-            -- full-row tap target (behind the column labels) -> per-flight detail page
             local rowy = y
-            elems[#elems + 1] = { type = "button", x = 4, y = rowy, w = w - 8, h = row_h,
-                text = " ", press = function() fl.detail = e; wgt.fl_dirty = true end }
+            -- full-row tap target -> per-flight detail page
+            add_hit(fl, 4, rowy, w - 8, row_h, function(w2)
+                local flx = w2.fl
+                if flx ~= nil then flx.detail = e end
+                w2.fl_dirty = true
+            end, 30)
+            chevron(rowy)
             y = rowy + vpad                                       -- labels vertically centered
             put(6, w_when, when)
             put(x_model, w_model, fit(e.m, w_model))
-            put(x_pack, w_pack, fit(fl.names[e.b] or e.b, w_pack), COLOR_THEME_SECONDARY1)
+            put(x_pack, w_pack, fit(fl.names[e.b] or e.b, w_pack), P.textDim)
             put(x_dur, w_dur, fmt_mmss(e.s), nil, RIGHT)
             y = rowy + row_h
         end
     elseif fl.mode == "models" then
-        -- model | flights | total time(right)
+        -- model | flights | total time(right) | >  (tap filters the Flights tab, B3)
         local w_tot = wide and 110 or 84
-        local x_tot = w - w_tot - 6
+        local x_tot = w - w_tot - chev
         local w_cnt = wide and 110 or 76
         local x_cnt = x_tot - GAP - w_cnt
-        put(6, x_cnt - GAP - 6, "Model", HDR_COLOR)
-        put(x_cnt, w_cnt, "Flights", HDR_COLOR)
-        put(x_tot, w_tot, "Total time", HDR_COLOR, RIGHT)
+        put(6, x_cnt - GAP - 6, "Model", P.textDim)
+        put(x_cnt, w_cnt, "Flights", P.textDim)
+        put(x_tot, w_tot, "Total time", P.textDim, RIGHT)
         y = y + row_h
+        local vpad = math.max(0, math.floor((row_h - fh) / 2))
         for i = 1 + fl.page * rows_eff, math.min(#fl.morder, (fl.page + 1) * rows_eff) do
             local m = fl.morder[i]
             local e = fl.models[m]
+            local rowy = y
+            add_hit(fl, 4, rowy, w - 8, row_h, function(w2)
+                local flx = w2.fl
+                if flx ~= nil then
+                    flx.filter_model = m
+                    flx.mode = "flights"
+                    flx.page = 0
+                end
+                w2.fl_dirty = true
+            end, 30)
+            chevron(rowy)
+            y = rowy + vpad
             put(6, x_cnt - GAP - 6, fit(m, x_cnt - GAP - 6))
             put(x_cnt, w_cnt, tostring(e.n))
             put(x_tot, w_tot, fmt_total(e.s), nil, RIGHT)
-            y = y + row_h
+            y = rowy + row_h
         end
-    else -- batteries: name | capacity | cycles | flights | last use(right)
+    else -- batteries: name | capacity | cycles | flights | last use(right) | >
         local w_last = wide and 112 or 86
-        local x_last = w - w_last - 6
+        local x_last = w - w_last - chev
         local w_cap = wide and 96 or 72
         local w_cyc = wide and 84 or 56
         local w_flt = wide and 84 or 52
@@ -449,66 +693,88 @@ function M.build(wgt, zone)
         local x_cyc = x_flt - GAP - w_cyc
         local x_cap = x_cyc - GAP - w_cap
         -- header line with the full column names; the cells below carry bare numbers
-        put(6, x_cap - GAP - 6, "Battery", HDR_COLOR)
-        put(x_cap, w_cap, "Capacity", HDR_COLOR)
-        put(x_cyc, w_cyc, "Cycles", HDR_COLOR)
-        put(x_flt, w_flt, "Flights", HDR_COLOR)
-        put(x_last, w_last, "Last use", HDR_COLOR, RIGHT)
+        put(6, x_cap - GAP - 6, "Battery", P.textDim)
+        put(x_cap, w_cap, "Capacity", P.textDim)
+        put(x_cyc, w_cyc, "Cycles", P.textDim)
+        put(x_flt, w_flt, "Flights", P.textDim)
+        put(x_last, w_last, "Last use", P.textDim, RIGHT)
         y = y + row_h
+        local vpad = math.max(0, math.floor((row_h - fh) / 2))
         for i = 1 + fl.page * rows_eff, math.min(#fl.reg, (fl.page + 1) * rows_eff) do
             local b = fl.reg[i]
             local flights = fl.by_id[b.id] or 0
+            local rowy = y
+            -- tap -> battery detail page (Edit / Delete live there, B5)
+            add_hit(fl, 4, rowy, w - 8, row_h, function(w2)
+                local flx = w2.fl
+                if flx ~= nil then open_batt(w2, flx, b, "detail") end
+            end, 30)
+            chevron(rowy)
+            y = rowy + vpad
             put(6, x_cap - GAP - 6, fit(b.name or b.id, x_cap - GAP - 6))
             put(x_cap, w_cap, b.cap and (b.cap .. " mAh") or "-")
             put(x_cyc, w_cyc, tostring(b.cycles or 0))
             put(x_flt, w_flt, tostring(flights))
             put(x_last, w_last, (b.last ~= nil and b.last ~= "") and b.last or "-", nil, RIGHT)
-            y = y + row_h
+            y = rowy + row_h
         end
     end
 
-    -- footer: totals + paging
-    local fy = zone.h - ((big and 56 or 40)) - foot_h
+    -- footer: totals + paging (the pager stays as it was, B2)
+    local fy = zone.h - foot_h
     local total_txt
     if fl.mode == "flights" then
-        total_txt = fl.n .. ((fl.n == 1) and " flight - " or " flights - ") .. fmt_total(fl.tot_s)
-        if fl.n > MAX_FLIGHTS then
-            total_txt = total_txt .. " (last " .. MAX_FLIGHTS .. " listed)"
+        if fl.filter_model ~= nil then
+            -- filtered totals over the ring's matching entries; "N of M" makes
+            -- the filter legible in the numbers too (spec 4.4)
+            total_txt = count .. " of " .. fl.n .. " flights - " .. fmt_total(fsum)
+        else
+            total_txt = fl.n .. ((fl.n == 1) and " flight - " or " flights - ") .. fmt_total(fl.tot_s)
+            if fl.n > MAX_FLIGHTS then
+                total_txt = total_txt .. " (last " .. MAX_FLIGHTS .. " listed)"
+            end
         end
     elseif fl.mode == "models" then
         total_txt = count .. ((count == 1) and " model" or " models")
     else
         total_txt = count .. ((count == 1) and " battery" or " batteries")
     end
-    -- footer text vertically centered on the pager buttons (h = foot_h - 2), in the
-    -- same muted gray as the headers (see HDR_COLOR above)
+    -- footer text vertically centered on the pager buttons (h = foot_h - 2)
     local fty = fy + math.floor((foot_h - 2 - fh) / 2)
     elems[#elems + 1] = { type = "label", x = 8, y = fty, w = math.floor(w * 0.5), h = fh + 2,
-        font = SMLSIZE, color = HDR_COLOR, text = total_txt }
+        font = SMLSIZE, color = P.textDim, text = total_txt }
     if pages > 1 then
         local bw = big and 64 or 48
         elems[#elems + 1] = { type = "label", x = w - 2 * bw - 90, y = fty, w = 76, h = fh + 2,
-            font = SMLSIZE, align = RIGHT, color = HDR_COLOR,
+            font = SMLSIZE, align = RIGHT, color = P.textDim,
             text = (fl.page + 1) .. "/" .. pages }
-        elems[#elems + 1] = { type = "button", x = w - 2 * bw - 10, y = fy, w = bw, h = foot_h - 2,
-            font = SMLSIZE, text = "<",
-            press = function()
-                if fl.page > 0 then fl.page = fl.page - 1; wgt.fl_dirty = true end
-            end }
-        elems[#elems + 1] = { type = "button", x = w - bw - 4, y = fy, w = bw, h = foot_h - 2,
-            font = SMLSIZE, text = ">",
-            press = function()
-                if fl.page < pages - 1 then fl.page = fl.page + 1; wgt.fl_dirty = true end
-            end }
+        button(fl, elems, P, w - 2 * bw - 10, fy, bw, foot_h - 2, "<",
+            function(w2)
+                local flx = w2.fl
+                if flx ~= nil and flx.page > 0 then flx.page = flx.page - 1; w2.fl_dirty = true end
+            end)
+        button(fl, elems, P, w - bw - 4, fy, bw, foot_h - 2, ">",
+            function(w2)
+                local flx = w2.fl
+                if flx ~= nil and flx.page < pages - 1 then flx.page = flx.page + 1; w2.fl_dirty = true end
+            end)
     end
 
-    pg:build(elems)
+    lvgl.build(elems)
+end
+
+local function rect_hit(ts, r)
+    return ts ~= nil and ts.x ~= nil
+        and ts.x >= r.x and ts.x < r.x + r.w
+        and ts.y >= r.y and ts.y < r.y + r.h
 end
 
 function M.refresh(wgt, event, touch_state)
     local fl = ensure(wgt)
 
-    -- disarmed-only: auto-close on arm; the host clears menu_view (fl_close_req)
+    -- disarmed-only: auto-close on arm; the host clears menu_view (fl_close_req).
+    -- M.close also drops the battery editor's state -- an open form is discarded,
+    -- nothing is written (spec 6.4)
     if wgt.armed_now then
         M.close(wgt)
         wgt.fl_close_req = true
@@ -521,12 +787,44 @@ function M.refresh(wgt, event, touch_state)
         return
     end
 
+    -- battery detail/editor pages: the module runs its own cycle (deferred
+    -- registry writes included); its flags translate into the viewer's own
+    if fl.batt_open and fl.B ~= nil then
+        fl.B.refresh(wgt, event, touch_state)
+        if wgt.fb_close_req then           -- the editor closed itself defensively
+            wgt.fb_close_req = nil
+            fl.batt_open = nil
+            wgt.fl_dirty = true
+        end
+        if wgt.fb_dirty then
+            wgt.fb_dirty = nil
+            wgt.fl_dirty = true
+        end
+        return
+    end
+
     -- chunked load in this call's own budget; one rebuild when done
     if fl.stage ~= nil then
         if load_tick(wgt, fl) then
             wgt.fl_dirty = true
         end
         return
+    end
+
+    -- tap dispatch over the current build's targets (logview conventions)
+    local now = getTime() or 0
+    if EVT_TOUCH_TAP ~= nil and event == EVT_TOUCH_TAP and touch_state ~= nil
+        and (touch_state.tapCount == nil or touch_state.tapCount <= 1)
+        and now >= (fl.tap_block or 0) then
+        local hits = fl.hit
+        for i = 1, #hits do
+            local r = hits[i]
+            if rect_hit(touch_state, r) then
+                fl.tap_block = now + (r.cool or 30)
+                r.fn(wgt, touch_state)
+                break
+            end
+        end
     end
 end
 

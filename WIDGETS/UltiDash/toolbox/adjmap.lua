@@ -19,10 +19,13 @@ local M = {}
 local C = nil
 function M.init(common) C = common end
 
+-- The active bank. With the FC-served table (TbSource) C.posFor consults the real
+-- enable windows and returns NIL inside a dead gap -- "no bank" is a real state the
+-- even split could not express, and every consumer below guards for it.
 local function activePos(m)
   local src = C.srcOf(m, "Config")
   if src == 0 then return 1 end
-  return C.posFromValue(getValue(src))
+  return C.posFor(getValue(src))
 end
 
 -- per-instance state, namespaced on the UltiDash widget
@@ -72,7 +75,7 @@ function M.refresh(wgt, event, touchState)
   end
 
   local av = C.srcOf(m,"AdjVal")
-  if av and av ~= 0 and m.connected and m.adjRow ~= nil then
+  if av and av ~= 0 and m.connected and m.adjRow ~= nil and m.pos ~= nil then
     local v = getValue(av)
     if v ~= 0 then
       local pos = m.pos
@@ -84,13 +87,13 @@ function M.refresh(wgt, event, touchState)
   end
 
   -- voice: announce the active EnCh bank (1..6) on open and on change (gated by TbVoice;
-  -- the host provides wgt.tb_announce, which honors master mute + widget volume)
+  -- the host provides wgt.tb_announce, which honors master mute + widget volume).
+  -- The HOST owns the debounce AND the "speak once after opening" latch: it is handed the
+  -- current bank every cycle -- pos == nil (a dead gap between the FC's windows) speaks
+  -- nothing and keeps the state, so the first real bank after the gap is still spoken --
+  -- and it holds while the knob is moving instead of queueing one announcement per step.
   if wgt.options and wgt.options.TbVoice == 1 and wgt.tb_announce then
-    local pos = m.pos
-    if m.announce_pending or (m.lastSpokenPos ~= nil and pos ~= m.lastSpokenPos) then
-      wgt.tb_announce(pos)
-    end
-    m.lastSpokenPos = pos
+    wgt.tb_announce(m.pos, m.announce_pending)
     m.announce_pending = false
   end
 end
@@ -115,6 +118,8 @@ function M.build(wgt, zone)
   end
 
   C.applyOverrides()
+  C.applyFcTable(wgt)   -- render the CURRENT active table (hand or FC-served); the host
+                        -- watches for later changes and rebuilds the page (adj_gen)
   m.announce_pending = true   -- speak the current bank once after (re)opening the page
 
   if C.srcOf(m, "Config") == 0 then
@@ -135,7 +140,7 @@ function M.build(wgt, zone)
   local _, th  = lcd.sizeText("Ag", font)
   local _, sth = lcd.sizeText("Ag", SMLSIZE)
   local headH = th + 6
-  local rowH  = (H - headH) / #C.TBL
+  local rowH  = (H - headH) / #C.cur
   local nameX, nameW = 4, math.floor(W * 0.34)
   local funcX = nameX + nameW
   local funcW = math.floor(W * 0.42)
@@ -170,20 +175,23 @@ function M.build(wgt, zone)
   layout[#layout + 1] = { type = "label", x = 6, y = (headH - th) / 2, w = W - 12, h = th, font = font, color = P.accent,
     text = function()
       local p = m.pos
-      if m.has_profile then return string.format("Pos %d (%s)   PID %d", p, C.SUB[p], m.profile) end
-      return string.format("Pos %d   (%s)", p, C.SUB[p])
+      if p == nil then     -- FC windows known and the channel sits in a dead gap
+        return m.has_profile and string.format("Pos -   PID %d", m.profile) or "Pos -"
+      end
+      if m.has_profile then return string.format("Pos %d (%s)   PID %d", p, C.curSUB[p], m.profile) end
+      return string.format("Pos %d   (%s)", p, C.curSUB[p])
     end }
   layout[#layout + 1] = { type = "label", x = 6, y = (headH - sth) / 2, w = W - 12, h = sth, font = SMLSIZE, align = RIGHT,
     color = P.hint, text = "Adjustment Map" }
   layout[#layout + 1] = { type = "rectangle", filled = true, x = 0, y = headH - 1, w = W, h = 1, color = P.line }
 
-  for i, row in ipairs(C.TBL) do
+  for i, row in ipairs(C.cur) do
     local rowY = headH + (i - 1) * rowH
     local ly = rowY + (rowH - th) / 2
     local idx = i
     layout[#layout + 1] = { type = "label", x = nameX, y = ly, w = nameW, h = th, font = font, text = row[1], color = P.text }
     layout[#layout + 1] = { type = "label", x = funcX, y = ly, w = funcW, h = th, font = font, color = P.text,
-      text = function() local g = C.TBL[idx][2][m.pos]; if g == nil or g == "" then return "-" end return g end }
+      text = function() local g = m.pos and C.cur[idx][2][m.pos]; if g == nil or g == "" then return "-" end return g end }
     layout[#layout + 1] = { type = "label", x = valX, y = rowY + (rowH - bth) / 2, w = valW, h = bth, font = bigFont, align = RIGHT,
       color = function()
         if m.lastRow == idx and m.lastPos == m.pos then return P.valHi end
