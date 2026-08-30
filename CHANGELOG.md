@@ -2,6 +2,61 @@
 
 All notable changes to UltiDash are documented here.
 
+## v0.8.1 — 2026-08-30
+
+### Added
+
+- **A warning when two MSP tools are loaded at once.** The RF Tool widget and an RFSuite
+  widget each bring their own MSP stack, and both push through the single CRSF telemetry slot
+  the radio has — so having both is a misconfiguration, not a richer setup. UltiDash now says
+  so in the **config warning overlay**: *TWO MSP TOOLS ACTIVE*, with what to do about it.
+  Unlike the ELRS rate notice it needs **no link** — the fault is in the radio's own setup, so
+  it is shown from boot and can be fixed before the heli is even powered — and it takes
+  precedence over that notice, because two stacks on one slot make every telemetry-timing
+  reading unreliable. Disarmed only, dismissed with the **X**, and it can be switched off with
+  the existing *Config warning overlay* setting.
+  **It does not accuse you of UltiDash's own doing.** Opening the *RFSuite* Toolbox page loads
+  that suite into the same Lua state and leaves exactly the traces a second widget would —
+  `_G.rfsuite` and its published MSP service, neither of which is ever removed again. The
+  evidence is therefore only collected while that page has never been opened, and is sticky
+  once seen. The one case this misses, stated rather than hidden: an RFSuite widget that first
+  appears *after* the page was opened is not noticed until the next reboot.
+
+### Changed
+
+- **The Toolbox shows only the flight-controller tool you can actually use.** *RF2 Config*
+  appears only where the **RF Tool widget** is loaded, *RFSuite* only where **RFSuite is
+  installed** on the card. Both used to appear regardless and open onto a page whose only
+  content was "the tool is not there" — the normal state on most radios. Normally exactly one
+  of the two is offered, which is also the setup that is correct. A **switch shortcut** bound
+  to either still opens and still lands on that explanatory page: a saved shortcut must not
+  silently do nothing.
+- ***RF2 Config* is dimmed while there is no MSP**, like the *FC battery profile* tile beside
+  it — it borrows RF Tool's stack. *RFSuite* is dimmed on **arming alone**: it brings its own
+  MSP stack and its own link, and UltiDash has no honest reading of that link to judge it by.
+
+### Fixed
+
+- **"RFTools widget missing" named the wrong tool.** Since 0.8.0 either RF Tool *or* RFSuite's
+  service can serve the flight-controller data, but the dashboard's arming-flags line and the
+  *Sensor check* page both still reported the absence of **any** provider as RF Tool being
+  missing — sending anyone running RFSuite after a widget they had deliberately not installed.
+  Both now say **MSP provider**, the same wording **menu ▸ Status** already used, and the
+  *Sensor check* hint names both possibilities and points at that row.
+
+- **The Flight Log page answers taps again.** Three defects stacked up to a page that read
+  as dead (reported from the radio): the CSV load pulled only 2 KiB per cycle — with the
+  per-flight statistics columns that is ~12 flights, so a season's `flights.csv` sat on
+  *Reading flight log …* for seconds at every open; **all taps were swallowed until that
+  load finished**, the tab chips included, although they were already on screen; and a
+  quick second tap on the pager (or a chip) landed inside the radio's double-tap window
+  and was **discarded entirely** — paging fast was structurally impossible, every second
+  tap vanished. Now the load parses up to 90 lines per cycle (measured well inside the
+  CPU budget, ~4× fewer cycles), the tabs respond from the first frame, and the pager and
+  tab chips accept quick successive taps, with a short cooldown kept as the guard against
+  one physical tap fanning out into several events. Rows (and everything that opens a
+  page) keep the stricter single-tap rule.
+
 ## v0.8.0 — 2026-08-24
 
 ### Added

@@ -39,7 +39,7 @@ local livemon = { mod = nil, avail = false }
 -- The RFSuite adapter (toolbox/rfscfg.lua). ONE local for the whole feature,
 -- same trick as livemon -- the main chunk stands at 184/200 active locals and a pair
 -- of tb_*/tb_*_avail locals is exactly what that wall is there to prevent.
-local rfscfg = { mod = nil, avail = false }
+local rfscfg = { mod = nil, avail = false, inst = false }
 do
     local okc, m = pcall(function() return loadScript(script_dir .. "toolbox/common.lua")() end)
     if okc then tb_common = m end
@@ -60,6 +60,11 @@ do
     tb_logview_avail = fstat(script_dir .. "toolbox/logview.lua") ~= nil and 3
     tb_rf2cfg_avail  = fstat(script_dir .. "toolbox/rf2cfg.lua") ~= nil and 3
     rfscfg.avail     = fstat(script_dir .. "toolbox/rfscfg.lua") ~= nil and 3
+    -- ...and whether the SUITE is installed at all, which is a different question from
+    -- whether our adapter shipped. One extra fstat at boot buys the Toolbox menu the
+    -- answer it needs BEFORE the tap; rfscfg.lua keeps its own throttled probe for the
+    -- notice page, which is what a saved shortcut still lands on.
+    rfscfg.inst      = fstat("/SCRIPTS/TOOLS/rfsuite-core/ui/home.lua") ~= nil
     fltlog.avail      = fstat(script_dir .. "toolbox/fltlog.lua") ~= nil and 3
     fltlog.data_avail = fstat(script_dir .. "toolbox/fltdata.lua") ~= nil and 3
     fltlog.batted_avail = fstat(script_dir .. "toolbox/fltbatt.lua") ~= nil and 3
@@ -4204,7 +4209,10 @@ MK.voice = function()
     -- so it has no page of its own under Alerts. It sits here because this is where
     -- the shared overlay behaviour already lives. Default ON -- its whole purpose is
     -- being seen by somebody who did not go looking, and it only ever appears
-    -- disarmed, after a link connect, when a real misconfiguration was measured.
+    -- disarmed, when a real misconfiguration was measured. TWO producers write it:
+    -- the ELRS<->FC rate verdict (needs a link connect and a module scan) and the
+    -- two-MSP-stacks conflict (needs neither -- it is a fault of the RADIO's setup and
+    -- is shown from boot, so it can be fixed before the heli is even powered).
     { key = "NoteOvl",    lbl = "Config warning overlay",    kind = "bool", def = 1 },
     }
     -- the second "Test callout / Play" row (see MK.volume): hear the working language
@@ -4816,8 +4824,19 @@ local function menu_load(wgt)
                 return false
             end,
             tb_avail              = function()
-                return tb_adjmap_avail, tb_adjed_avail, tb_logview_avail, tb_rf2cfg_avail,
-                       livemon.avail, rfscfg.avail
+                -- The two FC-tool flags are handed over ALREADY GATED on the door's own
+                -- key, not merely on the adapter file being present: rf2cfg needs `rf2` in
+                -- this Lua state (the RFTool widget placed -- its readiness() says "RF Tool
+                -- widget not active" otherwise) and rfscfg needs the suite installed under
+                -- SCRIPTS/TOOLS. Both used to show a tile whose only content was a notice
+                -- saying the tool is not there, which is the normal state on most cards.
+                -- The SHORTCUT path is deliberately NOT gated this way (it reads
+                -- rfscfg.avail / tb_rf2cfg_avail directly): a saved shortcut must still
+                -- land on that notice rather than silently do nothing.
+                return tb_adjmap_avail, tb_adjed_avail, tb_logview_avail,
+                       tb_rf2cfg_avail and type(rf2) == "table"
+                           and type(rf2.executeScript) == "function",
+                       livemon.avail, rfscfg.avail and rfscfg.inst
             end,
             SETTINGS_GROUPS       = SETTINGS_GROUPS,
             ALERT_PAGES           = ALERT_PAGES,
@@ -5197,7 +5216,15 @@ function shortcut.open(wgt, tgt, held)
     -- close, so the flag was never consumed)
     if tgt.id == "tb_logview" then wgt.lv_close_req = nil end
     if tgt.id == "tb_rf2cfg"  then wgt.rf2cfg_close_req = nil end
-    if tgt.id == "tb_rfscfg"  then wgt.rfs_close_req = nil end
+    if tgt.id == "tb_rfscfg"  then
+        wgt.rfs_close_req = nil
+        -- From here on `_G.rfsuite` in this Lua state may be OURS: rfscfg loads
+        -- lib/require.lua (which creates the global) and ui/home.lua pulls
+        -- tasks/msp/runtime.lua, whose publishService() sets _G.rfsuite.msp -- and close()
+        -- removes neither. The RF service stops collecting its "a foreign RFSuite is here"
+        -- evidence at this point; what it saw before this stands.
+        if wgt.rf ~= nil then wgt.rf.rfs_door_used = true end
+    end
     if tgt.id == "tb_fltlog"  then wgt.fl_close_req = nil end
     -- RTN from a shortcut-opened tool goes STRAIGHT back to the dashboard — the
     -- user never navigated the menu, so there is no menu trail to unwind (opened
@@ -7619,6 +7646,7 @@ local function refresh(wgt, event, touch_state)
             ultidash_functions.publish_shared(wgt)
             ultidash_functions.refresh_volume_override(wgt)   -- adaptive master volume via GVAR (off unless configured)
             ultidash_functions.update_elrs_notice(wgt)        -- ELRS<->FC link config verdict -> notice
+            ultidash_functions.update_msp_conflict(wgt)       -- two MSP stacks -> notice (OVERRIDES the line above)
             ultidash_functions.update_alert_overlay(wgt)      -- critical-alert overlay episode state
         end
         wgt.dbg_pass_cs = (getTime() or 0) - pass_t0

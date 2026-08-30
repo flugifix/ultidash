@@ -556,7 +556,11 @@ function M.createValues(wgt)
             return wgt.values.rf_connection_state == "armed" and st_armed or st_disarmed
         end,
         arm_flags_text_formatted = function()
-            if not (wgt.rf and wgt.rf.available) then return "RFTools widget missing" end
+            -- NOT "RFTool missing": since 0.8.0 either RFTool or RFSuite's service widget
+            -- can serve, and wgt.rf.available says only that NEITHER does. Naming RFTool
+            -- here sent a pilot running RFSuite after a widget he had deliberately not
+            -- installed. Same wording as the Status page's own row, so the two agree.
+            if not (wgt.rf and wgt.rf.available) then return "No MSP provider" end
             local current_flag = get_current_arm_disable_flag(wgt)
             if current_flag == nil then return "" end
             -- the cycled flag changes at most every 2 s; memo so the concat is not

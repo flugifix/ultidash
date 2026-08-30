@@ -3631,6 +3631,37 @@ function ultidash_functions.update_elrs_notice(wgt)
     }
 end
 
+-- ============================================================================
+-- TWO MSP STACKS ON ONE RADIO
+-- ============================================================================
+--- The MSP-conflict notice. It runs AFTER update_elrs_notice and OVERRIDES it, which is
+--- the whole reason it is a second function and not a branch inside the first: two MSP
+--- stacks fighting over the one CRSF TX slot make every telemetry-timing reading suspect,
+--- so a rate mismatch reported on top of it would send the pilot after the wrong setting.
+--- While the conflict stands the ELRS notice is suppressed, and it comes back with it.
+--- The VERDICT is not computed here. ultidashRf.background already reads both globals on
+--- every pass and owns the false-positive guard -- our own Toolbox door leaves exactly the
+--- traces a foreign RFSuite does -- so this function only presents what it decided.
+--- Cost on a correctly set up radio, which is every pass on every card that has no
+--- conflict: two table reads and a return. The message is built once and cached on wgt.
+function ultidash_functions.update_msp_conflict(wgt)
+    if not (wgt.rf ~= nil and wgt.rf.msp_conflict) then return end
+    local n = wgt.ovl_note_conflict
+    if n == nil then
+        n = {
+            -- The title length is not free: add_alert_overlay picks the title font so the
+            -- LONGEST entry of OVL_TITLES fits the box, and anything longer than that
+            -- clips. This one is shorter, so the fitting string stays where it was.
+            title = "TWO MSP TOOLS ACTIVE",
+            body  = "RF Tool and RFSuite are\nboth loaded on this radio.",
+            hint  = "They share one CRSF telemetry slot\nand will fight over it. Remove one\n"
+                 .. "of the two widgets from the screens.",
+        }
+        wgt.ovl_note_conflict = n
+    end
+    wgt.ovl_note = n
+end
+
 -- Episode state machine, run in the publisher's 5 Hz foreground pass (display-only,
 -- so no background variant). Highest-priority active condition wins (Pwr > Volt >
 -- Telem -- matching the callout suppression order). A tap (host tap chain) or the

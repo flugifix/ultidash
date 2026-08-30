@@ -11,6 +11,11 @@ local function ensure_rf_state(wgt)
         is_registered = false,
         last_state = nil,
         msp_allowed = false,
+        rfs_foreign = false,        -- an RFSuite was in this Lua state before OUR Toolbox
+                                    -- door could have put it there. Sticky. See M.background
+        rfs_door_used = false,      -- the host sets this when toolbox/rfscfg.lua is opened;
+                                    -- from then on the evidence above is no longer collected
+        msp_conflict = false,       -- RFTool AND a foreign RFSuite: two stacks, one TX slot
         battery_profile = nil,
         battery_config = nil,
         governor_config = nil,
@@ -893,6 +898,19 @@ function M.background(wgt, on_telemetry_state_changed)
     if type(_G.rfsuite) == "table" then
         rfs_level = (type(_G.rfsuite.msp) == "table") and 2 or 1
     end
+    -- TWO STACKS, ONE TX SLOT. RFTool and an RFSuite widget both push CRSF MSP frames
+    -- through the single crossfireTelemetryPush slot, so both on one radio is a real
+    -- misconfiguration and not a theoretical one. Telling it apart from OUR OWN doing is
+    -- the whole difficulty: toolbox/rfscfg.lua loads lib/require.lua (which creates
+    -- `_G.rfsuite`) and ui/home.lua pulls tasks/msp/runtime.lua, whose publishService()
+    -- sets `_G.rfsuite.msp` -- so after ONE visit to our own Toolbox door a correct
+    -- RFTool-only card looks exactly like the broken one, at BOTH levels, and stays that
+    -- way (close() calls clearAllModules, which empties rfsuite.modules and nothing else).
+    -- Hence: the evidence is collected only while our door has never been opened, and it
+    -- is STICKY once seen. The missed case, stated rather than hidden -- an RFSuite widget
+    -- that first appears AFTER our door was used is not detected until the next reboot.
+    if rfs_level > 0 and not state.rfs_door_used then state.rfs_foreign = true end
+    state.msp_conflict = (rf2_there and state.rfs_foreign) or false
     local kind, ref = nil, nil
     if rf2_there then
         kind, ref = "rf2", rf2

@@ -562,7 +562,7 @@ plus the voice language in force.
 | **Mute (master)** | choice | None | None / **All** silences every **voice** callout (audio only) |
 | **Vibration (master)** | bool | on | master switch for **haptic** feedback, independent of *Mute* — turn off to stop all vibration while keeping (or muting) sound separately |
 | **Overlay auto-close (s)** | num | until tapped | shared timer for the **fullscreen alert overlay** (below): >0 = the overlay closes itself after that many seconds; 0 = it stays until tapped or the condition clears. The timer counts from the episode's **start** — also while a menu or detail page covers the overlay |
-| **Config warning overlay** | bool | **on** | shows a **misconfiguration** in the same red box, in words you can act on. Today one message: the ELRS module's link rate and telemetry ratio against what the flight controller was told (§3.6a) — both sides, what the difference does, and the two values to set. **Disarmed only**, and only after a link connect actually measured one; the three alert overlays above always take precedence. Closed with the **X** in its corner, and it does not come back until the next connect |
+| **Config warning overlay** | bool | **on** | shows a **misconfiguration** in the same red box, in words you can act on. **Disarmed only**; the three alert overlays above always take precedence. Closed with the **X** in its corner. Two messages: **(1)** *TELEMETRY RATE MISMATCH* — the ELRS module's link rate and telemetry ratio against what the flight controller was told (§3.6a), with both sides, what the difference does and the two values to set. Needs a link connect to be measured, and does not come back until the next one. **(2)** *TWO MSP TOOLS ACTIVE* (0.8.1) — the RF Tool widget **and** an RFSuite widget are both loaded on this radio. They share the one CRSF telemetry slot and will fight over it; remove one of the two from your screens. This one needs no link — it is a fault of the radio's own setup and is shown from boot, so it can be fixed before the heli is powered. It takes precedence over (1), because two stacks on one slot make every telemetry-timing reading unreliable |
 | **Test callout** | button | — | *Play* previews a callout in the **currently selected (unsaved)** language |
 
 **Per-alert pages** — Fuel, Voltage, Cell check, Armed / disarm, Telemetry, Link quality,
@@ -1157,7 +1157,7 @@ resolves sensors by their Rotorflight sensor ID (immune to duplicates/renames), 
 fallback for the ELRS / decoder sensors that carry no ID. The scan runs only while the page
 is open (≤ 1 Hz) — no cost in normal use, no MSP.
 
-- **Required** (RFTool running · RF2 telemetry discovered · ARM · Vbat · Bat% · Cel# · Vcel ·
+- **Required** (an MSP provider serving · RF2 telemetry discovered · ARM · Vbat · Bat% · Cel# · Vcel ·
   Hspd · Gov · RQly): a MISS here is **red** and counts in the summary ("N required sensor(s)
   missing"), with a one-line note on what it breaks. If the RF2 custom telemetry was never
   discovered, the hint points you to *Discover new sensors* (with the FC powered) — and if that

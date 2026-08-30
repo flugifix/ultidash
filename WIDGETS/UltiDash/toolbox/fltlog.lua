@@ -18,8 +18,9 @@
 
 local M = {}
 
-local CHUNK       = 2048   -- io.read chunk per tick
-local LINES_TICK  = 90     -- CSV lines parsed per tick (one string.match each)
+local CHUNK       = 2048   -- io.read chunk size (several reads per tick if the lines need them)
+local LINES_TICK  = 90     -- CSV lines parsed per tick (one string.match each) -- the BINDING
+                           -- work cap: the tick pulls as many CHUNKs as those lines take
 local MAX_FLIGHTS = 300    -- flight ring: on overflow the OLDEST entries drop,
                            -- totals/aggregates still count EVERY line
 
@@ -226,11 +227,15 @@ local function load_tick(wgt, fl)
         return false
     end
     if fl.stage == "parse" then
-        local ok, data = pcall(io.read, fl.fh, CHUNK)
-        if not ok then data = nil end
-        local buf = fl.buf .. (data or "")
-        local eof = (data == nil or data == "")
-        local pos = 1
+        -- The LINE cap is the binding one. This used to read ONE 2 KiB chunk per
+        -- tick -- with the stats columns a row is ~180 bytes, so the effective
+        -- rate was ~12 lines per cycle whatever LINES_TICK said, and a season's
+        -- flights.csv held the page on "Reading flight log ..." for seconds at
+        -- every open (radio report, 2026-08-30). Now the tick pulls chunks until
+        -- it has parsed its LINES_TICK lines or the file ends; the buffer never
+        -- holds more than one chunk plus a partial line.
+        local buf, pos = fl.buf, 1
+        local eof = false
         local lines = 0
         while lines < LINES_TICK do
             local e = string.find(buf, "\n", pos, true)
@@ -238,18 +243,28 @@ local function load_tick(wgt, fl)
             if e ~= nil then
                 line = string.sub(buf, pos, e - 1)
                 pos = e + 1
-            elseif eof and pos <= #buf then
+            elseif not eof then
+                local ok, data = pcall(io.read, fl.fh, CHUNK)
+                if not ok or data == nil or data == "" then
+                    eof = true                    -- EOF (or read error: stop, keep what we have)
+                else
+                    buf = string.sub(buf, pos) .. data
+                    pos = 1
+                end
+            elseif pos <= #buf then
                 line = string.sub(buf, pos)       -- last line without newline
                 pos = #buf + 1
             else
                 break
             end
-            local d, t, m, b, s, x = string.match(line, "^([^,]*),([^,]*),([^,]*),([^,]*),(%d+),?(.*)$")
-            if d ~= nil then add_flight(fl, d, t, m, b, tonumber(s) or 0, x) end
-            lines = lines + 1
+            if line ~= nil then
+                local d, t, m, b, s, x = string.match(line, "^([^,]*),([^,]*),([^,]*),([^,]*),(%d+),?(.*)$")
+                if d ~= nil then add_flight(fl, d, t, m, b, tonumber(s) or 0, x) end
+                lines = lines + 1
+            end
         end
         fl.buf = string.sub(buf, pos)
-        if eof and fl.buf == "" and lines < LINES_TICK then
+        if eof and fl.buf == "" then
             pcall(io.close, fl.fh)
             fl.fh = nil
             fl.stage = nil
@@ -303,21 +318,30 @@ end
 -- testing -- a focusable type="button" would capture PAGE/RTN, see
 -- logview.lua; rebuilt via wgt.fl_dirty)
 -- ---------------------------------------------------------------------
-local function add_hit(fl, x, y, w, h, fn, cool)
-    fl.hit[#fl.hit + 1] = { x = x, y = y, w = w, h = h, fn = fn, cool = cool }
+-- `multi` = the hit also accepts EdgeTX double/triple-TAP events: quick
+-- successive taps land inside the radio's double-tap window and arrive with
+-- tapCount >= 2, and for the pager and the tab chips DROPPING those made
+-- paging feel dead -- every second tap vanished (radio report, 2026-08-30).
+-- The time cooldown stays as the bounce guard (one physical tap can still
+-- fan out into several TAP events; those follow within a few cs).
+local function add_hit(fl, x, y, w, h, fn, cool, multi)
+    fl.hit[#fl.hit + 1] = { x = x, y = y, w = w, h = h, fn = fn, cool = cool, multi = multi }
 end
 
--- plain-rect button (footer pager)
+-- plain-rect button (footer pager): repeated activation is the point, so
+-- multi-tap counts and the cooldown is only the bounce guard
 local function button(fl, layout, P, x, y, w, h, txt, fn)
     layout[#layout + 1] = { type = "rectangle", x = x, y = y, w = w, h = h,
         thickness = 1, rounded = 4, color = P.line }
     local _, th = lcd.sizeText(txt, SMLSIZE)
     layout[#layout + 1] = { type = "label", x = x, y = y + (h - th) / 2,
         w = w, h = th, font = SMLSIZE, align = CENTER, color = P.text, text = txt }
-    add_hit(fl, x, y, w, h, fn, 30)
+    add_hit(fl, x, y, w, h, fn, 15, true)
 end
 
--- a filled/outlined chip; `on` decides the fill (logview's chip pattern)
+-- a filled/outlined chip; `on` decides the fill (logview's chip pattern).
+-- Multi-tap accepted here too: set_mode is idempotent and "+ New" re-opens
+-- the same fresh form, so a fast second tap can do no harm
 local function chip(fl, layout, P, x, y, w, h, txt, on, fn)
     if on then
         layout[#layout + 1] = { type = "rectangle", filled = true, rounded = 4,
@@ -330,7 +354,7 @@ local function chip(fl, layout, P, x, y, w, h, txt, on, fn)
     layout[#layout + 1] = { type = "label", x = x, y = y + (h - th) / 2, w = w, h = th,
         font = SMLSIZE, align = CENTER,
         color = on and (P.bg or lcd.RGB(0, 0, 0)) or P.text, text = txt }
-    add_hit(fl, x, y, w, h, fn, 30)
+    add_hit(fl, x, y, w, h, fn, 15, true)
 end
 
 -- Two INDEPENDENT size flags. `big` (height) drives row heights / fonts, like the
@@ -769,6 +793,25 @@ local function rect_hit(ts, r)
         and ts.y >= r.y and ts.y < r.y + r.h
 end
 
+-- tap dispatch over the current build's targets (logview conventions); a hit
+-- with `multi` also accepts tapCount >= 2 (see add_hit)
+local function dispatch_taps(wgt, fl, event, touch_state)
+    local now = getTime() or 0
+    if EVT_TOUCH_TAP ~= nil and event == EVT_TOUCH_TAP and touch_state ~= nil
+        and now >= (fl.tap_block or 0) then
+        local single = (touch_state.tapCount == nil or touch_state.tapCount <= 1)
+        local hits = fl.hit
+        for i = 1, #hits do
+            local r = hits[i]
+            if (single or r.multi) and rect_hit(touch_state, r) then
+                fl.tap_block = now + (r.cool or 30)
+                r.fn(wgt, touch_state)
+                break
+            end
+        end
+    end
+end
+
 function M.refresh(wgt, event, touch_state)
     local fl = ensure(wgt)
 
@@ -803,29 +846,20 @@ function M.refresh(wgt, event, touch_state)
         return
     end
 
-    -- chunked load in this call's own budget; one rebuild when done
+    -- chunked load in this call's own budget; one rebuild when done. The taps
+    -- stay LIVE through it: the tab chips are on screen from the first build,
+    -- and swallowing their events until the whole file was parsed read as a
+    -- dead page (radio report, 2026-08-30). Only the chips exist during the
+    -- load, so the dispatch is a handful of rect tests on a TAP event.
     if fl.stage ~= nil then
+        dispatch_taps(wgt, fl, event, touch_state)
         if load_tick(wgt, fl) then
             wgt.fl_dirty = true
         end
         return
     end
 
-    -- tap dispatch over the current build's targets (logview conventions)
-    local now = getTime() or 0
-    if EVT_TOUCH_TAP ~= nil and event == EVT_TOUCH_TAP and touch_state ~= nil
-        and (touch_state.tapCount == nil or touch_state.tapCount <= 1)
-        and now >= (fl.tap_block or 0) then
-        local hits = fl.hit
-        for i = 1, #hits do
-            local r = hits[i]
-            if rect_hit(touch_state, r) then
-                fl.tap_block = now + (r.cool or 30)
-                r.fn(wgt, touch_state)
-                break
-            end
-        end
-    end
+    dispatch_taps(wgt, fl, event, touch_state)
 end
 
 return M

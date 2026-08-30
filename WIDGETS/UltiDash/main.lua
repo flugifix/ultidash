@@ -65,7 +65,7 @@ local app_name = "UltiDash"
 -- leaving it behind would make every development build claim to be the previous version.
 -- Shown as "0.8.0" plus the card's short commit on a dev build; see version_text() in
 -- ultidash.lua.
-local app_ver = "0.8.0"
+local app_ver = "0.8.1"
 local widg_dir = "/WIDGETS/UltiDash/"
 
 local ultidash = nil

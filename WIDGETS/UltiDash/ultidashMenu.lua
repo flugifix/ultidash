@@ -317,11 +317,13 @@ local function update_sensorcheck(wgt)
     local prior = wgt.senscheck
 
     add({ header = "Required" })
-    do  -- RFTool present (not a sensor)
+    do  -- an MSP provider present (not a sensor). EITHER of the two serves; the flag says
+        -- only that neither does, so the row must not name one of them as the fix.
         local ok = wgt.rf ~= nil and wgt.rf.available == true
         if not ok then req_missing = req_missing + 1 end
-        add({ lbl = "RFTool widget", status = ok and "ok" or "miss",
-              hint = "RFTool widget not running - no connection state, no MSP" })
+        add({ lbl = "MSP provider", status = ok and "ok" or "miss",
+              hint = "Neither the RF Tool widget nor RFSuite's service widget is serving - "
+                  .. "no connection state, no MSP. menu > Status names which was seen." })
     end
     do  -- RF2 telemetry decoder ran at least once (*Cnt is created unconditionally)
         local present = senscheck_present(by_id, by_name, "*Cnt", nil)
@@ -1836,12 +1838,25 @@ local function build_toolbox_menu_view(wgt, zone)
     end
     end_section()
     items[#items + 1] = { hdr = "Flight controller" }
+    -- MSP state, read once for the tiles below: armed, or our provider is not serving
+    -- (no RF connection / the gate closed).
+    local msp_ok = wgt.rf ~= nil and wgt.rf.msp_allowed
+    -- RF2 Config BORROWS RFTool's stack, so it dims for the same reason the battery-profile
+    -- tile does. RFSuite LOADS its own -- own MSP runtime, own link -- and we have no
+    -- honest reading of THAT link, so it dims on ARM alone. Dimming it by a provider it
+    -- does not use would be a lie on exactly the card it exists for.
+    local dim_msp = (wgt.armed_now or not msp_ok) and COLOR_DIM or nil
+    -- Both FC tiles are gated by the host on the door's own key, not on the adapter file:
+    -- `rf2` in this Lua state for RF2 Config, the suite installed for RFSuite (see
+    -- tb_avail). Only one of the two is normally passable, which is the point -- they
+    -- share one CRSF TX slot and must not both be driven. A radio carrying both gets the
+    -- config-warning overlay (ultidash_functions.update_msp_conflict), not a silent choice.
     if tb_rf2cfg_avail then
-        items[#items + 1] = { txt = "RF2 Config",  icon = "chip",     tcol = dim_armed, act = open_tool("tb_rf2cfg") }
+        items[#items + 1] = { txt = "RF2 Config",  icon = "chip",     tcol = dim_msp, act = open_tool("tb_rf2cfg") }
     end
-    -- RFSuite. The tile appears only when the adapter file is on the card, so a
-    -- release that does not ship rfscfg.lua shows nothing -- and with the adapter present
-    -- but RFSuite not installed, the tile opens onto its own notice page. Disarmed-only.
+    -- RFSuite. Disarmed-only. A saved SHORTCUT to this target still opens even where the
+    -- tile is gone and still lands on the adapter's own notice page -- that path reads
+    -- rfscfg.avail, not this flag.
     if tb_rfscfg_avail then
         -- "(exp.)" is on the TILE and not only on the page behind it: the marker has to be
         -- readable BEFORE the tap, and the page behind it is the last screen we own anyway.
@@ -1853,9 +1868,8 @@ local function build_toolbox_menu_view(wgt, zone)
     -- when the user goes looking for it. Unavailable therefore means DIMMED, like the
     -- disarmed-only tools — armed, or no MSP (no RF connection / the gate closed). The open
     -- path refuses in both states; this is the affordance in front of it.
-    local msp_ok = wgt.rf ~= nil and wgt.rf.msp_allowed
     items[#items + 1] = { txt = "Battery profile", icon = "battery",
-                          tcol = (wgt.armed_now or not msp_ok) and COLOR_DIM or nil,
+                          tcol = dim_msp,
                           act = open_tool("battprofile") }
     wgt.tb_menu_armed = wgt.armed_now   -- arm state this build reflects (rebuild trigger)
     -- reserve room below the grid for the armed hint — without it the 5-button grid

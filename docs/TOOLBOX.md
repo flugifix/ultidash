@@ -384,20 +384,32 @@ released again on close, so they cost no memory while flying.
   Lua suite updates this page too. Requirements: the **RF Tool widget** must be placed
   and connected (it provides the `rf2` runtime), and the RF2 scripts must be present /
   compiled (RF Tool does that on its first run) — otherwise the page shows what is
-  missing. RTN walks back exactly like the original (page → main menu → Toolbox).
+  missing. **Since 0.8.1 the tile is only there when the RF Tool widget actually is**: without
+  it the page had nothing to show but *"RF Tool widget not active"*, which is the normal state
+  on a radio that does not run RF Tool. A **switch shortcut** bound to this page still opens
+  and still lands on that notice — a saved shortcut must not silently do nothing.
+  RTN walks back exactly like the original (page → main menu → Toolbox).
   If the FC disconnects **while a config page is open**, the stock tool falls back to its
   original "waiting for connection" screen, which does not process RTN — leave fullscreen
   or reconnect the FC to get out.
   Unlike the standalone tool it is blocked while armed (UltiDash's
   no-MSP-while-armed rule).
-- **RFSuite (exp.)** *(0.8.0, optional and **highly experimental** — the tile only appears
-  if the adapter is installed)* — runs
+- **RFSuite (exp.)** *(0.8.0, optional and **highly experimental** — since 0.8.1 the tile only
+  appears if the adapter is installed **and RFSuite itself is on the card**; before that it also
+  appeared without the suite and opened onto a page whose only content was "RFSuite is not
+  installed". A switch shortcut bound to it still opens and still lands on that page)* — runs
   the **RFSuite for EdgeTX** configuration suite (`rotorflight-lua-edgetx-suite`) inside
   UltiDash's fullscreen, the same way *RF2 Config* runs the classic tool. Nothing is copied:
   the suite loads from `/SCRIPTS/TOOLS/rfsuite-core/` on the SD card, so updating RFSuite
   updates this page. **RFSuite is a separate, optional install and does not replace RF Tool** —
-  UltiDash reads the flight controller through RF Tool's `rf2` runtime either way. Without the
-  suite on the card the tile opens a page that says so and what to do about it.
+  UltiDash reads the flight controller through RF Tool's `rf2` runtime either way.
+
+  > **Do not run both at once.** RF Tool and RFSuite each bring their own MSP stack, and both
+  > push through the single CRSF telemetry slot the radio has. Having both widgets loaded is a
+  > misconfiguration, not a richer setup — since 0.8.1 UltiDash says so in the **config warning
+  > overlay** (*TWO MSP TOOLS ACTIVE*, REFERENCE §5) instead of quietly picking one. Opening
+  > *this* page is safe either way: it stops RF Tool's queue for as long as it is open.
+  > Normally only **one** of the two tiles is there at all, which is the point.
   Disarmed-only, force-closes on arming, RTN walks back through RFSuite's own navigation.
 
   **The tile carries `(exp.)` and the page in front of it says why.** Tapping it shows
